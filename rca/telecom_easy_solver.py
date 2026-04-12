@@ -1,10 +1,10 @@
 import os
 import re
+import math
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from statsmodels.tsa.stattools import grangercausalitytests
 
 
 _MONTH = {
@@ -71,106 +71,6 @@ def _load_metric(path: str) -> pd.DataFrame:
     df = df.copy()
     df["timestamp"] = _to_tz_timestamp_ms(df["timestamp"])
     return df
-
-
-def _to_seconds_timestamp(series: pd.Series) -> pd.Series:
-    v = series.astype(int)
-    return v.where(v.astype(str).str.len() != 13, v // 1000)
-
-
-def _metric_window_series_map(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, max_per_component: int = 3) -> Dict[Tuple[str, str], pd.Series]:
-    frames = []
-    for filename in ["metric_node.csv", "metric_container.csv", "metric_service.csv"]:
-        path = os.path.join(metric_dir, filename)
-        if not os.path.exists(path):
-            continue
-        df = pd.read_csv(path)
-        if df.empty:
-            continue
-        df = df[["cmdb_id", "name", "timestamp", "value"]].dropna()
-        df["timestamp"] = _to_seconds_timestamp(df["timestamp"])
-        df["ts"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Shanghai")
-        df = df[(df["ts"] >= start) & (df["ts"] <= end)].copy()
-        if not df.empty:
-            frames.append(df[["cmdb_id", "name", "timestamp", "value"]])
-    if not frames:
-        return {}
-
-    df_all = pd.concat(frames, ignore_index=True).sort_values("timestamp")
-    grouped = df_all.groupby(["cmdb_id", "name"])
-    series_map: Dict[Tuple[str, str], pd.Series] = {}
-    for (comp, metric), g in grouped:
-        s = g.set_index("timestamp")["value"].astype(float)
-        if len(s) >= 20:
-            series_map[(str(comp), str(metric))] = s
-
-    by_comp: Dict[str, int] = {}
-    filtered: Dict[Tuple[str, str], pd.Series] = {}
-    for (comp, metric), s in sorted(series_map.items(), key=lambda kv: kv[1].var(), reverse=True):
-        c = by_comp.get(comp, 0)
-        if c < max_per_component:
-            filtered[(comp, metric)] = s
-            by_comp[comp] = c + 1
-    return filtered
-
-
-def _granger_edges(series_map: Dict[Tuple[str, str], pd.Series], max_pairs: int = 200, max_lag: int = 2, p_thresh: float = 0.05):
-    keys = list(series_map.keys())
-    edges = []
-    pairs = 0
-    for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
-            if pairs >= max_pairs:
-                break
-            k1, k2 = keys[i], keys[j]
-            s1, s2 = series_map[k1], series_map[k2]
-            idx = s1.index.intersection(s2.index)
-            if len(idx) < 25:
-                continue
-            x = s1.loc[idx].values
-            y = s2.loc[idx].values
-            df_xy = pd.DataFrame({"x": x, "y": y})
-            try:
-                res_xy = grangercausalitytests(df_xy[["y", "x"]], maxlag=max_lag, verbose=False)
-                res_yx = grangercausalitytests(df_xy[["x", "y"]], maxlag=max_lag, verbose=False)
-            except Exception:
-                continue
-            best_xy_p = min([res_xy[lag][0]["ssr_ftest"][1] for lag in res_xy])
-            best_yx_p = min([res_yx[lag][0]["ssr_ftest"][1] for lag in res_yx])
-            if best_xy_p < p_thresh:
-                edges.append((k1[0], k2[0], float(max(0.1, 1.0 - best_xy_p))))
-            if best_yx_p < p_thresh:
-                edges.append((k2[0], k1[0], float(max(0.1, 1.0 - best_yx_p))))
-            pairs += 1
-        if pairs >= max_pairs:
-            break
-    return edges
-
-
-def pick_component_by_granger(instruction: str) -> str:
-    date_dir, start, end = _parse_time_window(instruction)
-    metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
-    series_map = _metric_window_series_map(metric_dir, start, end, max_per_component=3)
-    if not series_map:
-        return "os_001"
-    edges = _granger_edges(series_map, max_pairs=250, max_lag=2, p_thresh=0.05)
-    if not edges:
-        ranked = _rank_components(metric_dir, start, end)
-        return str(ranked.iloc[0]["component"]) if not ranked.empty else "os_001"
-    out_score: Dict[str, float] = {}
-    in_score: Dict[str, float] = {}
-    for src, tgt, conf in edges:
-        out_score[src] = out_score.get(src, 0.0) + conf
-        in_score[tgt] = in_score.get(tgt, 0.0) + conf
-    comps = set(list(out_score.keys()) + list(in_score.keys()))
-    best = None
-    best_score = None
-    for comp in comps:
-        score = out_score.get(comp, 0.0) - 0.4 * in_score.get(comp, 0.0)
-        if best_score is None or score > best_score:
-            best_score = score
-            best = comp
-    return str(best) if best else "os_001"
 
 
 def _find_faults(metric_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -412,24 +312,18 @@ def _pick_datetime(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, comp
 def solve_telecom_easy(task_id: int, instruction: str) -> str:
     date_dir, start, end = _parse_time_window(instruction)
     metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
-    reason = _reason_from_window(metric_dir, start, end)
-    if task_id == 3:
-        ranked = _rank_components(metric_dir, start, end)
-        component = str(ranked.iloc[0]["component"]) if not ranked.empty else "os_001"
-        onset = start.floor("min")
-    else:
-        component = _pick_component_for_reason(metric_dir, start, end, reason)
-        onset = _pick_datetime(metric_dir, start, end, component, reason)
 
     if task_id == 1:
+        dt = estimate_task1_datetime_from_trace(instruction)
         return (
             "{"
             "\"1\": {"
-            f"\"root cause occurrence datetime\": \"{onset.strftime('%Y-%m-%d %H:%M:%S')}\""
+            f"\"root cause occurrence datetime\": \"{dt}\""
             "}"
             "}"
         )
     if task_id == 2:
+        reason, _ = task2_reason_with_evidence(instruction)
         return (
             "{"
             "\"1\": {"
@@ -438,6 +332,7 @@ def solve_telecom_easy(task_id: int, instruction: str) -> str:
             "}"
         )
     if task_id == 3:
+        component = _best_component_for_task3(metric_dir, start, end, instruction)
         return (
             "{"
             "\"1\": {"
@@ -447,6 +342,657 @@ def solve_telecom_easy(task_id: int, instruction: str) -> str:
         )
 
     raise ValueError("solve_telecom_easy only supports task_id 1-3.")
+
+
+def _breach_scores_for_keywords(metric_path: str, start: pd.Timestamp, end: pd.Timestamp, keywords: List[str]) -> Tuple[float, int]:
+    if not os.path.exists(metric_path):
+        return 0.0, 0
+    df = _load_metric(metric_path)
+    if df.empty:
+        return 0.0, 0
+    df = df.copy()
+    df["name_l"] = df["name"].astype(str).str.lower()
+    mask = False
+    for kw in keywords:
+        mask = mask | df["name_l"].str.contains(str(kw).lower(), na=False)
+    df = df[mask].copy()
+    if df.empty:
+        return 0.0, 0
+    thresholds = (
+        df.groupby(["cmdb_id", "name"], as_index=False)["value"]
+        .quantile(0.95)
+        .rename(columns={"value": "p95"})
+    )
+    win = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
+    if win.empty:
+        return 0.0, 0
+    win = win.merge(thresholds, on=["cmdb_id", "name"], how="left")
+    win = win.dropna(subset=["p95"]).copy()
+    denom = win["p95"].abs().where(win["p95"].abs() > 1e-6, 1.0)
+    win["breach_ratio"] = (win["value"] - win["p95"]) / denom
+    win["breach_ratio"] = win["breach_ratio"].clip(lower=0.0, upper=10.0)
+    win = win[win["breach_ratio"] > 0].copy()
+    if win.empty:
+        return 0.0, 0
+    return float(win["breach_ratio"].sum()), int(len(win))
+
+
+def _norm_name(s: str) -> str:
+    s = str(s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+# reason socre
+def _breach_stats(metric_path: str, start: pd.Timestamp, end: pd.Timestamp, any_keywords: List[str], strong_keywords: Optional[List[str]] = None) -> Dict[str, Any]:
+    if not os.path.exists(metric_path):
+        return {"sum_ratio": 0.0, "count": 0, "distinct": 0, "strong_hit": False, "strong_count": 0, "top_metrics": []}
+    df = _load_metric(metric_path)
+    if df.empty:
+        return {"sum_ratio": 0.0, "count": 0, "distinct": 0, "strong_hit": False, "strong_count": 0, "top_metrics": []}
+    df = df.copy()
+    df["name_norm"] = df["name"].astype(str).map(_norm_name)
+    any_norm = [_norm_name(k) for k in any_keywords if str(k).strip()]
+    strong_norm = [_norm_name(k) for k in (strong_keywords or []) if str(k).strip()]
+
+    mask = False
+    for kw in any_norm:
+        mask = mask | df["name_norm"].str.contains(kw, na=False)
+    if not mask.any():
+        return {"sum_ratio": 0.0, "count": 0, "distinct": 0, "strong_hit": False, "strong_count": 0, "top_metrics": []}
+
+    thresholds = (
+        df.groupby(["cmdb_id", "name"], as_index=False)["value"]
+        .quantile(0.95)
+        .rename(columns={"value": "p95"})
+    )
+    win = df[(df["timestamp"] >= start) & (df["timestamp"] <= end) & (mask)].copy()
+    if win.empty:
+        return {"sum_ratio": 0.0, "count": 0, "distinct": 0, "strong_hit": False, "strong_count": 0, "top_metrics": []}
+    win = win.merge(thresholds, on=["cmdb_id", "name"], how="left").dropna(subset=["p95"]).copy()
+    denom = win["p95"].abs().where(win["p95"].abs() > 1e-6, 1.0)
+    win["breach_ratio"] = (win["value"] - win["p95"]) / denom
+    win["breach_ratio"] = win["breach_ratio"].clip(lower=0.0, upper=10.0)
+    win = win[win["breach_ratio"] > 0].copy()
+    if win.empty:
+        return {"sum_ratio": 0.0, "count": 0, "distinct": 0, "strong_hit": False, "strong_count": 0, "top_metrics": []}
+    strong_hit = False
+    strong_count = 0
+    if strong_norm:
+        for k in strong_norm:
+            if win["name_norm"].str.contains(k, na=False).any():
+                strong_count += 1
+        strong_hit = strong_count > 0
+    top_metrics = (
+        win.groupby("name", as_index=False)["breach_ratio"]
+        .sum()
+        .sort_values("breach_ratio", ascending=False)
+        .head(10)["name"]
+        .astype(str)
+        .tolist()
+    )
+    return {
+        "sum_ratio": float(win["breach_ratio"].sum()),
+        "count": int(len(win)),
+        "distinct": int(win["name"].nunique()),
+        "strong_hit": bool(strong_hit),
+        "strong_count": int(strong_count),
+        "top_metrics": top_metrics,
+    }
+
+
+def _reason_from_breach_scores(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    net_loss_kws = ["loss", "drop", "retrans", "timeout", "reset", "error"]
+    net_delay_kws = ["tnsping_result_time", "tnsping", "ping", "rtt", "latency", "delay"]
+    db_conn_kws = ["login_per_sec", "login", "tps_per_sec", "tps", "exec_per_sec", "exec", "sess_active", "session"]
+    db_conn_strong = ["login_per_sec", "tps_per_sec", "exec_per_sec"]
+    db_close_kws = ["on_off_state", "on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"]
+    cpu_kws = ["proc_used_pct", "proc_user_used_pct", "cpu", "load", "iowait", "util"]
+
+    net_path = os.path.join(metric_dir, "metric_node.csv")
+    mw_path = os.path.join(metric_dir, "metric_middleware.csv")
+    svc_path = os.path.join(metric_dir, "metric_service.csv")
+    cont_path = os.path.join(metric_dir, "metric_container.csv")
+
+    net_loss_n = _breach_stats(net_path, start, end, net_loss_kws)
+    net_delay_n = _breach_stats(net_path, start, end, net_delay_kws)
+    net_loss_m = _breach_stats(mw_path, start, end, net_loss_kws)
+    net_delay_m = _breach_stats(mw_path, start, end, net_delay_kws)
+    net_loss = max([net_loss_n, net_loss_m], key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))))
+    net_delay = max([net_delay_n, net_delay_m], key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))))
+    db_conn = _breach_stats(svc_path, start, end, db_conn_kws, strong_keywords=db_conn_strong)
+    db_close = _breach_stats(svc_path, start, end, db_close_kws)
+    cpu_c = _breach_stats(cont_path, start, end, cpu_kws)
+    cpu_n = _breach_stats(net_path, start, end, cpu_kws)
+
+    def score(stat: Dict[str, Any], require_distinct: int = 1, weak_penalty: float = 1.0) -> float:
+        if int(stat.get("distinct", 0)) < require_distinct:
+            return 0.0
+        s_sum = float(stat.get("sum_ratio", 0.0))
+        s_cnt = float(stat.get("count", 0))
+        s_dis = float(stat.get("distinct", 0))
+        mean_ratio = s_sum / max(1.0, s_cnt)
+        s = 2.0 * math.log1p(max(0.0, mean_ratio)) + 0.35 * math.log1p(max(0.0, s_cnt)) + 0.9 * math.log1p(max(0.0, s_dis))
+        return float(s * weak_penalty)
+
+    s_net_loss = max(score(net_loss_n, require_distinct=1), score(net_loss_m, require_distinct=1))
+    s_net_delay = max(score(net_delay_n, require_distinct=1), score(net_delay_m, require_distinct=1))
+    s_db_conn = score(db_conn, require_distinct=2, weak_penalty=1.0 if db_conn.get("strong_hit") else 0.25)
+    s_db_close = score(db_close, require_distinct=2)
+    s_cpu = max(score(cpu_c, require_distinct=1), score(cpu_n, require_distinct=1))
+
+    scored = [
+        ("network loss", s_net_loss, net_loss),
+        ("network delay", s_net_delay, net_delay),
+        ("db connection limit", s_db_conn, db_conn),
+        ("db close", s_db_close, db_close),
+        ("CPU fault", s_cpu, {"container": cpu_c, "node": cpu_n}),
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    if scored and scored[0][1] >= 1.0:
+        return scored[0][0]
+    return _reason_from_window(metric_dir, start, end)
+
+
+def task2_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
+    date_dir, start, end = _parse_time_window(instruction)
+    metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
+    trace_path = os.path.join("dataset", "Telecom", "telemetry", date_dir, "trace", "trace_span.csv")
+
+    net_loss_kws = ["loss", "drop", "retrans", "timeout", "reset", "error"]
+    net_delay_kws = ["tnsping_result_time", "tnsping", "ping", "rtt", "latency", "delay"]
+    db_conn_kws = ["login_per_sec", "login", "tps_per_sec", "tps", "exec_per_sec", "exec", "sess_active", "session"]
+    db_conn_strong = ["login_per_sec", "tps_per_sec", "exec_per_sec"]
+    db_close_kws = ["on_off_state", "on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"]
+    cpu_kws = ["proc_used_pct", "proc_user_used_pct", "cpu", "load", "iowait", "util"]
+
+    net_path = os.path.join(metric_dir, "metric_node.csv")
+    mw_path = os.path.join(metric_dir, "metric_middleware.csv")
+    svc_path = os.path.join(metric_dir, "metric_service.csv")
+    cont_path = os.path.join(metric_dir, "metric_container.csv")
+
+    net_loss_n = _breach_stats(net_path, start, end, net_loss_kws)
+    net_delay_n = _breach_stats(net_path, start, end, net_delay_kws)
+    net_loss_m = _breach_stats(mw_path, start, end, net_loss_kws)
+    net_delay_m = _breach_stats(mw_path, start, end, net_delay_kws)
+    net_loss = max([net_loss_n, net_loss_m], key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))))
+    net_delay = max([net_delay_n, net_delay_m], key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))))
+    db_conn = _breach_stats(svc_path, start, end, db_conn_kws, strong_keywords=db_conn_strong)
+    db_close = _breach_stats(svc_path, start, end, db_close_kws)
+    cpu_c = _breach_stats(cont_path, start, end, cpu_kws)
+    cpu_n = _breach_stats(net_path, start, end, cpu_kws)
+
+    def score(stat: Dict[str, Any], require_distinct: int = 1, weak_penalty: float = 1.0) -> float:
+        if int(stat.get("distinct", 0)) < require_distinct:
+            return 0.0
+        s_sum = float(stat.get("sum_ratio", 0.0))
+        s_cnt = float(stat.get("count", 0))
+        s_dis = float(stat.get("distinct", 0))
+        mean_ratio = s_sum / max(1.0, s_cnt)
+        s = 2.0 * math.log1p(max(0.0, mean_ratio)) + 0.35 * math.log1p(max(0.0, s_cnt)) + 0.9 * math.log1p(max(0.0, s_dis))
+        return float(s * weak_penalty)
+
+    s_net_loss = max(score(net_loss_n, require_distinct=1), score(net_loss_m, require_distinct=1))
+    s_net_delay = max(score(net_delay_n, require_distinct=1), score(net_delay_m, require_distinct=1))
+    s_db_conn = score(db_conn, require_distinct=2, weak_penalty=1.0 if db_conn.get("strong_hit") else 0.25)
+    s_db_close = score(db_close, require_distinct=2)
+    s_cpu = max(score(cpu_c, require_distinct=1), score(cpu_n, require_distinct=1))
+
+    scored = [
+        ("network loss", s_net_loss, net_loss),
+        ("network delay", s_net_delay, net_delay),
+        ("db connection limit", s_db_conn, db_conn),
+        ("db close", s_db_close, db_close),
+        ("CPU fault", s_cpu, {"container": cpu_c, "node": cpu_n}),
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_reason = scored[0][0] if scored else _reason_from_window(metric_dir, start, end)
+    best_score = float(scored[0][1]) if scored else 0.0
+    second_score = float(scored[1][1]) if len(scored) > 1 else 0.0
+    gap = best_score - second_score
+    evidence = {
+        "time_window": {"date_dir": date_dir, "start": start.strftime("%Y-%m-%d %H:%M:%S"), "end": end.strftime("%Y-%m-%d %H:%M:%S")},
+        "scores": {r: float(s) for r, s, _ in scored},
+        "gap": float(gap),
+        "best": {"reason": best_reason, "score": float(best_score)},
+        "stats": {
+            "network_loss": net_loss,
+            "network_delay": net_delay,
+            "db_connection_limit": db_conn,
+            "db_close": db_close,
+            "cpu_container": cpu_c,
+            "cpu_node": cpu_n,
+        },
+        "top_metrics": {
+            "network_loss": net_loss.get("top_metrics", []),
+            "network_delay": net_delay.get("top_metrics", []),
+            "db_connection_limit": db_conn.get("top_metrics", []),
+            "db_close": db_close.get("top_metrics", []),
+            "cpu_container": cpu_c.get("top_metrics", []),
+            "cpu_node": cpu_n.get("top_metrics", []),
+        },
+        "keyword_hits": {
+            "network_delay": 0,
+            "network_loss": 0,
+            "db_connection_limit": int(db_conn.get("strong_count", 0) or 0),
+            "db_close": 0,
+            "cpu": 0,
+        },
+        "trace_spread": {},
+    }
+    def _count_hits(metrics: List[str], tokens: List[str]) -> int:
+        blob = " ".join([str(x).lower() for x in metrics])
+        return int(sum(1 for t in tokens if t and t in blob))
+
+    evidence["keyword_hits"]["network_delay"] = _count_hits(evidence["top_metrics"]["network_delay"], ["tnsping", "ping", "rtt", "latency", "delay"])
+    evidence["keyword_hits"]["network_loss"] = _count_hits(evidence["top_metrics"]["network_loss"], ["timeout", "retrans", "loss", "drop", "reset", "error"])
+    evidence["keyword_hits"]["db_close"] = _count_hits(evidence["top_metrics"]["db_close"], ["close", "disconnect", "logout", "onoff", "shutdown", "restart"])
+    evidence["keyword_hits"]["cpu"] = _count_hits(evidence["top_metrics"]["cpu_node"] + evidence["top_metrics"]["cpu_container"], ["cpu", "load", "iowait", "util"])
+
+    evidence["trace_spread"] = _trace_spread_stats(trace_path, start, end)
+    evidence["trace_component"] = _trace_component_strength(trace_path, start, end)
+
+    spread = evidence["trace_spread"]
+    spread_ratio = float(spread.get("affected_ratio", 0.0) or 0.0)
+    hits = evidence["keyword_hits"]
+    scores = evidence["scores"]
+    tc = evidence["trace_component"]
+    db_max = float(tc.get("db_max_ratio", 0.0) or 0.0)
+    node_max = float(tc.get("node_max_ratio", 0.0) or 0.0)
+    cont_max = float(tc.get("container_max_ratio", 0.0) or 0.0)
+    top_type = str(tc.get("top_type") or "")
+    if spread_ratio >= 0.35 and (int(hits.get("network_loss", 0)) > 0 or int(hits.get("network_delay", 0)) > 0):
+        if int(hits.get("network_loss", 0)) >= int(hits.get("network_delay", 0)):
+            scores["network loss"] = float(scores.get("network loss", 0.0) + 1.0)
+        else:
+            scores["network delay"] = float(scores.get("network delay", 0.0) + 1.0)
+        scores["CPU fault"] = float(max(0.0, scores.get("CPU fault", 0.0) - 0.4))
+        scores["db connection limit"] = float(max(0.0, scores.get("db connection limit", 0.0) - 0.3))
+        scores["db close"] = float(max(0.0, scores.get("db close", 0.0) - 0.3))
+    if spread_ratio <= 0.15 and float(scores.get("CPU fault", 0.0)) > 0:
+        scores["CPU fault"] = float(scores.get("CPU fault", 0.0) + 0.2)
+    if db_max >= 1.6 or top_type == "db":
+        scores["db connection limit"] = float(scores.get("db connection limit", 0.0) + 0.4)
+        scores["db close"] = float(scores.get("db close", 0.0) + 0.4)
+    if db_max <= 1.25 and top_type in ("node", "container"):
+        scores["db connection limit"] = float(max(0.0, scores.get("db connection limit", 0.0) - 0.6))
+        scores["db close"] = float(max(0.0, scores.get("db close", 0.0) - 0.6))
+    if (max(node_max, cont_max) >= 1.6) and spread_ratio <= 0.25 and int(hits.get("cpu", 0)) >= 1:
+        scores["CPU fault"] = float(scores.get("CPU fault", 0.0) + 0.3)
+        scores["network loss"] = float(max(0.0, scores.get("network loss", 0.0) - 0.2))
+        scores["network delay"] = float(max(0.0, scores.get("network delay", 0.0) - 0.2))
+    evidence["scores"] = scores
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    if ranked:
+        best_reason = ranked[0][0]
+        evidence["best"] = {"reason": best_reason, "score": float(ranked[0][1])}
+        evidence["gap"] = float(ranked[0][1] - (ranked[1][1] if len(ranked) > 1 else 0.0))
+    return best_reason, evidence
+
+
+def _trace_component_strength(trace_path: str, start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, Any]:
+    if not os.path.exists(trace_path):
+        return {"top_component": "", "top_ratio": 0.0, "top_type": "", "db_max_ratio": 0.0, "node_max_ratio": 0.0, "container_max_ratio": 0.0}
+    df = pd.read_csv(trace_path, low_memory=False)
+    if df.empty or "cmdb_id" not in df.columns:
+        return {"top_component": "", "top_ratio": 0.0, "top_type": "", "db_max_ratio": 0.0, "node_max_ratio": 0.0, "container_max_ratio": 0.0}
+    ts_col = "startTime" if "startTime" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
+    dur_col = "elapsedTime" if "elapsedTime" in df.columns else ("duration" if "duration" in df.columns else None)
+    if ts_col is None or dur_col is None:
+        return {"top_component": "", "top_ratio": 0.0, "top_type": "", "db_max_ratio": 0.0, "node_max_ratio": 0.0, "container_max_ratio": 0.0}
+    df = df[[ts_col, "cmdb_id", dur_col]].copy()
+    df["ts"] = pd.to_datetime(df[ts_col], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai")
+    df["dur"] = pd.to_numeric(df[dur_col], errors="coerce")
+    df["cmdb_id"] = df["cmdb_id"].astype(str)
+    df = df.dropna(subset=["ts", "dur"])
+    df = df[(df["ts"] >= start) & (df["ts"] <= end)].copy()
+    if df.empty:
+        return {"top_component": "", "top_ratio": 0.0, "top_type": "", "db_max_ratio": 0.0, "node_max_ratio": 0.0, "container_max_ratio": 0.0}
+    p95 = df.groupby("cmdb_id")["dur"].quantile(0.95)
+    if p95.empty:
+        return {"top_component": "", "top_ratio": 0.0, "top_type": "", "db_max_ratio": 0.0, "node_max_ratio": 0.0, "container_max_ratio": 0.0}
+    baseline = float(p95.median())
+    if baseline <= 0:
+        return {"top_component": "", "top_ratio": 0.0, "top_type": "", "db_max_ratio": 0.0, "node_max_ratio": 0.0, "container_max_ratio": 0.0}
+    ratios = (p95 / baseline).fillna(0.0)
+    top_comp = str(ratios.sort_values(ascending=False).index[0])
+    top_ratio = float(ratios.loc[top_comp])
+    def _ctype(c: str) -> str:
+        c = str(c or "")
+        if c.startswith("db_"):
+            return "db"
+        if c.startswith(("os_", "node-")):
+            return "node"
+        if c.startswith(("docker_", "container")):
+            return "container"
+        if "-" in c:
+            return "service"
+        return "other"
+    db_max = float(ratios[[i for i in ratios.index if str(i).startswith('db_')]].max()) if any(str(i).startswith('db_') for i in ratios.index) else 0.0
+    node_max = float(ratios[[i for i in ratios.index if str(i).startswith('os_')]].max()) if any(str(i).startswith('os_') for i in ratios.index) else 0.0
+    cont_max = float(ratios[[i for i in ratios.index if str(i).startswith('docker_')]].max()) if any(str(i).startswith('docker_') for i in ratios.index) else 0.0
+    return {
+        "top_component": top_comp,
+        "top_ratio": top_ratio,
+        "top_type": _ctype(top_comp),
+        "db_max_ratio": db_max,
+        "node_max_ratio": node_max,
+        "container_max_ratio": cont_max,
+    }
+
+
+def _trace_spread_stats(trace_path: str, start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, Any]:
+    if not os.path.exists(trace_path):
+        return {"total_components": 0, "affected_components": 0, "affected_ratio": 0.0}
+    df = pd.read_csv(trace_path, low_memory=False)
+    if df.empty:
+        return {"total_components": 0, "affected_components": 0, "affected_ratio": 0.0}
+    if "cmdb_id" not in df.columns:
+        return {"total_components": 0, "affected_components": 0, "affected_ratio": 0.0}
+    ts_col = "startTime" if "startTime" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
+    dur_col = "elapsedTime" if "elapsedTime" in df.columns else ("duration" if "duration" in df.columns else None)
+    if ts_col is None or dur_col is None:
+        return {"total_components": 0, "affected_components": 0, "affected_ratio": 0.0}
+    df = df[[ts_col, "cmdb_id", dur_col]].copy()
+    if ts_col == "startTime":
+        df["ts"] = pd.to_datetime(df[ts_col], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai")
+    else:
+        df["ts"] = pd.to_datetime(df[ts_col], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai")
+    df["dur"] = pd.to_numeric(df[dur_col], errors="coerce")
+    df["cmdb_id"] = df["cmdb_id"].astype(str)
+    df = df.dropna(subset=["ts", "dur"])
+    df = df[(df["ts"] >= start) & (df["ts"] <= end)].copy()
+    if df.empty:
+        return {"total_components": 0, "affected_components": 0, "affected_ratio": 0.0}
+    p95 = df.groupby("cmdb_id")["dur"].quantile(0.95)
+    if p95.empty:
+        return {"total_components": 0, "affected_components": 0, "affected_ratio": 0.0}
+    baseline = float(p95.median())
+    if baseline <= 0:
+        return {"total_components": int(p95.shape[0]), "affected_components": 0, "affected_ratio": 0.0}
+    ratios = (p95 / baseline).fillna(0.0)
+    affected = int((ratios >= 1.5).sum())
+    total = int(ratios.shape[0])
+    return {"total_components": total, "affected_components": affected, "affected_ratio": float(affected / total) if total else 0.0}
+
+
+def evidence_supports_task2_reason(evidence: Dict[str, Any], reason: str) -> bool:
+    stats = evidence.get("stats", {}) if isinstance(evidence.get("stats"), dict) else {}
+    topm = evidence.get("top_metrics", {}) if isinstance(evidence.get("top_metrics"), dict) else {}
+    hits = evidence.get("keyword_hits", {}) if isinstance(evidence.get("keyword_hits"), dict) else {}
+    r = str(reason)
+    if r == "network loss":
+        s = stats.get("network_loss", {})
+        names = " ".join([str(x).lower() for x in topm.get("network_loss", [])])
+        return bool(
+            float(s.get("sum_ratio", 0.0)) >= 0.6
+            and int(s.get("distinct", 0)) >= 1
+            and (int(hits.get("network_loss", 0)) >= 1 or ("timeout" in names or "retrans" in names or "loss" in names or "drop" in names or "reset" in names))
+        )
+    if r == "network delay":
+        s = stats.get("network_delay", {})
+        names = " ".join([str(x).lower() for x in topm.get("network_delay", [])])
+        return bool(
+            float(s.get("sum_ratio", 0.0)) >= 0.6
+            and int(s.get("distinct", 0)) >= 1
+            and (int(hits.get("network_delay", 0)) >= 1 or ("tnsping" in names or "ping" in names or "rtt" in names or "latency" in names or "delay" in names))
+        )
+    if r == "db connection limit":
+        s = stats.get("db_connection_limit", {})
+        return bool(float(s.get("sum_ratio", 0.0)) >= 0.8 and int(s.get("distinct", 0)) >= 2 and bool(s.get("strong_hit", False)))
+    if r == "db close":
+        s = stats.get("db_close", {})
+        names = " ".join([str(x).lower() for x in topm.get("db_close", [])])
+        return bool(
+            float(s.get("sum_ratio", 0.0)) >= 0.8
+            and int(s.get("distinct", 0)) >= 2
+            and (int(hits.get("db_close", 0)) >= 1 or ("close" in names or "disconnect" in names or "logout" in names or "onoff" in names))
+        )
+    if r == "CPU fault":
+        s1 = stats.get("cpu_container", {})
+        s2 = stats.get("cpu_node", {})
+        return bool(max(float(s1.get("sum_ratio", 0.0)), float(s2.get("sum_ratio", 0.0))) >= 0.8)
+    return False
+
+
+def _best_component_by_total_breach(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    files = ["metric_node.csv", "metric_service.csv", "metric_container.csv", "metric_middleware.csv"]
+    total: Dict[str, float] = {}
+    for fn in files:
+        path = os.path.join(metric_dir, fn)
+        if not os.path.exists(path):
+            continue
+        df = _load_metric(path)
+        if df.empty:
+            continue
+        df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
+        if df.empty:
+            continue
+        thresholds = (
+            df.groupby(["cmdb_id", "name"], as_index=False)["value"]
+            .quantile(0.95)
+            .rename(columns={"value": "p95"})
+        )
+        df = df.merge(thresholds, on=["cmdb_id", "name"], how="left")
+        df = df.dropna(subset=["p95"]).copy()
+        denom = df["p95"].abs().where(df["p95"].abs() > 1e-6, 1.0)
+        df["breach_ratio"] = (df["value"] - df["p95"]) / denom
+        df["breach_ratio"] = df["breach_ratio"].clip(lower=0.0, upper=10.0)
+        df = df[df["breach_ratio"] > 0].copy()
+        if df.empty:
+            continue
+        for comp, g in df.groupby("cmdb_id"):
+            comp_s = str(comp)
+            if not comp_s.startswith(("os_", "docker_", "db_")):
+                continue
+            total[comp_s] = total.get(comp_s, 0.0) + float(g["breach_ratio"].sum())
+    if not total:
+        return ""
+    return sorted(total.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+
+
+def _best_component_by_prefix(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, prefix: str) -> Tuple[str, float]:
+    files = ["metric_node.csv", "metric_service.csv", "metric_container.csv", "metric_middleware.csv"]
+    total: Dict[str, float] = {}
+    for fn in files:
+        path = os.path.join(metric_dir, fn)
+        if not os.path.exists(path):
+            continue
+        df = _load_metric(path)
+        if df.empty:
+            continue
+        df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
+        if df.empty:
+            continue
+        df = df[df["cmdb_id"].astype(str).str.startswith(prefix)].copy()
+        if df.empty:
+            continue
+        thresholds = (
+            df.groupby(["cmdb_id", "name"], as_index=False)["value"]
+            .quantile(0.95)
+            .rename(columns={"value": "p95"})
+        )
+        df = df.merge(thresholds, on=["cmdb_id", "name"], how="left").dropna(subset=["p95"]).copy()
+        denom = df["p95"].abs().where(df["p95"].abs() > 1e-6, 1.0)
+        df["breach_ratio"] = (df["value"] - df["p95"]) / denom
+        df["breach_ratio"] = df["breach_ratio"].clip(lower=0.0, upper=10.0)
+        df = df[df["breach_ratio"] > 0].copy()
+        if df.empty:
+            continue
+        by_comp = df.groupby("cmdb_id", as_index=False)["breach_ratio"].sum()
+        for _, r in by_comp.iterrows():
+            c = str(r["cmdb_id"])
+            total[c] = total.get(c, 0.0) + float(r["breach_ratio"])
+    if not total:
+        return "", 0.0
+    comp, s = sorted(total.items(), key=lambda kv: kv[1], reverse=True)[0]
+    return comp, float(s)
+
+
+def _best_component_for_task3(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, instruction: str) -> str:
+    reason, ev = task2_reason_with_evidence(instruction)
+
+    def best_comp(metric_file: str, prefix: str, keywords: List[str]) -> Tuple[str, float]:
+        path = os.path.join(metric_dir, metric_file)
+        if not os.path.exists(path):
+            return "", 0.0
+        df = _load_metric(path)
+        if df.empty:
+            return "", 0.0
+        df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
+        if df.empty:
+            return "", 0.0
+        df["cmdb_id"] = df["cmdb_id"].astype(str)
+        df = df[df["cmdb_id"].str.startswith(prefix)].copy()
+        if df.empty:
+            return "", 0.0
+        df["name_norm"] = df["name"].astype(str).map(_norm_name)
+        kws = [_norm_name(k) for k in keywords if str(k).strip()]
+        mask = False
+        for k in kws:
+            mask = mask | df["name_norm"].str.contains(k, na=False)
+        df = df[mask].copy()
+        if df.empty:
+            return "", 0.0
+        thresholds = (
+            df.groupby(["cmdb_id", "name"], as_index=False)["value"]
+            .quantile(0.95)
+            .rename(columns={"value": "p95"})
+        )
+        df = df.merge(thresholds, on=["cmdb_id", "name"], how="left").dropna(subset=["p95"]).copy()
+        denom = df["p95"].abs().where(df["p95"].abs() > 1e-6, 1.0)
+        df["breach_ratio"] = (df["value"] - df["p95"]) / denom
+        df["breach_ratio"] = df["breach_ratio"].clip(lower=0.0, upper=10.0)
+        df = df[df["breach_ratio"] > 0].copy()
+        if df.empty:
+            return "", 0.0
+        by = df.groupby("cmdb_id", as_index=False)["breach_ratio"].sum().sort_values("breach_ratio", ascending=False)
+        return str(by.iloc[0]["cmdb_id"]), float(by.iloc[0]["breach_ratio"])
+
+    cpu_node_kws = ["proc_used_pct", "proc_user_used_pct", "cpu", "load", "iowait", "util"]
+    cpu_cont_kws = ["cpu", "load", "util"]
+    db_conn_kws = ["login_per_sec", "login", "tps_per_sec", "tps", "exec_per_sec", "exec", "sess_active", "session"]
+    db_close_kws = ["on_off_state", "on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"]
+    net_kws = ["tnsping_result_time", "tnsping", "ping", "rtt", "latency", "delay", "timeout", "retrans", "loss", "drop", "reset"]
+
+    os_cpu_comp, os_cpu_s = best_comp("metric_node.csv", "os_", cpu_node_kws)
+    os_net_comp, os_net_s = best_comp("metric_node.csv", "os_", net_kws)
+    db_conn_comp, db_conn_s = best_comp("metric_service.csv", "db_", db_conn_kws)
+    db_close_comp, db_close_s = best_comp("metric_service.csv", "db_", db_close_kws)
+    docker_cpu_comp, docker_cpu_s = best_comp("metric_container.csv", "docker_", cpu_cont_kws)
+
+    if reason in ("network delay", "network loss"):
+        return os_net_comp or os_cpu_comp or "os_001"
+    if reason == "db close" and db_close_comp:
+        return db_close_comp
+    if reason == "db connection limit" and db_conn_comp:
+        return db_conn_comp
+
+    db_s = max(db_conn_s, db_close_s)
+    db_comp = db_conn_comp if db_conn_s >= db_close_s else db_close_comp
+    if db_s > 0 and os_cpu_s > 0 and db_s >= os_cpu_s * 1.3:
+        return db_comp
+    if os_cpu_comp:
+        return os_cpu_comp
+    if os_net_comp:
+        return os_net_comp
+    if db_comp:
+        return db_comp
+    if docker_cpu_comp:
+        return docker_cpu_comp
+    return _best_component_by_total_breach(metric_dir, start, end) or "os_001"
+
+
+def task3_component_candidates_with_evidence(instruction: str) -> Tuple[str, List[str], Dict[str, Any]]:
+    date_dir, start, end = _parse_time_window(instruction)
+    metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
+
+    cpu_node_kws = ["proc_used_pct", "proc_user_used_pct", "cpu", "load", "iowait", "util"]
+    net_kws = ["tnsping_result_time", "tnsping", "ping", "rtt", "latency", "delay", "timeout", "retrans", "loss", "drop", "reset"]
+    db_conn_kws = ["login_per_sec", "login", "tps_per_sec", "tps", "exec_per_sec", "exec", "sess_active", "session"]
+    db_close_kws = ["on_off_state", "on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"]
+
+    def top_comps(metric_file: str, prefix: str, keywords: List[str], top_k: int) -> List[Tuple[str, float, str]]:
+        path = os.path.join(metric_dir, metric_file)
+        if not os.path.exists(path):
+            return []
+        df = _load_metric(path)
+        if df.empty:
+            return []
+        df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
+        if df.empty:
+            return []
+        df["cmdb_id"] = df["cmdb_id"].astype(str)
+        df = df[df["cmdb_id"].str.startswith(prefix)].copy()
+        if df.empty:
+            return []
+        df["name_norm"] = df["name"].astype(str).map(_norm_name)
+        kws = [_norm_name(k) for k in keywords if str(k).strip()]
+        mask = False
+        for k in kws:
+            mask = mask | df["name_norm"].str.contains(k, na=False)
+        df = df[mask].copy()
+        if df.empty:
+            return []
+        thresholds = (
+            df.groupby(["cmdb_id", "name"], as_index=False)["value"]
+            .quantile(0.95)
+            .rename(columns={"value": "p95"})
+        )
+        df = df.merge(thresholds, on=["cmdb_id", "name"], how="left").dropna(subset=["p95"]).copy()
+        denom = df["p95"].abs().where(df["p95"].abs() > 1e-6, 1.0)
+        df["breach_ratio"] = (df["value"] - df["p95"]) / denom
+        df["breach_ratio"] = df["breach_ratio"].clip(lower=0.0, upper=10.0)
+        df = df[df["breach_ratio"] > 0].copy()
+        if df.empty:
+            return []
+        by = df.groupby("cmdb_id", as_index=False)["breach_ratio"].sum().sort_values("breach_ratio", ascending=False).head(top_k)
+        peak_map: Dict[str, str] = {}
+        df["minute"] = df["timestamp"].dt.floor("min")
+        for comp, g in df.groupby("cmdb_id"):
+            m = g.groupby("minute", as_index=False)["breach_ratio"].sum().sort_values("breach_ratio", ascending=False)
+            if not m.empty:
+                peak_map[str(comp)] = pd.Timestamp(m.iloc[0]["minute"]).strftime("%Y-%m-%d %H:%M:%S")
+        out = []
+        for _, r in by.iterrows():
+            c = str(r["cmdb_id"])
+            out.append((c, float(r["breach_ratio"]), peak_map.get(c, "")))
+        return out
+
+    os_cpu = top_comps("metric_node.csv", "os_", cpu_node_kws, 8)
+    os_net = top_comps("metric_node.csv", "os_", net_kws, 6)
+    db_conn = top_comps("metric_service.csv", "db_", db_conn_kws, 6)
+    db_close = top_comps("metric_service.csv", "db_", db_close_kws, 6)
+
+    det = _best_component_for_task3(metric_dir, start, end, instruction)
+    cand = []
+    for seq in (os_cpu, os_net, db_conn, db_close):
+        for c, _, _ in seq:
+            cand.append(c)
+    cand = list(dict.fromkeys([det] + cand))[:15]
+
+    t1 = estimate_task1_datetime_from_trace(instruction)
+    evidence = {
+        "time_window": {"date_dir": date_dir, "start": start.strftime("%Y-%m-%d %H:%M:%S"), "end": end.strftime("%Y-%m-%d %H:%M:%S")},
+        "task1_estimated_time": t1,
+        "deterministic_choice": det,
+        "os_cpu_top": [{"component": c, "score": s, "peak_time": pt} for c, s, pt in os_cpu[:6]],
+        "os_net_top": [{"component": c, "score": s, "peak_time": pt} for c, s, pt in os_net[:6]],
+        "db_conn_top": [{"component": c, "score": s, "peak_time": pt} for c, s, pt in db_conn[:6]],
+        "db_close_top": [{"component": c, "score": s, "peak_time": pt} for c, s, pt in db_close[:6]],
+    }
+    return det, cand, evidence
+
+
+def pick_component_by_granger(instruction: str) -> str:
+    date_dir, start, end = _parse_time_window(instruction)
+    metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
+    comp = _best_component_by_total_breach(metric_dir, start, end)
+    if comp:
+        return comp
+    ranked = _rank_components(metric_dir, start, end)
+    if not ranked.empty:
+        return str(ranked.iloc[0]["component"])
+    return "os_001"
 
 
 def estimate_task1_datetime_from_trace(instruction: str) -> str:
@@ -463,13 +1009,12 @@ def estimate_task1_datetime_from_trace(instruction: str) -> str:
     if df.empty:
         return start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
     df["minute"] = df["ts"].dt.floor("min")
-    p95 = df.groupby("minute")["elapsedTime"].quantile(0.95)
+    p95 = df.groupby("minute")["elapsedTime"].quantile(0.95).sort_index()
     if p95.empty:
         return start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
-    p95 = p95.sort_index()
     baseline = float(p95.median())
-    threshold = baseline * 1.08
-    candidates = p95[p95 >= threshold]
+    diff = p95.diff().fillna(0.0)
+    candidates = p95[(p95 >= baseline * 1.2) & (diff >= max(1.0, baseline * 0.1))]
     if not candidates.empty:
         chosen = candidates.index[0]
         return pd.Timestamp(chosen).strftime("%Y-%m-%d %H:%M:%S")

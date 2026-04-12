@@ -6,7 +6,11 @@ def load_config(config_path="rca/api_config.yaml"):
     configs = dict(os.environ)
     with open(config_path, "r") as file:
         yaml_data = yaml.safe_load(file)
-    configs.update(yaml_data)
+    if isinstance(yaml_data, dict):
+        for key, value in yaml_data.items():
+            if value is None or value == "":
+                continue
+            configs[key] = value
     return configs
 
 configs = load_config()

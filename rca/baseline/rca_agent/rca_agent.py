@@ -18,8 +18,7 @@ class RCA_Agent:
             dataset_name=dataset_name,
             max_step=max_step,
             max_turn=max_turn,
-            task_focus=task_focus,
-        )
+            task_focus=task_focus)
         logger.info(f"Result: {prediction}")
 
         return prediction, trajectory, prompt
