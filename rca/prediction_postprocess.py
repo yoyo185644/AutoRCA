@@ -1,5 +1,8 @@
 import json
+import re
 from typing import Any, Dict, List, Optional
+
+import pandas as pd
 
 from rca.market_solver import canonicalize_market_component, estimate_k_occurrence_datetimes_from_logs, estimate_k_occurrence_datetimes_from_trace, required_root_count
 from rca.task_time_hybrid import estimate_occurrence_datetime_from_trace
@@ -39,6 +42,36 @@ def _single_time(dataset: str, instruction: str) -> str:
     return dt
 
 
+_DT_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _normalize_datetime_str(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    s = s.replace("/", "-").replace("T", " ").strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}$", s):
+        s = s + ":00"
+    has_tz = bool(re.search(r"(Z|[+-]\d{2}:?\d{2})$", s))
+    try:
+        if has_tz:
+            ts = pd.to_datetime(s, errors="coerce", utc=True)
+            if pd.isna(ts):
+                return ""
+            ts = ts.tz_convert("Asia/Shanghai")
+        else:
+            ts = pd.to_datetime(s, errors="coerce")
+            if pd.isna(ts):
+                return ""
+            if getattr(ts, "tz", None) is None:
+                ts = ts.tz_localize("Asia/Shanghai")
+            else:
+                ts = ts.tz_convert("Asia/Shanghai")
+        return ts.strftime(_DT_FMT)
+    except Exception:
+        return ""
+
+
 def normalize_prediction_for_eval(
     prediction: str,
     dataset: str,
@@ -54,10 +87,7 @@ def normalize_prediction_for_eval(
     if not obj:
         obj = {"1": {}}
 
-    if dataset.startswith("Market/"):
-        k = required_root_count(scoring_points)
-    else:
-        k = 1
+    k = required_root_count(scoring_points)
 
     roots: List[Dict[str, Any]] = []
     for i in range(1, int(k) + 1):
@@ -68,12 +98,13 @@ def normalize_prediction_for_eval(
 
     dts: Optional[List[str]] = None
     if need_time:
-        if dataset.startswith("Market/") and int(k) > 1:
+        if dataset.startswith("Market/") and int(k) >= 1:
             dts = _market_times(dataset=dataset, instruction=instruction, k=int(k))
-        elif dataset.startswith("Market/") and int(k) == 1:
-            dts = _market_times(dataset=dataset, instruction=instruction, k=1)
         else:
-            dts = [_single_time(dataset=dataset, instruction=instruction)]
+            if int(k) > 1:
+                dts = estimate_k_occurrence_datetimes_from_trace(dataset=dataset, instruction=instruction, k=int(k))
+            else:
+                dts = [_single_time(dataset=dataset, instruction=instruction)]
 
     for i in range(int(k)):
         r = roots[i]
@@ -82,11 +113,18 @@ def normalize_prediction_for_eval(
                 dt = dts[i] if i < len(dts) else dts[-1]
             else:
                 dt = ""
-            r.setdefault("root cause occurrence datetime", dt)
+            if not str(r.get("root cause occurrence datetime") or "").strip():
+                r["root cause occurrence datetime"] = dt
         if need_comp:
-            r.setdefault("root cause component", r.get("root cause component") or r.get("root cause component".replace(" ", "_")) or "")
+            key2 = "root cause component".replace(" ", "_")
+            v = r.get("root cause component") or r.get(key2) or ""
+            if not str(r.get("root cause component") or "").strip():
+                r["root cause component"] = str(v or "")
         if need_reason:
-            r.setdefault("root cause reason", r.get("root cause reason") or r.get("root cause reason".replace(" ", "_")) or "")
+            key2 = "root cause reason".replace(" ", "_")
+            v = r.get("root cause reason") or r.get(key2) or ""
+            if not str(r.get("root cause reason") or "").strip():
+                r["root cause reason"] = str(v or "")
 
         if dataset.startswith("Market/") and "root cause component" in r:
             r["root cause component"] = canonicalize_market_component(str(r.get("root cause component") or ""))
@@ -97,11 +135,10 @@ def normalize_prediction_for_eval(
     for i, r in enumerate(roots, start=1):
         rr: Dict[str, Any] = {}
         if "root cause occurrence datetime" in r:
-            rr["root cause occurrence datetime"] = r.get("root cause occurrence datetime") or ""
+            rr["root cause occurrence datetime"] = _normalize_datetime_str(r.get("root cause occurrence datetime") or "")
         if "root cause component" in r:
             rr["root cause component"] = r.get("root cause component") or ""
         if "root cause reason" in r:
             rr["root cause reason"] = r.get("root cause reason") or ""
         out[str(i)] = rr
     return _safe_dump_obj(out)
-

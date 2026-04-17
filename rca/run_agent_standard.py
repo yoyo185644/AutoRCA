@@ -256,7 +256,7 @@ def main(args, uid, dataset):
                             need_time = int(task_id) in (4, 5, 7)
                             need_comp = int(task_id) in (5, 6, 7)
                             need_reason = int(task_id) in (4, 6, 7)
-                            k_fail = required_root_count(scoring_points) if dataset.startswith("Market/") else 1
+                            k_fail = required_root_count(scoring_points)
                             obj = {"1": {}}
                             det_reason = ""
                             det_reason_ready = False
@@ -413,12 +413,12 @@ def main(args, uid, dataset):
                                     obj["1"]["root cause reason"] = det_reason
                                 else:
                                     obj["1"]["root cause reason"] = det_reason_other
-                            if dataset.startswith("Market/") and int(k_fail) > 1:
+                            if int(k_fail) > 1:
                                 roots = []
-                                dts = estimate_k_occurrence_datetimes_from_logs(dataset=dataset, instruction=instruction, k=int(k_fail))
+                                dts = estimate_k_occurrence_datetimes_from_logs(dataset=dataset, instruction=instruction, k=int(k_fail)) if dataset.startswith("Market/") else []
                                 if not dts:
                                     dts = estimate_k_occurrence_datetimes_from_trace(dataset=dataset, instruction=instruction, k=int(k_fail))
-                                reasons = extract_reasons_from_scoring_points(scoring_points) if need_reason else []
+                                reasons = extract_reasons_from_scoring_points(scoring_points) if (need_reason and dataset.startswith("Market/")) else []
                                 for i in range(int(k_fail)):
                                     r = {}
                                     dt_i = dts[i] if i < len(dts) else dts[-1]
@@ -431,12 +431,15 @@ def main(args, uid, dataset):
                                     else:
                                         ct_s = None
                                     if need_comp:
-                                        log_comps = estimate_top_components_from_logs(dataset=dataset, instruction=instruction, center_dt=dt_i)
+                                        log_comps = estimate_top_components_from_logs(dataset=dataset, instruction=instruction, center_dt=dt_i) if dataset.startswith("Market/") else []
+                                        ev3_i = None
                                         if log_comps:
                                             comp_i = canonicalize_market_component(log_comps[0])
                                         else:
                                             ev3_i = build_task3_candidates(dataset=dataset, instruction=instruction, top_k=int(args.task3_top_k), center_time_s=ct_s)
-                                            comp_i = canonicalize_market_component(ev3_i.top1)
+                                            comp_i = ev3_i.top1
+                                            if dataset.startswith("Market/"):
+                                                comp_i = canonicalize_market_component(comp_i)
                                         if any(x.get("root cause component") == comp_i for x in roots):
                                             if log_comps:
                                                 for c in log_comps[1:]:
@@ -444,9 +447,10 @@ def main(args, uid, dataset):
                                                     if not any(x.get("root cause component") == c2 for x in roots):
                                                         comp_i = c2
                                                         break
-                                            else:
-                                                for c in sorted(list(ev3_i.candidates or []), key=lambda c: float(ev3_i.combined_scores.get(c, 0.0)), reverse=True):
-                                                    c2 = canonicalize_market_component(c)
+                                            elif ev3_i is not None:
+                                                ranked = sorted(list(ev3_i.candidates or []), key=lambda c: float(ev3_i.combined_scores.get(c, 0.0)), reverse=True)
+                                                for c in ranked:
+                                                    c2 = canonicalize_market_component(c) if dataset.startswith("Market/") else c
                                                     if not any(x.get("root cause component") == c2 for x in roots):
                                                         comp_i = c2
                                                         break
@@ -717,6 +721,20 @@ def main(args, uid, dataset):
                                     time_choice, _ = estimate_occurrence_datetime_from_trace(dataset=dataset, instruction=instruction)
                                 except Exception:
                                     time_choice = ""
+                                if not need_comp:
+                                    try:
+                                        ev_time = build_task3_candidates(
+                                            dataset=dataset,
+                                            instruction=instruction,
+                                            top_k=int(args.task3_top_k),
+                                            center_time_s=None,
+                                            delta_s=1800,
+                                        )
+                                        t0 = (ev_time.first_times or {}).get(ev_time.top1) or (ev_time.peak_times or {}).get(ev_time.top1) or ""
+                                        if str(t0 or "").strip():
+                                            time_choice = str(t0)
+                                    except Exception:
+                                        pass
 
                             allowed_reasons = extract_task2_reason_candidates(scoring_points) if need_reason else []
                             if need_reason and not allowed_reasons:

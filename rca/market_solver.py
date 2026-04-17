@@ -9,9 +9,9 @@ from rca.query_parsing import extract_task2_reason_candidates
 from rca.task3_hybrid import parse_time_window_generic
 
 
-_COMP_PATTERN = r"The (?:\\d+-th|only) predicted root cause component is ([^\\n]+)"
-_REASON_PATTERN = r"The (?:\\d+-th|only) predicted root cause reason is ([^\\n]+)"
-_TIME_PATTERN = r"The (?:\\d+-th|only) root cause occurrence time is within 1 minutes \\(i.e., <=1min\\) of ([^\\n]+)"
+_COMP_PATTERN = r"The (?:\d+-th|only) predicted root cause component is ([^\n]+)"
+_REASON_PATTERN = r"The (?:\d+-th|only) predicted root cause reason is ([^\n]+)"
+_TIME_PATTERN = r"The (?:\d+-th|only) root cause occurrence time is within 1 minutes \(i.e., <=1min\) of ([^\n]+)"
 
 
 def required_root_count(scoring_points: str) -> int:
@@ -98,13 +98,11 @@ def estimate_k_occurrence_datetimes_from_trace(dataset: str, instruction: str, k
 
 def _market_log_anomaly_mask_service(values: pd.Series) -> pd.Series:
     s = values.astype(str).str.lower()
-    return s.str.contains(r"severity:\s*(error|warn)") | s.str.contains(r"\b(error|exception|fail|failed|timeout|unavailable|panic)\b")
-
+    return s.str.contains("error", regex=False) | s.str.contains("fail", regex=False) | s.str.contains("exception", regex=False) | s.str.contains("timeout", regex=False)
 
 def _market_log_anomaly_mask_proxy(values: pd.Series) -> pd.Series:
-    status = values.astype(str).str.extract(r"\"\"\"[^\"]+\"\"\"\s+(\d{3})", expand=False)
-    status = pd.to_numeric(status, errors="coerce")
-    return status.ge(400)
+    s = values.astype(str)
+    return s.str.contains(" 500 ", regex=False) | s.str.contains(" 502 ", regex=False) | s.str.contains(" 503 ", regex=False) | s.str.contains(" 504 ", regex=False) | s.str.contains(" 400 ", regex=False) | s.str.contains(" 404 ", regex=False)
 
 
 def estimate_k_occurrence_datetimes_from_logs(dataset: str, instruction: str, k: int) -> List[str]:
@@ -112,16 +110,22 @@ def estimate_k_occurrence_datetimes_from_logs(dataset: str, instruction: str, k:
     log_dir = os.path.join("dataset", dataset, "telemetry", date_dir, "log")
     paths = [os.path.join(log_dir, "log_service.csv"), os.path.join(log_dir, "log_proxy.csv")]
     frames = []
+
+    def _load_and_filter_time(p: str) -> pd.DataFrame:
+        df = pd.read_csv(p, low_memory=False, usecols=["timestamp", "value"] if "log_proxy" in p or "log_service" in p else None)
+        if df.empty or not {"timestamp", "value"}.issubset(df.columns):
+            return pd.DataFrame()
+        df["ts"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Shanghai")
+        return df[(df["ts"] >= start) & (df["ts"] <= end)].copy()
+
     if os.path.exists(paths[0]):
-        df = pd.read_csv(paths[0], low_memory=False)
-        if not df.empty and {"timestamp", "value"}.issubset(df.columns):
-            df = df[["timestamp", "value"]].copy()
+        df = _load_and_filter_time(paths[0])
+        if not df.empty:
             df["is_anom"] = _market_log_anomaly_mask_service(df["value"])
             frames.append(df[df["is_anom"]])
     if os.path.exists(paths[1]):
-        df = pd.read_csv(paths[1], low_memory=False)
-        if not df.empty and {"timestamp", "value"}.issubset(df.columns):
-            df = df[["timestamp", "value"]].copy()
+        df = _load_and_filter_time(paths[1])
+        if not df.empty:
             df["is_anom"] = _market_log_anomaly_mask_proxy(df["value"])
             frames.append(df[df["is_anom"]])
     if not frames:
@@ -129,11 +133,7 @@ def estimate_k_occurrence_datetimes_from_logs(dataset: str, instruction: str, k:
     df = pd.concat(frames, ignore_index=True)
     if df.empty:
         return []
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Shanghai")
-    df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
-    if df.empty:
-        return []
-    df["minute"] = df["timestamp"].dt.floor("min")
+    df["minute"] = df["ts"].dt.floor("min")
     cnt = df.groupby("minute").size().sort_values(ascending=False)
     if cnt.empty:
         return []
@@ -152,37 +152,45 @@ def estimate_top_components_from_logs(dataset: str, instruction: str, center_dt:
     log_dir = os.path.join("dataset", dataset, "telemetry", date_dir, "log")
     paths = [os.path.join(log_dir, "log_service.csv"), os.path.join(log_dir, "log_proxy.csv")]
     frames = []
-    if os.path.exists(paths[0]):
-        df = pd.read_csv(paths[0], low_memory=False)
-        if not df.empty and {"timestamp", "cmdb_id", "value"}.issubset(df.columns):
-            df = df[["timestamp", "cmdb_id", "value"]].copy()
-            df["is_anom"] = _market_log_anomaly_mask_service(df["value"])
-            df["w"] = 1.0
-            frames.append(df[df["is_anom"]])
-    if os.path.exists(paths[1]):
-        df = pd.read_csv(paths[1], low_memory=False)
-        if not df.empty and {"timestamp", "cmdb_id", "value"}.issubset(df.columns):
-            df = df[["timestamp", "cmdb_id", "value"]].copy()
-            df["is_anom"] = _market_log_anomaly_mask_proxy(df["value"])
-            status = df["value"].astype(str).str.extract(r"\"\"\"[^\"]+\"\"\"\s+(\d{3})", expand=False)
-            status = pd.to_numeric(status, errors="coerce")
-            df["w"] = status.apply(lambda x: 2.0 if pd.notna(x) and float(x) >= 500 else 1.0)
-            frames.append(df[df["is_anom"]])
-    if not frames:
-        return []
-    df = pd.concat(frames, ignore_index=True)
-    if df.empty:
-        return []
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Shanghai")
-    df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
-    if df.empty:
-        return []
+    
+    # 提前做时间过滤，避免在几 GB 的全量日志上做 contains 字符串匹配
     if center_dt:
         try:
             c = pd.Timestamp(center_dt, tz="Asia/Shanghai")
-            df = df[(df["timestamp"] >= c - pd.Timedelta(seconds=int(window_s))) & (df["timestamp"] <= c + pd.Timedelta(seconds=int(window_s)))].copy()
+            filter_start = c - pd.Timedelta(seconds=int(window_s))
+            filter_end = c + pd.Timedelta(seconds=int(window_s))
         except Exception:
-            pass
+            filter_start, filter_end = start, end
+    else:
+        filter_start, filter_end = start, end
+        
+    def _load_and_filter_time(p: str) -> pd.DataFrame:
+        df = pd.read_csv(p, low_memory=False, usecols=["timestamp", "cmdb_id", "value"] if "log_proxy" in p or "log_service" in p else None)
+        if df.empty or not {"timestamp", "cmdb_id", "value"}.issubset(df.columns):
+            return pd.DataFrame()
+        df["ts"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Shanghai")
+        return df[(df["ts"] >= filter_start) & (df["ts"] <= filter_end)].copy()
+
+    if os.path.exists(paths[0]):
+        df = _load_and_filter_time(paths[0])
+        if not df.empty:
+            df["is_anom"] = _market_log_anomaly_mask_service(df["value"])
+            df["w"] = 1.0
+            frames.append(df[df["is_anom"]])
+            
+    if os.path.exists(paths[1]):
+        df = _load_and_filter_time(paths[1])
+        if not df.empty:
+            df["is_anom"] = _market_log_anomaly_mask_proxy(df["value"])
+            s_val = df["value"].astype(str)
+            is_5xx = s_val.str.contains(" 500 ", regex=False) | s_val.str.contains(" 502 ", regex=False) | s_val.str.contains(" 503 ", regex=False) | s_val.str.contains(" 504 ", regex=False)
+            df["w"] = 1.0
+            df.loc[is_5xx, "w"] = 2.0
+            frames.append(df[df["is_anom"]])
+            
+    if not frames:
+        return []
+    df = pd.concat(frames, ignore_index=True)
     if df.empty:
         return []
     g = df.groupby("cmdb_id")["w"].sum().sort_values(ascending=False)

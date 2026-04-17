@@ -50,9 +50,6 @@ class CounterfactualController:
         def pick_time(component: str) -> str:
             if not need_time:
                 return ""
-            t = str(context.get("time_choice", "") or "").strip()
-            if t:
-                return t
             if need_comp:
                 ft = (context.get("component_first_times") or {}).get(component)
                 if str(ft or "").strip():
@@ -63,6 +60,9 @@ class CounterfactualController:
                 est = str(context.get("estimated_failure_time", "") or "").strip()
                 if est:
                     return est
+            t = str(context.get("time_choice", "") or "").strip()
+            if t:
+                return t
             return ""
 
         # Step 1: 候选生成
