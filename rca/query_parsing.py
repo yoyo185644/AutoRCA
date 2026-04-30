@@ -2,7 +2,7 @@ import re
 from typing import List
 
 
-def extract_task2_reason_candidates(scoring_points: str) -> List[str]:
+def extract_reason_candidates(scoring_points: str) -> List[str]:
     s = str(scoring_points or "")
     cands = re.findall(r"root cause reason is ([^\n\r]+)", s, flags=re.IGNORECASE)
     out = []
@@ -13,7 +13,7 @@ def extract_task2_reason_candidates(scoring_points: str) -> List[str]:
     return out
 
 
-def extract_task3_component_candidates(scoring_points: str) -> List[str]:
+def extract_component_candidates(scoring_points: str) -> List[str]:
     s = str(scoring_points or "")
     cands = re.findall(r"root cause component is ([^\n\r]+)", s, flags=re.IGNORECASE)
     out = []
@@ -22,4 +22,3 @@ def extract_task3_component_candidates(scoring_points: str) -> List[str]:
         if v and v not in out:
             out.append(v)
     return out
-

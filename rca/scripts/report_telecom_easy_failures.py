@@ -4,8 +4,8 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from rca.telecom_easy_solver import task2_reason_with_evidence
-from rca.task3_hybrid import build_task3_candidates
+from rca.fast_solver import infer_reason_with_evidence
+from rca.component_candidates import build_component_candidates
 
 
 def _extract_reason_from_pred(pred: str) -> str:
@@ -51,7 +51,7 @@ def main():
     t2_details = []
     for rid in t2_f:
         inst = q.loc[rid, "instruction"]
-        best, ev = task2_reason_with_evidence(inst)
+        best, ev = infer_reason_with_evidence(inst)
         pred = _extract_reason_from_pred(df[df.row_id == rid].iloc[0].prediction)
         gt = re.findall(r"root cause reason is ([^\n\r]+)", str(q.loc[rid, "scoring_points"]), flags=re.IGNORECASE)
         t2_details.append(
@@ -72,7 +72,7 @@ def main():
     t3_details = []
     for rid in t3_f:
         inst = q.loc[rid, "instruction"]
-        ev = build_task3_candidates("Telecom", inst, top_k=80)
+        ev = build_component_candidates("Telecom", inst, top_k=80)
         pred = _extract_comp_from_pred(df[df.row_id == rid].iloc[0].prediction)
         gt = re.findall(r"root cause component is ([^\n\r]+)", str(q.loc[rid, "scoring_points"]), flags=re.IGNORECASE)
         t3_details.append(
@@ -99,4 +99,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

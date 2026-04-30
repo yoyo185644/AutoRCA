@@ -4,7 +4,7 @@ from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
-from rca.task3_hybrid import parse_time_window_generic
+from rca.component_candidates import parse_time_window_generic
 
 
 @dataclass
@@ -58,9 +58,42 @@ def estimate_occurrence_datetime_from_trace(dataset: str, instruction: str) -> T
     if p95.empty:
         chosen = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
         return chosen, None
-    baseline = float(p95.median())
-    diff = p95.diff().fillna(0.0)
-    candidates = p95[(p95 >= baseline * 1.2) & (diff >= max(1.0, baseline * 0.1))]
+    p95_s = p95.rolling(window=3, center=True, min_periods=1).median()
+    pre_n = max(5, int(len(p95_s) * 0.2))
+    pre = p95_s.iloc[:pre_n]
+    baseline = float(pre.median())
+    mad = float((pre - baseline).abs().median())
+    thr = max(baseline * 1.18, baseline + 6.0 * mad, baseline + 1.0)
+    cond = p95_s >= thr
+    onset2 = cond & cond.shift(-1, fill_value=False)
+    if onset2.any():
+        chosen_min = onset2[onset2].index[0]
+        chosen = pd.Timestamp(chosen_min).strftime("%Y-%m-%d %H:%M:%S")
+        ev = TimeEvidence(
+            date_dir=date_dir,
+            start=start.strftime("%Y-%m-%d %H:%M:%S"),
+            end=end.strftime("%Y-%m-%d %H:%M:%S"),
+            chosen=chosen,
+            method="onset",
+            baseline_p95=baseline,
+            peak_p95=float(p95.max()),
+        )
+        return chosen, ev
+    if cond.any():
+        chosen_min = cond[cond].index[0]
+        chosen = pd.Timestamp(chosen_min).strftime("%Y-%m-%d %H:%M:%S")
+        ev = TimeEvidence(
+            date_dir=date_dir,
+            start=start.strftime("%Y-%m-%d %H:%M:%S"),
+            end=end.strftime("%Y-%m-%d %H:%M:%S"),
+            chosen=chosen,
+            method="onset",
+            baseline_p95=baseline,
+            peak_p95=float(p95.max()),
+        )
+        return chosen, ev
+    diff = p95_s.diff().fillna(0.0)
+    candidates = p95_s[(p95_s >= baseline * 1.2) & (diff >= max(1.0, baseline * 0.08))]
     if not candidates.empty:
         chosen_min = candidates.index[0]
         chosen = pd.Timestamp(chosen_min).strftime("%Y-%m-%d %H:%M:%S")
@@ -74,7 +107,8 @@ def estimate_occurrence_datetime_from_trace(dataset: str, instruction: str) -> T
             peak_p95=float(p95.max()),
         )
         return chosen, ev
-    chosen_min = p95.sort_values(ascending=False).index[0]
+    roll = p95.rolling(window=3, center=True, min_periods=1).mean()
+    chosen_min = roll.sort_values(ascending=False).index[0]
     chosen = pd.Timestamp(chosen_min).strftime("%Y-%m-%d %H:%M:%S")
     ev = TimeEvidence(
         date_dir=date_dir,
@@ -86,3 +120,7 @@ def estimate_occurrence_datetime_from_trace(dataset: str, instruction: str) -> T
         peak_p95=float(p95.max()),
     )
     return chosen, ev
+
+
+def estimate_time_candidate_from_trace(dataset: str, instruction: str) -> Tuple[str, Optional[TimeEvidence]]:
+    return estimate_occurrence_datetime_from_trace(dataset=dataset, instruction=instruction)

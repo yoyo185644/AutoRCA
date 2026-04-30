@@ -5,8 +5,8 @@ from typing import List, Optional
 import pandas as pd
 import json
 
-from rca.query_parsing import extract_task2_reason_candidates
-from rca.task3_hybrid import parse_time_window_generic
+from rca.query_parsing import extract_reason_candidates
+from rca.component_candidates import parse_time_window_generic
 
 
 _COMP_PATTERN = r"The (?:\d+-th|only) predicted root cause component is ([^\n]+)"
@@ -23,7 +23,7 @@ def required_root_count(scoring_points: str) -> int:
     return int(k) if k > 0 else 1
 
 
-def canonicalize_market_component(component: str) -> str:
+def canonicalize_component(component: str) -> str:
     c = str(component or "").strip()
     m = re.match(r"^node-\\d+\\.(.+)$", c)
     if m:
@@ -31,7 +31,7 @@ def canonicalize_market_component(component: str) -> str:
     return c
 
 
-def canonicalize_market_prediction(prediction: str) -> str:
+def canonicalize_prediction(prediction: str) -> str:
     s = str(prediction or "").strip()
     try:
         obj = json.loads(s)
@@ -45,7 +45,7 @@ def canonicalize_market_prediction(prediction: str) -> str:
             continue
         if "root cause component" in v:
             c0 = v.get("root cause component")
-            c1 = canonicalize_market_component(str(c0))
+            c1 = canonicalize_component(str(c0))
             if c1 != str(c0):
                 v["root cause component"] = c1
                 changed = True
@@ -55,7 +55,7 @@ def canonicalize_market_prediction(prediction: str) -> str:
 
 
 def extract_reasons_from_scoring_points(scoring_points: str) -> List[str]:
-    return extract_task2_reason_candidates(scoring_points)
+    return extract_reason_candidates(scoring_points)
 
 
 def estimate_k_occurrence_datetimes_from_trace(dataset: str, instruction: str, k: int) -> List[str]:
@@ -96,11 +96,11 @@ def estimate_k_occurrence_datetimes_from_trace(dataset: str, instruction: str, k
     return [pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S") for x in picked[: int(k)]]
 
 
-def _market_log_anomaly_mask_service(values: pd.Series) -> pd.Series:
+def _log_anomaly_mask_service(values: pd.Series) -> pd.Series:
     s = values.astype(str).str.lower()
     return s.str.contains("error", regex=False) | s.str.contains("fail", regex=False) | s.str.contains("exception", regex=False) | s.str.contains("timeout", regex=False)
 
-def _market_log_anomaly_mask_proxy(values: pd.Series) -> pd.Series:
+def _log_anomaly_mask_proxy(values: pd.Series) -> pd.Series:
     s = values.astype(str)
     return s.str.contains(" 500 ", regex=False) | s.str.contains(" 502 ", regex=False) | s.str.contains(" 503 ", regex=False) | s.str.contains(" 504 ", regex=False) | s.str.contains(" 400 ", regex=False) | s.str.contains(" 404 ", regex=False)
 
@@ -121,12 +121,12 @@ def estimate_k_occurrence_datetimes_from_logs(dataset: str, instruction: str, k:
     if os.path.exists(paths[0]):
         df = _load_and_filter_time(paths[0])
         if not df.empty:
-            df["is_anom"] = _market_log_anomaly_mask_service(df["value"])
+            df["is_anom"] = _log_anomaly_mask_service(df["value"])
             frames.append(df[df["is_anom"]])
     if os.path.exists(paths[1]):
         df = _load_and_filter_time(paths[1])
         if not df.empty:
-            df["is_anom"] = _market_log_anomaly_mask_proxy(df["value"])
+            df["is_anom"] = _log_anomaly_mask_proxy(df["value"])
             frames.append(df[df["is_anom"]])
     if not frames:
         return []
@@ -174,14 +174,14 @@ def estimate_top_components_from_logs(dataset: str, instruction: str, center_dt:
     if os.path.exists(paths[0]):
         df = _load_and_filter_time(paths[0])
         if not df.empty:
-            df["is_anom"] = _market_log_anomaly_mask_service(df["value"])
+            df["is_anom"] = _log_anomaly_mask_service(df["value"])
             df["w"] = 1.0
             frames.append(df[df["is_anom"]])
             
     if os.path.exists(paths[1]):
         df = _load_and_filter_time(paths[1])
         if not df.empty:
-            df["is_anom"] = _market_log_anomaly_mask_proxy(df["value"])
+            df["is_anom"] = _log_anomaly_mask_proxy(df["value"])
             s_val = df["value"].astype(str)
             is_5xx = s_val.str.contains(" 500 ", regex=False) | s_val.str.contains(" 502 ", regex=False) | s_val.str.contains(" 503 ", regex=False) | s_val.str.contains(" 504 ", regex=False)
             df["w"] = 1.0

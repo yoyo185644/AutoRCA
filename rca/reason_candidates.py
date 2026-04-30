@@ -6,8 +6,8 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import pandas as pd
 
 from rca.light_agent import choose_from_candidates
-from rca.query_parsing import extract_task2_reason_candidates
-from rca.task3_hybrid import parse_time_window_generic
+from rca.query_parsing import extract_reason_candidates
+from rca.component_candidates import parse_time_window_generic
 
 
 def _norm_name(s: str) -> str:
@@ -143,7 +143,7 @@ def _keyword_hits(metrics: Sequence[str]) -> Dict[str, int]:
     }
 
 
-def predict_task2_reason_universal(
+def predict_reason_universal(
     dataset: str,
     instruction: str,
     scoring_points: str,
@@ -158,7 +158,7 @@ def predict_task2_reason_universal(
     top_metrics = _top_anomalous_metrics(metric_dir, start_s, end_s, top_k=30)
     hits = _keyword_hits(top_metrics)
     spread = _trace_spread_stats(trace_path, start_s, end_s)
-    cands = extract_task2_reason_candidates(scoring_points)
+    cands = extract_reason_candidates(scoring_points)
     evidence = {
         "dataset": dataset,
         "date_dir": date_dir,
@@ -178,4 +178,3 @@ def predict_task2_reason_universal(
         temperature=float(temperature),
     )
     return (dec.chosen or (cands[0] if cands else "")), evidence
-

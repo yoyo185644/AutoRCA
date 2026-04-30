@@ -23,7 +23,7 @@ _MONTH = {
 }
 
 
-def _telecom_candidates() -> Tuple[List[str], List[str], List[str]]:
+def _default_component_pool() -> Tuple[List[str], List[str], List[str]]:
     nodes = [f"os_{i:03d}" for i in range(1, 23)]
     pods = [f"docker_{i:03d}" for i in range(1, 9)]
     svcs = [f"db_{i:03d}" for i in range(1, 14)]
@@ -116,7 +116,7 @@ def _find_faults(metric_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp
 
 
 def _rank_components(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    nodes, pods, svcs = _telecom_candidates()
+    nodes, pods, svcs = _default_component_pool()
     allowed = set(nodes + pods + svcs)
 
     parts = []
@@ -237,7 +237,7 @@ def _reason_from_window(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp)
 
 
 def _pick_component_for_reason(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, reason: str) -> str:
-    nodes, pods, svcs = _telecom_candidates()
+    nodes, pods, svcs = _default_component_pool()
     reason = str(reason)
     if reason in ("network delay", "network loss"):
         preferred = nodes
@@ -309,39 +309,31 @@ def _pick_datetime(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, comp
     return pd.Timestamp(peak_ts).floor("min")
 
 
-def solve_telecom_easy(task_id: int, instruction: str) -> str:
-    date_dir, start, end = _parse_time_window(instruction)
-    metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
+def solve_easy(instruction: str, required_fields: List[str]) -> str:
+    fields = set([str(x).strip().lower() for x in (required_fields or []) if str(x).strip()])
+    if fields == {"time"}:
+        dt = estimate_time_from_trace(instruction)
+        return "{" + "\"1\": {" + f"\"root cause occurrence datetime\": \"{dt}\"" + "}" + "}"
+    if fields == {"reason"}:
+        reason, _ = infer_reason_with_evidence(instruction)
+        return "{" + "\"1\": {" + f"\"root cause reason\": \"{reason}\"" + "}" + "}"
+    if fields == {"component"}:
+        date_dir, start, end = _parse_time_window(instruction)
+        metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
+        component = _best_component_for_component_field(metric_dir, start, end, instruction)
+        return "{" + "\"1\": {" + f"\"root cause component\": \"{component}\"" + "}" + "}"
 
-    if task_id == 1:
-        dt = estimate_task1_datetime_from_trace(instruction)
-        return (
-            "{"
-            "\"1\": {"
-            f"\"root cause occurrence datetime\": \"{dt}\""
-            "}"
-            "}"
-        )
-    if task_id == 2:
-        reason, _ = task2_reason_with_evidence(instruction)
-        return (
-            "{"
-            "\"1\": {"
-            f"\"root cause reason\": \"{reason}\""
-            "}"
-            "}"
-        )
-    if task_id == 3:
-        component = _best_component_for_task3(metric_dir, start, end, instruction)
-        return (
-            "{"
-            "\"1\": {"
-            f"\"root cause component\": \"{component}\""
-            "}"
-            "}"
-        )
-
-    raise ValueError("solve_telecom_easy only supports task_id 1-3.")
+    obj: Dict[str, Dict[str, str]] = {"1": {}}
+    if "time" in fields:
+        obj["1"]["root cause occurrence datetime"] = estimate_time_from_trace(instruction)
+    if "reason" in fields:
+        reason, _ = infer_reason_with_evidence(instruction)
+        obj["1"]["root cause reason"] = str(reason or "")
+    if "component" in fields:
+        date_dir, start, end = _parse_time_window(instruction)
+        metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
+        obj["1"]["root cause component"] = _best_component_for_component_field(metric_dir, start, end, instruction)
+    return json.dumps(obj, ensure_ascii=False)
 
 
 def _breach_scores_for_keywords(metric_path: str, start: pd.Timestamp, end: pd.Timestamp, keywords: List[str]) -> Tuple[float, int]:
@@ -493,7 +485,7 @@ def _reason_from_breach_scores(metric_dir: str, start: pd.Timestamp, end: pd.Tim
     return _reason_from_window(metric_dir, start, end)
 
 
-def task2_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
+def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
     date_dir, start, end = _parse_time_window(instruction)
     metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
     trace_path = os.path.join("dataset", "Telecom", "telemetry", date_dir, "trace", "trace_span.csv")
@@ -715,7 +707,7 @@ def _trace_spread_stats(trace_path: str, start: pd.Timestamp, end: pd.Timestamp)
     return {"total_components": total, "affected_components": affected, "affected_ratio": float(affected / total) if total else 0.0}
 
 
-def evidence_supports_task2_reason(evidence: Dict[str, Any], reason: str) -> bool:
+def evidence_supports_reason(evidence: Dict[str, Any], reason: str) -> bool:
     stats = evidence.get("stats", {}) if isinstance(evidence.get("stats"), dict) else {}
     topm = evidence.get("top_metrics", {}) if isinstance(evidence.get("top_metrics"), dict) else {}
     hits = evidence.get("keyword_hits", {}) if isinstance(evidence.get("keyword_hits"), dict) else {}
@@ -828,8 +820,8 @@ def _best_component_by_prefix(metric_dir: str, start: pd.Timestamp, end: pd.Time
     return comp, float(s)
 
 
-def _best_component_for_task3(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, instruction: str) -> str:
-    reason, ev = task2_reason_with_evidence(instruction)
+def _best_component_for_component_field(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp, instruction: str) -> str:
+    reason, ev = infer_reason_with_evidence(instruction)
 
     def best_comp(metric_file: str, prefix: str, keywords: List[str]) -> Tuple[str, float]:
         path = os.path.join(metric_dir, metric_file)
@@ -902,7 +894,7 @@ def _best_component_for_task3(metric_dir: str, start: pd.Timestamp, end: pd.Time
     return _best_component_by_total_breach(metric_dir, start, end) or "os_001"
 
 
-def task3_component_candidates_with_evidence(instruction: str) -> Tuple[str, List[str], Dict[str, Any]]:
+def component_candidates_with_evidence(instruction: str) -> Tuple[str, List[str], Dict[str, Any]]:
     date_dir, start, end = _parse_time_window(instruction)
     metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
 
@@ -963,14 +955,14 @@ def task3_component_candidates_with_evidence(instruction: str) -> Tuple[str, Lis
     db_conn = top_comps("metric_service.csv", "db_", db_conn_kws, 6)
     db_close = top_comps("metric_service.csv", "db_", db_close_kws, 6)
 
-    det = _best_component_for_task3(metric_dir, start, end, instruction)
+    det = _best_component_for_component_field(metric_dir, start, end, instruction)
     cand = []
     for seq in (os_cpu, os_net, db_conn, db_close):
         for c, _, _ in seq:
             cand.append(c)
     cand = list(dict.fromkeys([det] + cand))[:15]
 
-    t1 = estimate_task1_datetime_from_trace(instruction)
+    t1 = estimate_time_from_trace(instruction)
     evidence = {
         "time_window": {"date_dir": date_dir, "start": start.strftime("%Y-%m-%d %H:%M:%S"), "end": end.strftime("%Y-%m-%d %H:%M:%S")},
         "task1_estimated_time": t1,
@@ -983,7 +975,7 @@ def task3_component_candidates_with_evidence(instruction: str) -> Tuple[str, Lis
     return det, cand, evidence
 
 
-def pick_component_by_granger(instruction: str) -> str:
+def pick_component_from_granger(instruction: str) -> str:
     date_dir, start, end = _parse_time_window(instruction)
     metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
     comp = _best_component_by_total_breach(metric_dir, start, end)
@@ -995,28 +987,8 @@ def pick_component_by_granger(instruction: str) -> str:
     return "os_001"
 
 
-def estimate_task1_datetime_from_trace(instruction: str) -> str:
-    date_dir, start, end = _parse_time_window(instruction)
-    trace_path = os.path.join("dataset", "Telecom", "telemetry", date_dir, "trace", "trace_span.csv")
-    if not os.path.exists(trace_path):
-        return start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
-    df = pd.read_csv(trace_path, low_memory=False)
-    if "startTime" not in df.columns or "elapsedTime" not in df.columns:
-        return start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
-    df = df.copy()
-    df["ts"] = pd.to_datetime(df["startTime"], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai")
-    df = df[(df["ts"] >= start) & (df["ts"] <= end)].copy()
-    if df.empty:
-        return start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
-    df["minute"] = df["ts"].dt.floor("min")
-    p95 = df.groupby("minute")["elapsedTime"].quantile(0.95).sort_index()
-    if p95.empty:
-        return start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
-    baseline = float(p95.median())
-    diff = p95.diff().fillna(0.0)
-    candidates = p95[(p95 >= baseline * 1.2) & (diff >= max(1.0, baseline * 0.1))]
-    if not candidates.empty:
-        chosen = candidates.index[0]
-        return pd.Timestamp(chosen).strftime("%Y-%m-%d %H:%M:%S")
-    chosen = p95.sort_values(ascending=False).index[0]
-    return pd.Timestamp(chosen).strftime("%Y-%m-%d %H:%M:%S")
+def estimate_time_from_trace(instruction: str) -> str:
+    from rca.time_candidates import estimate_occurrence_datetime_from_trace
+
+    dt, _ = estimate_occurrence_datetime_from_trace(dataset="Telecom", instruction=instruction)
+    return str(dt or "")

@@ -27,7 +27,7 @@ _METRIC_DAY_CACHE: Dict[Tuple[str, str], pd.DataFrame] = {}
 _ALLOWED_COMPONENTS_CACHE: Dict[str, set] = {}
 
 
-def _parse_market_or_bank_time_window(instruction: str) -> Tuple[List[str], pd.Timestamp, pd.Timestamp]:
+def _parse_time_window_for_granger(instruction: str) -> Tuple[List[str], pd.Timestamp, pd.Timestamp]:
     text = str(instruction)
     tz = "Asia/Shanghai"
 
@@ -157,7 +157,7 @@ def _estimate_failure_times_from_metric_signal(signal_df: pd.DataFrame, k: int) 
         chosen.append(pd.to_datetime(minute, unit="s", utc=True).tz_convert("Asia/Shanghai"))
     return chosen[:k]
 
-def _load_metric_long_market(metric_dir: str, start_s: int, end_s: int) -> pd.DataFrame:
+def _load_metric_long_variant_a(metric_dir: str, start_s: int, end_s: int) -> pd.DataFrame:
     frames = []
 
     for name in ["metric_node.csv", "metric_container.csv", "metric_runtime.csv", "metric_mesh.csv"]:
@@ -204,7 +204,7 @@ def _load_metric_long_market(metric_dir: str, start_s: int, end_s: int) -> pd.Da
     return out
 
 
-def _load_metric_long_bank(metric_dir: str, start_s: int, end_s: int) -> pd.DataFrame:
+def _load_metric_long_variant_b(metric_dir: str, start_s: int, end_s: int) -> pd.DataFrame:
     frames = []
     for name in ["metric_container.csv", "metric_app.csv"]:
         path = os.path.join(metric_dir, name)
@@ -306,9 +306,9 @@ def _get_metric_day(dataset: str, date_dir: str) -> pd.DataFrame:
     telemetry_root = os.path.join("dataset", dataset, "telemetry")
     metric_dir = os.path.join(telemetry_root, date_dir, "metric")
     if dataset.startswith("Market/"):
-        df = _load_metric_long_market(metric_dir, start_s=-10**18, end_s=10**18)
+        df = _load_metric_long_variant_a(metric_dir, start_s=-10**18, end_s=10**18)
     else:
-        df = _load_metric_long_bank(metric_dir, start_s=-10**18, end_s=10**18)
+        df = _load_metric_long_variant_b(metric_dir, start_s=-10**18, end_s=10**18)
     _METRIC_DAY_CACHE[key] = df
     return df
 
@@ -614,7 +614,7 @@ def _infer_top_reasons(dataset: str, metric_long: pd.DataFrame, start_s: int, en
 
 
 def solve_with_window_granger(dataset: str, instruction: str, task_id: int) -> str:
-    date_dirs, start, end = _parse_market_or_bank_time_window(instruction)
+    date_dirs, start, end = _parse_time_window_for_granger(instruction)
     k_fail = _parse_failure_count(instruction)
 
     telemetry_root = os.path.join("dataset", dataset, "telemetry")

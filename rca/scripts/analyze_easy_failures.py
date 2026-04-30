@@ -7,8 +7,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from rca.telecom_easy_solver import task2_reason_with_evidence
-from rca.task3_hybrid import build_task3_candidates
+from rca.fast_solver import infer_reason_with_evidence
+from rca.component_candidates import build_component_candidates
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
     t2 = df[(df.task_index == "task_2") & (df.score < 1.0)].row_id.astype(int).tolist()
     print("task2_fail_ids", t2)
     for rid in t2:
-        det, ev = task2_reason_with_evidence(q.loc[rid, "instruction"])
+        det, ev = infer_reason_with_evidence(q.loc[rid, "instruction"])
         pred = json.loads(df[df.row_id == rid].iloc[0].prediction).get("1", {}).get("root cause reason")
         print("row", rid, "pred", pred, "best", ev.get("best"), "gap", round(float(ev.get("gap", 0.0)), 3))
         print(" trace_spread", ev.get("trace_spread"))
@@ -31,7 +31,7 @@ def main():
 
     print("task3")
     for rid in [26, 30, 39, 47]:
-        ev = build_task3_candidates("Telecom", q.loc[rid, "instruction"], top_k=80)
+        ev = build_component_candidates("Telecom", q.loc[rid, "instruction"], top_k=80)
         pred = json.loads(df[df.row_id == rid].iloc[0].prediction).get("1", {}).get("root cause component")
         top_db = sorted(
             [(c, s) for c, s in ev.combined_scores.items() if str(c).startswith("db_")],

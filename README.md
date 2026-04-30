@@ -1,202 +1,165 @@
 # OpenRCA
 
-![Python Version](https://img.shields.io/badge/Python-3776AB?&logo=python&logoColor=white-blue&label=3.10%20%7C%203.11)&ensp;
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)&ensp;
-![Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg?style=flat)
+OpenRCA 是一个用于评测大模型（LLMs）在软件运维场景下根因分析（Root Cause Analysis, RCA）能力的基准数据集与代码仓库。输入是一条自然语言故障查询（query），模型/Agent 需要结合大规模遥测数据（metric / trace / log）输出根因要素：
 
-</div>
+- root cause occurrence datetime
+- root cause component
+- root cause reason
 
-OpenRCA is a benchmark for assessing LLMs' root cause analysis ability in a software operating scenario. When given a natural language query, LLMs need to analyze large volumes of telemetry data to identify the relevant root cause elements. This process requires the models to understand complex system dependencies and perform comprehensive reasoning across various types of telemetry data, including KPI time series, dependency trace graphs, and semi-structured log text.
+本仓库也包含一个可复现的 Agent baseline（RCA-agent + Counterfactual agent），通过 Python 工具化数据检索与分析，降低超长上下文带来的负担，提升可扩展性。
 
-<img src="./.asset/openrca.png"/> 
+## 项目目标
 
-</div>
+- 提供可复现、可扩展的 RCA benchmark 与 baseline 实现
+- 统一执行入口与策略路由：根据 difficulty 自动选择执行路径（默认 auto）
+  - easy → fast-solver
+  - middle / hard → counterfactual agent
+- 保持现有逻辑、输入输出语义与实验脚本习惯不变
 
-We also introduce RCA-agent as a baseline for OpenRCA. By using Python for data retrieval and analysis, the model avoids processing overly long contexts, enabling it to focus on reasoning and scalable for extensive telemetry.
+## 整体架构
 
-<img src="./.asset/rcaagent.png"/> 
+核心是一个“统一执行框架”（Runner + Router + Strategy/Adapter）：
 
-## ✨ Quick Start
+- Runner：执行一次任务求解，屏蔽内部多策略细节
+- Router：根据 difficulty / CLI 参数决定策略顺序
+- Strategy/Adapter：对已有 fast-solver 与 counterfactual agent 做薄封装，复用旧实现而非重写算法
 
-> ⚠️ Since the OpenRCA dataset includes a large amount of telemetry and RCA-agent requires extensive memory operations, we recommend using a device with at least 80GB of storage space and 32GB of memory.
+关键实现文件：
 
-### 🛠️ Installation
+- `rca/execution/framework.py`：通用执行框架（TaskContext / Strategy / Router / UnifiedTaskRunner）
+- `rca/execution/agent_standard.py`：面向当前项目的策略实现与默认路由（fast-solver + counterfactual agent）
+- `rca/run_agent_standard.py`：保留原有评测脚本入口，但内部改为调用统一框架
+- `rca/run.py`：新增统一主入口（可扩展为更多 runner）
 
-OpenRCA requires **Python >= 3.10**. It can be installed by running the following command:
-```bash
-# [optional to create conda environment]
-# conda create -n openrca python=3.10
-# conda activate openrca
+## Difficulty 与执行策略
 
-# clone the repository
-git clone https://github.com/microsoft/OpenRCA.git
-cd OpenRCA
-# install the requirements
-pip install -r requirements.txt
-```
+当前 difficulty 默认按 `task_id` 映射（与原逻辑保持一致）：
 
-The telemetry data can be download from [Google Drive](https://drive.google.com/drive/folders/1wGiEnu4OkWrjPxfx5ZTROnU37-5UDoPM?usp=drive_link). Once you have download the telemetry dataset, please put them into the path `dataset/` (which is empty now).
+- task_1 ~ task_3 → easy
+- task_4 ~ task_6 → middle
+- task_7 → hard
 
-The directory structure of the data is:
+默认 `--route_mode auto` 下：
+
+- easy：优先 fast-solver，失败则自动回退到 counterfactual agent（与旧行为一致）
+- middle/hard：直接走 counterfactual agent（与旧行为一致）
+
+可通过 `--route_mode` 显式控制（不影响旧命令）：
+
+- `auto`：默认（推荐）
+- `fast`：easy 优先 fast-solver（仍保留回退）
+- `counterfactual`：强制走 counterfactual agent
+
+## 目录结构（关键部分）
 
 ```
 .
+├── main/
+│   ├── generate.py
+│   └── evaluate.py
+├── rca/
+│   ├── execution/
+│   │   ├── framework.py
+│   │   └── agent_standard.py
+│   ├── baseline/
+│   │   ├── rca_agent/
+│   │   └── counterfactor_agent/
+│   ├── run_agent_standard.py
+│   └── run.py
+└── README.md
+```
+
+## 安装
+
+需要 Python >= 3.10：
+
+```bash
+pip install -r requirements.txt
+```
+
+数据集下载后放入 `dataset/`（仓库默认为空）。数据目录结构如下：
+
+```text
+dataset/
 ├── {SYSTEM}
-│   ├── query.csv
-│   ├── record.csv
-│   └── telemetry
-│       ├── {DATE}
-│       │   ├── log
-│       │   ├── metric
-│       │   └── trace
-│       └── ... 
+│   ├── query.csv
+│   ├── record.csv
+│   └── telemetry/
+│       ├── {DATE}/
+│       │   ├── log/
+│       │   ├── metric/
+│       │   └── trace/
+│       └── ...
 └── ...
 ```
 
-where the `{SYSTEM}` can be `Telecom`, `Bank`, or `Market`, and the `{DATE}` format is `{YYYY_MM_DD}`.
+其中 `{SYSTEM}` 取值：`Telecom`、`Bank`、`Market`（Market 包含 `Market/cloudbed-1` 与 `Market/cloudbed-2` 两套数据）。
 
-### 🖊️ Evaluation
+## 常用命令
 
-Using following command to evaluate:
+### 统一入口（新增）
 
-```bash
-python -m main.evaluate \
-    -p [prediction csv files to evaluate] \
-    -q [groundtruth csv files to evaluate] \
-    -r [report csv file to save]
-```
-
-Note that the prediction CSV file must include at least a "prediction" field for valid evaluation (extra fields are allowed). Each prediction should be a JSON-like string containing all required elements for each query (extra elements are allowed). If there are multiple failures, list them in chronological order (e.g., 1, 2, 3, ...):
-
-
-```json
-{
-    "1": {
-        "root cause occurrence datetime": "[%Y-%m-%d %H:%M:%S]",
-        "root cause component": "[COMPONENT]",
-        "root cause reason": "[REASON]"
-    }, 
-    ...
-}
-```
-
-For example, to evaluate the archived predictions of RCA-agent (Claude ver.), you can use the following command:
+等价于原 `run_agent_standard`，但提供一个更统一的入口点：
 
 ```bash
-python -m main.evaluate \
-    -p \
-        rca/archive/agent-Bank.csv \
-        rca/archive/agent-Market-cloudbed-1.csv \
-        rca/archive/agent-Market-cloudbed-2.csv \
-        rca/archive/agent-Telecom.csv \
-    -q \
-        dataset/Bank/query.csv \
-        dataset/Market/cloudbed-1/query.csv \
-        dataset/Market/cloudbed-2/query.csv \
-        dataset/Telecom/query.csv \
-    -r \
-        test/agent_claude.csv
+python3 -m rca.run --runner agent_standard --dataset Bank
 ```
 
-### 🚩 Reproduction
+### 保持兼容的旧入口（无需修改）
 
-To reproduce results in the paper, please first setup your API configurations before running OpenRCA's baselines. Taking OpenAI as an example, you can configure `rca/api_config.yaml` file as follows:
-
-```yaml
-SOURCE:   "OpenAI"
-MODEL:    "gpt-4o-2024-05-13"
-API_KEY:  "sk-xxxxxxxxxxxxxx"
-```
-
-Then, run the following commands for result reproduction:
+原命令保持可用：
 
 ```bash
-python -m rca.{TESTS} --dataset {DATASET_NAME}
-# Optional tests: run_agent_standard, run_baseline_balanced, run_baseline_oracle
-# Optional datasets: Telecom, Bank, Market/cloudbed-1, Market/cloudbed-2
+python3 -m rca.run_agent_standard --dataset Bank
+python3 -m rca.run_agent_standard --dataset Market/cloudbed-1
+python3 -m rca.run_agent_standard --dataset Market/cloudbed-2
+python3 -m rca.run_agent_standard --dataset Telecom
 ```
 
-For example, if you want to evaluate RCA-agent on Bank dataset, you should use the following command:
+### 路由参数示例
 
 ```bash
-python -m rca.run_agent_standard --dataset Bank
+python3 -m rca.run_agent_standard --dataset Telecom --route_mode auto
+python3 -m rca.run_agent_standard --dataset Telecom --route_mode counterfactual
 ```
 
-Note that the telemetry of two Market cloudbed service group are collected separately. For example, if you want to evaluate RCA-agent on the whole Market dataset, you should use the following command:
+### 评测（evaluate）
 
 ```bash
-python -m rca.run_agent_standard --dataset Market/cloudbed-1
-python -m rca.run_agent_standard --dataset Market/cloudbed-2
+python3 -m main.evaluate \
+  -p [prediction csv files] \
+  -q [query csv files] \
+  -r [report csv file]
 ```
 
-The generated results and monitor files can be found in a new `test` directory created after running any test script.
+prediction CSV 至少包含 `prediction` 字段；每条 prediction 是 JSON-like 字符串（允许多条 failure，用 "1","2",... 编号）。
 
-### 💽 Reconstruction
+## 参数说明（节选）
 
-You can generate new task for OpenRCA telemetry or your own privacy telemetry by modifying `main/task_specification.json` and run the following command:
+`python3 -m rca.run_agent_standard --help` 查看完整参数。以下是与执行路由相关的重点参数：
 
-```bash
-python -m main.generate \
-    -s [your specification config file] \
-    -r [record file to generate query] \
-    -q [query file to save] \
-    -t [timezone of telemetry]
-```
+- `--route_mode {auto|fast|counterfactual}`：策略路由模式（新增，默认 auto，不破坏旧命令）
+- `--fast_easy_solver / --no_fast_easy_solver`：是否启用 fast-solver（原有参数）
+- `--force_counterfactual`：强制使用 counterfactual agent（原有参数）
+- `--no_llm_fallback`：禁止 LLM 回退（原有参数）
 
-Note that the record schema should be consistent with the `record.csv` of OpenRCA.
+## 输出结果说明
 
-You can also re-generate random queries of OpenRCA with the following command:
+运行 `run_agent_standard`（或 `rca.run --runner agent_standard`）后，会生成 `test/` 目录（与旧行为一致）：
 
-```bash
-python -m main.generate -d True
-```
+- `test/result/{DATASET}/agent-{tag}-{model}-{uid}.csv`：每条 query 的 prediction 与评测得分
+- `test/monitor/{DATASET}/agent-{tag}-{model}/{uid}/history/`：日志
+- `test/monitor/{DATASET}/agent-{tag}-{model}/{uid}/trajectory/`：trajectory（ipynb）
+- `test/monitor/{DATASET}/agent-{tag}-{model}/{uid}/prompt/`：prompt（json）
 
-## ❓ FAQ
+## 如何扩展新的 solver / agent
 
-**Q: Why can't I find any fault based on `records.csv` or `query.csv` / why does the fault appear at a different time or on a different component?**
+推荐通过新增 Strategy 的方式接入，而不是侵入式改写旧流程：
 
-A: All faults are recorded in the **UTC+8** timezone. If you convert timestamps using your local time (and your local timezone is not UTC+8), this may cause a time offset, leading to mismatched results.
+1. 在 `rca/execution/agent_standard.py` 中新增一个 `Strategy`（实现 `can_handle()` 与 `run()`，返回 `ExecutionResult`）
+2. 在 `build_agent_standard_runner()` 中把新 Strategy 注册进路由（控制顺序即可实现优先级与回退）
+3. 如果要新增一个全新的 runner（例如新的评测脚本入口），在 `rca/run.py` 的 `_runner_entrypoints()` 中注册即可
 
-**Q: Why am I often unable to find network-related faults?**
+## 其他
 
-A: Network-related faults usually cannot be identified using KPIs alone. Consider examining the latency relationship between parent spans and child spans in traces.
-
-**Q: Why can't my agent read telemetry data at the ground-truth timestamp recorded in `records.csv`?**
-
-A: All telemetry data has a fixed sampling frequency. There may not be a sampled data point at the exact corresponding timestamp.
-
-**Q: Can I submit evaluation results using my own custom agent?**
-
-A: Yes. You need to indicate whether your agent is open-source. If it is not open-source, you must provide the descriptions of your tools/MCPs/skills for review, to ensure that no ground-truth information from `records.csv` is being read from local directories or websites.
-
-**Q: What is the deployment relationship between Node, Pod, Container, and Service?**
-
-A:
-- For **Bank**: You can find it [here](https://docs.google.com/spreadsheets/d/14j_z6K5vqwY9sQvkPsygksbL7Dm4bpiR/edit?usp=sharing&ouid=114089563960398803334&rtpof=true&sd=true).
-- For **Market**: You can find it in `metric_container.csv`. For example, `node-5.adservice-2` means it is the 2nd pod of `adservice` deployed on `node-5`; `node-6.adservice-1` means the 1st pod deployed on `node-6`. Multiple pods together form a service (with fault tolerance).
-
-## 📚 Citation
-
-If you use OpenRCA in your research, please cite our paper:
-
-```bibtex
-@inproceedings{
-xu2025openrca,
-title={OpenRCA: Can Large Language Models Locate the Root Cause of Software Failures?},
-author={Xu, Junjielong and Zhang, Qinan and Zhong, Zhiqing and He, Shilin and Zhang, Chaoyun and Lin, Qingwei and Pei, Dan and He, Pinjia and Zhang, Dongmei and Zhang, Qi},
-booktitle={The Thirteenth International Conference on Learning Representations},
-year={2025},
-url={https://openreview.net/forum?id=M4qNIzQYpd}
-}
-```
-
-## Trademarks
-
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
-
-## Disclaimer
-The recommended models in this Repo are just examples, used to explore the potential of agent systems with the paper at ICLR2025. Users can replace the models in this Repo according to their needs. When using the recommended models in this Repo, you need to comply with the licenses of these models respectively. Microsoft shall not be held liable for any infringement of third-party rights resulting from your usage of this repo. Users agree to defend, indemnify and hold Microsoft harmless from and against all damages, costs, and attorneys' fees in connection with any claims arising from this Repo. If anyone believes that this Repo infringes on your rights, please notify the project owner email.
+时间相关注意事项：OpenRCA 的故障时间均记录在 UTC+8（Asia/Shanghai）时区，若用本地时区转换可能导致时间偏移而影响评测。

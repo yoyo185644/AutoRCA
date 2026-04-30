@@ -8,7 +8,7 @@ import pandas as pd
 
 
 @dataclass(frozen=True)
-class Task3Evidence:
+class ComponentEvidence:
     dataset: str
     date_dir: str
     start_local: str
@@ -297,7 +297,7 @@ def _comp_type(comp: str) -> str:
     return "other"
 
 
-def build_task3_candidates(
+def build_component_candidates(
     dataset: str,
     instruction: str,
     top_k: int = 12,
@@ -305,7 +305,7 @@ def build_task3_candidates(
     w_trace: float = 1.0,
     center_time_s: Optional[int] = None,
     delta_s: int = 300,
-) -> Task3Evidence:
+) -> ComponentEvidence:
     date_dir, start, end = parse_time_window_generic(instruction)
     metric_dir = os.path.join("dataset", dataset, "telemetry", date_dir, "metric")
     trace_path = os.path.join("dataset", dataset, "telemetry", date_dir, "trace", "trace_span.csv")
@@ -440,7 +440,7 @@ def build_task3_candidates(
 
     t_star_local = pd.to_datetime(int(t_star), unit="s", utc=True).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
     expl = f"metric_w={w_metric}, trace_w={w_trace}, align_w={align_w}, onset_w={onset_w}, lead_w={lead_w}, t*={t_star_local}, local=[{local_start_s},{local_end_s}], top1={top1}, top2={top2}, gap_norm={gap_norm:.4f}"
-    return Task3Evidence(
+    return ComponentEvidence(
         dataset=dataset,
         date_dir=date_dir,
         start_local=start.strftime("%Y-%m-%d %H:%M:%S"),
@@ -464,7 +464,7 @@ def build_task3_candidates(
 
 
 
-def apply_task3_component_to_prediction(prediction: str, component: str) -> str:
+def apply_component_to_prediction(prediction: str, component: str) -> str:
     try:
         obj = json.loads(prediction)
         if not isinstance(obj, dict):

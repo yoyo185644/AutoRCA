@@ -7,7 +7,7 @@ from rca.api_router import get_chat_completion
 _ALLOWED_REASONS = ["CPU fault", "network delay", "network loss", "db connection limit", "db close"]
 
 
-def infer_task2_reason_with_agent(
+def infer_reason_with_agent(
     instruction: str,
     evidence: Dict[str, Any],
     allowed_reasons: Optional[List[str]] = None,
@@ -45,4 +45,3 @@ def infer_task2_reason_with_agent(
         if isinstance(resp, str) and r in resp:
             return r
     return ""
-

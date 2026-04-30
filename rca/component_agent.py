@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from rca.api_router import get_chat_completion
 
 
-def infer_task3_component_with_agent(
+def infer_component_with_agent(
     instruction: str,
     candidates: List[str],
     evidence: Dict[str, Any],
@@ -14,8 +14,8 @@ def infer_task3_component_with_agent(
     if not cands:
         return ""
     sys = (
-        "You are an RCA component selector.\n"
-        "Select exactly ONE root cause component from the provided candidates.\n"
+        "You are an RCA selector.\n"
+        "Select exactly ONE root cause component from the provided candidate list.\n"
         "Return ONLY JSON: {\"root_cause_component\": \"...\"}.\n"
         "No other keys.\n"
     )
@@ -23,10 +23,10 @@ def infer_task3_component_with_agent(
         "instruction": str(instruction),
         "candidates": cands,
         "evidence": evidence,
-        "guidance": [
-            "Prefer candidates with both high metric anomaly score and high trace duration anomaly (if available).",
-            "If trace evidence is empty, rely on metric evidence and peak time alignment with the time window.",
-            "Choose conservatively; do not invent new components.",
+        "selection_guidance": [
+            "Prefer components whose anomaly peak time is closest to the estimated failure time.",
+            "Prefer node components (os_*) for CPU spikes on node metrics; prefer db_* only if db KPIs (login/tps/exec/on_off/close) dominate and peak aligns.",
+            "If multiple candidates are similar, choose the one with higher anomaly score and earlier peak (lead).",
         ],
     }
     resp = get_chat_completion(
@@ -44,4 +44,3 @@ def infer_task3_component_with_agent(
         if isinstance(resp, str) and c in resp:
             return c
     return ""
-

@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from rca.market_solver import canonicalize_market_component, estimate_k_occurrence_datetimes_from_logs, estimate_k_occurrence_datetimes_from_trace, required_root_count
-from rca.task_time_hybrid import estimate_occurrence_datetime_from_trace
+from rca.telemetry_solver import canonicalize_component, estimate_k_occurrence_datetimes_from_logs, estimate_k_occurrence_datetimes_from_trace, required_root_count
+from rca.time_candidates import estimate_occurrence_datetime_from_trace
 
 
 def _safe_load_obj(prediction: str) -> Dict[str, Any]:
@@ -30,7 +30,7 @@ def _need_fields(task_id: int):
     return need_time, need_comp, need_reason
 
 
-def _market_times(dataset: str, instruction: str, k: int) -> List[str]:
+def _log_trace_times(dataset: str, instruction: str, k: int) -> List[str]:
     dts = estimate_k_occurrence_datetimes_from_logs(dataset=dataset, instruction=instruction, k=int(k))
     if not dts:
         dts = estimate_k_occurrence_datetimes_from_trace(dataset=dataset, instruction=instruction, k=int(k))
@@ -99,7 +99,7 @@ def normalize_prediction_for_eval(
     dts: Optional[List[str]] = None
     if need_time:
         if dataset.startswith("Market/") and int(k) >= 1:
-            dts = _market_times(dataset=dataset, instruction=instruction, k=int(k))
+            dts = _log_trace_times(dataset=dataset, instruction=instruction, k=int(k))
         else:
             if int(k) > 1:
                 dts = estimate_k_occurrence_datetimes_from_trace(dataset=dataset, instruction=instruction, k=int(k))
@@ -127,7 +127,7 @@ def normalize_prediction_for_eval(
                 r["root cause reason"] = str(v or "")
 
         if dataset.startswith("Market/") and "root cause component" in r:
-            r["root cause component"] = canonicalize_market_component(str(r.get("root cause component") or ""))
+            r["root cause component"] = canonicalize_component(str(r.get("root cause component") or ""))
 
         roots[i] = r
 
