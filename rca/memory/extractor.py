@@ -73,6 +73,25 @@ def _get_metric_baseline(metric_dir: str) -> pd.DataFrame:
     return _METRIC_BASELINE_CACHE[key]
 
 
+def get_cached_metric_baseline(metric_dir: str) -> pd.DataFrame:
+    """
+    Public accessor for the module-level metric baseline cache.
+    Computes p95 baseline on first call, serves from cache on subsequent calls.
+    Safe to call from any module in the same process.
+    """
+    return _get_metric_baseline(metric_dir)
+
+
+def get_cached_listdir(directory: str) -> List[str]:
+    """Public accessor for the module-level listdir cache."""
+    return _cached_listdir(directory)
+
+
+def get_cached_header(path: str) -> List[str]:
+    """Public accessor for the module-level CSV header cache."""
+    return _cached_header(path)
+
+
 def _normalize_metric_file(path: str) -> pd.DataFrame:
     """Load metric CSV into (ts_s, component, metric, value) using minimal columns when possible."""
     from rca.component_candidates import _normalize_metric_file as _normalize_metric_file_full

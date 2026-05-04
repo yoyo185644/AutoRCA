@@ -43,16 +43,27 @@ def _norm_name(s: str) -> str:
 _MONTH = {
     "january": 1,
     "february": 2,
+    "feb": 2,
     "march": 3,
+    "mar": 3,
     "april": 4,
+    "apr": 4,
     "may": 5,
     "june": 6,
+    "jun": 6,
     "july": 7,
+    "jul": 7,
     "august": 8,
+    "aug": 8,
     "september": 9,
+    "sep": 9,
+    "sept": 9,
     "october": 10,
+    "oct": 10,
     "november": 11,
+    "nov": 11,
     "december": 12,
+    "dec": 12,
 }
 
 
@@ -61,7 +72,7 @@ def parse_time_window_generic(instruction: str, tz: str = "Asia/Shanghai") -> Tu
     text_l = text.lower()
     date = ""
     y = mo = d = None
-    m = re.search(r"([A-Za-z]+)\s+(\d{1,2})(?:,)?\s*(\d{4})", text)
+    m = re.search(r"([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,)?\s*(\d{4})", text)
     if m:
         mon, day, year = m.groups()
         mo = _MONTH.get(mon.lower())
@@ -111,6 +122,35 @@ def parse_time_window_generic(instruction: str, tz: str = "Asia/Shanghai") -> Tu
         if end < start:
             start, end = end, start
         return f"{y:04d}_{mo:02d}_{d:02d}", start, end
+
+    date_matches: List[Tuple[int, int, int]] = []
+    for dm in re.finditer(r"([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,)?\s*(\d{4})", text):
+        mon, day, year = dm.groups()
+        mo2 = _MONTH.get(mon.lower())
+        if mo2 is None:
+            continue
+        date_matches.append((int(year), int(mo2), int(day)))
+    for dm in re.finditer(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text):
+        yy, mm, dd = [int(x) for x in dm.groups()]
+        date_matches.append((yy, mm, dd))
+    for dm in re.finditer(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?", text):
+        yy, mm, dd = [int(x) for x in dm.groups()]
+        date_matches.append((yy, mm, dd))
+
+    times = re.findall(r"\b(\d{1,2}:\d{2})(?::\d{2})?\b", text_l)
+    times = [str(t).strip() for t in times if str(t).strip()]
+    if date_matches and len(times) >= 2:
+        (sy, smo, sd) = date_matches[0]
+        (ey, emo, ed) = date_matches[-1]
+        start_date = f"{sy:04d}-{smo:02d}-{sd:02d}"
+        end_date = f"{ey:04d}-{emo:02d}-{ed:02d}"
+        hm1 = times[0][:5]
+        hm2 = times[-1][:5]
+        start = pd.Timestamp(f"{start_date} {hm1}:00", tz=tz)
+        end = pd.Timestamp(f"{end_date} {hm2}:00", tz=tz)
+        if end < start and (sy, smo, sd) == (ey, emo, ed):
+            start, end = end, start
+        return f"{sy:04d}_{smo:02d}_{sd:02d}", start, end
 
     raise ValueError("Cannot parse time window from instruction.")
 

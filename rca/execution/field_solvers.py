@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+import logging
+import math
+import os
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -16,8 +21,328 @@ from rca.telemetry_solver import (
 from rca.reason_candidates import predict_reason_universal
 from rca.component_candidates import build_component_candidates
 from rca.time_candidates import estimate_occurrence_datetime_from_trace
-from rca.fast_solver import evidence_supports_reason, infer_reason_with_evidence
+from rca.fast_solver import (
+    _norm_name,
+    _parse_time_window,
+    _to_tz_timestamp_ms,
+    _trace_component_strength,
+    _trace_spread_stats,
+    evidence_supports_reason,
+    infer_reason_with_evidence as _infer_reason_with_evidence_raw,
+ )
 from rca.memory.config import basil_config_from_args, basil_enabled
+from rca.memory.extractor import get_cached_header, get_cached_metric_baseline
+
+
+_REASON_INFERENCE_CACHE: Dict[Tuple[str, str, str], Tuple[str, Dict[str, Any]]] = {}
+
+
+def _get_reason_cache_key(metric_dir: str, start: pd.Timestamp, end: pd.Timestamp) -> Tuple[str, str, str]:
+    return (str(metric_dir), str(start.isoformat()), str(end.isoformat()))
+
+
+def _load_metric_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    header = get_cached_header(path)
+    usecols = ["timestamp", "cmdb_id", "name", "value"]
+    if header and all(c in header for c in usecols):
+        df = pd.read_csv(path, usecols=usecols, low_memory=False)
+    else:
+        df = pd.read_csv(path, low_memory=False)
+    if df.empty:
+        return df
+    if "timestamp" in df.columns:
+        df = df.copy()
+        df["timestamp"] = _to_tz_timestamp_ms(df["timestamp"])
+    return df
+
+
+def _thresholds_from_baseline(baseline: pd.DataFrame, metric_path: str) -> pd.DataFrame:
+    if baseline is None or baseline.empty:
+        return pd.DataFrame(columns=["cmdb_id", "name", "p95"])
+    file_name = os.path.basename(metric_path)
+    b = baseline[baseline["_file"].astype(str) == str(file_name)].copy()
+    if b.empty:
+        return pd.DataFrame(columns=["cmdb_id", "name", "p95"])
+    b = b.rename(columns={"component": "cmdb_id", "metric": "name"})
+    for c in ["cmdb_id", "name"]:
+        if c in b.columns:
+            b[c] = b[c].astype(str)
+    b["p95"] = pd.to_numeric(b.get("p95"), errors="coerce")
+    b = b.dropna(subset=["p95"])
+    if b.empty:
+        return pd.DataFrame(columns=["cmdb_id", "name", "p95"])
+    return b[["cmdb_id", "name", "p95"]]
+
+
+def _breach_stats_with_baseline(
+    *,
+    metric_path: str,
+    baseline: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    any_keywords: List[str],
+    strong_keywords: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    empty = {"sum_ratio": 0.0, "count": 0, "distinct": 0, "strong_hit": False, "strong_count": 0, "top_metrics": []}
+    if not os.path.exists(metric_path):
+        return dict(empty)
+
+    df = _load_metric_csv(metric_path)
+    if df.empty:
+        return dict(empty)
+    if not all(c in df.columns for c in ["timestamp", "cmdb_id", "name", "value"]):
+        return dict(empty)
+
+    df = df.copy()
+    df["cmdb_id"] = df["cmdb_id"].astype(str)
+    df["name"] = df["name"].astype(str)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["timestamp", "cmdb_id", "name", "value"])
+    if df.empty:
+        return dict(empty)
+
+    df["name_norm"] = df["name"].astype(str).map(_norm_name)
+    any_norm = [_norm_name(k) for k in any_keywords if str(k).strip()]
+    strong_norm = [_norm_name(k) for k in (strong_keywords or []) if str(k).strip()]
+
+    mask = False
+    for kw in any_norm:
+        mask = mask | df["name_norm"].str.contains(kw, na=False)
+    if not mask.any():
+        return dict(empty)
+
+    thresholds = _thresholds_from_baseline(baseline, metric_path)
+    if thresholds.empty:
+        return dict(empty)
+
+    win = df[(df["timestamp"] >= start) & (df["timestamp"] <= end) & (mask)].copy()
+    if win.empty:
+        return dict(empty)
+    win = win.merge(thresholds, on=["cmdb_id", "name"], how="left").dropna(subset=["p95"]).copy()
+    if win.empty:
+        return dict(empty)
+
+    denom = win["p95"].abs().where(win["p95"].abs() > 1e-6, 1.0)
+    win["breach_ratio"] = (win["value"] - win["p95"]) / denom
+    win["breach_ratio"] = win["breach_ratio"].clip(lower=0.0, upper=10.0)
+    win = win[win["breach_ratio"] > 0].copy()
+    if win.empty:
+        return dict(empty)
+
+    strong_hit = False
+    strong_count = 0
+    if strong_norm:
+        for k in strong_norm:
+            if win["name_norm"].str.contains(k, na=False).any():
+                strong_count += 1
+        strong_hit = strong_count > 0
+
+    top_metrics = (
+        win.groupby("name", as_index=False)["breach_ratio"]
+        .sum()
+        .sort_values("breach_ratio", ascending=False)
+        .head(10)["name"]
+        .astype(str)
+        .tolist()
+    )
+    return {
+        "sum_ratio": float(win["breach_ratio"].sum()),
+        "count": int(len(win)),
+        "distinct": int(win["name"].nunique()),
+        "strong_hit": bool(strong_hit),
+        "strong_count": int(strong_count),
+        "top_metrics": top_metrics,
+    }
+
+
+def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
+    logger = logging.getLogger(__name__)
+    t0 = time.time()
+    metric_dir = ""
+    cache_hit = False
+    try:
+        date_dir, start, end = _parse_time_window(instruction)
+        metric_dir = os.path.join("dataset", "Telecom", "telemetry", date_dir, "metric")
+        trace_path = os.path.join("dataset", "Telecom", "telemetry", date_dir, "trace", "trace_span.csv")
+    except Exception:
+        reason, ev = _infer_reason_with_evidence_raw(instruction)
+        logger.info(
+            "reason_inference completed | metric_dir=%s | cache_hit=%s | elapsed_ms=%d",
+            str(metric_dir),
+            bool(False),
+            int((time.time() - t0) * 1000),
+        )
+        return reason, ev
+
+    cache_key = _get_reason_cache_key(metric_dir, start, end)
+    if cache_key in _REASON_INFERENCE_CACHE:
+        cache_hit = True
+        reason, ev = _REASON_INFERENCE_CACHE[cache_key]
+        logger.info("reason_inference cache hit | metric_dir=%s", metric_dir)
+        logger.info(
+            "reason_inference completed | metric_dir=%s | cache_hit=%s | elapsed_ms=%d",
+            str(metric_dir),
+            bool(True),
+            int((time.time() - t0) * 1000),
+        )
+        return reason, ev
+
+    baseline = get_cached_metric_baseline(metric_dir)
+
+    net_loss_kws = ["loss", "drop", "retrans", "timeout", "reset", "error"]
+    net_delay_kws = ["tnsping_result_time", "tnsping", "ping", "rtt", "latency", "delay"]
+    db_conn_kws = ["login_per_sec", "login", "tps_per_sec", "tps", "exec_per_sec", "exec", "sess_active", "session"]
+    db_conn_strong = ["login_per_sec", "tps_per_sec", "exec_per_sec"]
+    db_close_kws = ["on_off_state", "on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"]
+    cpu_kws = ["proc_used_pct", "proc_user_used_pct", "cpu", "load", "iowait", "util"]
+
+    net_path = os.path.join(metric_dir, "metric_node.csv")
+    mw_path = os.path.join(metric_dir, "metric_middleware.csv")
+    svc_path = os.path.join(metric_dir, "metric_service.csv")
+    cont_path = os.path.join(metric_dir, "metric_container.csv")
+
+    net_loss_n = _breach_stats_with_baseline(metric_path=net_path, baseline=baseline, start=start, end=end, any_keywords=net_loss_kws)
+    net_delay_n = _breach_stats_with_baseline(metric_path=net_path, baseline=baseline, start=start, end=end, any_keywords=net_delay_kws)
+    net_loss_m = _breach_stats_with_baseline(metric_path=mw_path, baseline=baseline, start=start, end=end, any_keywords=net_loss_kws)
+    net_delay_m = _breach_stats_with_baseline(metric_path=mw_path, baseline=baseline, start=start, end=end, any_keywords=net_delay_kws)
+    net_loss = max(
+        [net_loss_n, net_loss_m],
+        key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))),
+    )
+    net_delay = max(
+        [net_delay_n, net_delay_m],
+        key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))),
+    )
+    db_conn = _breach_stats_with_baseline(
+        metric_path=svc_path,
+        baseline=baseline,
+        start=start,
+        end=end,
+        any_keywords=db_conn_kws,
+        strong_keywords=db_conn_strong,
+    )
+    db_close = _breach_stats_with_baseline(metric_path=svc_path, baseline=baseline, start=start, end=end, any_keywords=db_close_kws)
+    cpu_c = _breach_stats_with_baseline(metric_path=cont_path, baseline=baseline, start=start, end=end, any_keywords=cpu_kws)
+    cpu_n = _breach_stats_with_baseline(metric_path=net_path, baseline=baseline, start=start, end=end, any_keywords=cpu_kws)
+
+    def score(stat: Dict[str, Any], require_distinct: int = 1, weak_penalty: float = 1.0) -> float:
+        if int(stat.get("distinct", 0)) < require_distinct:
+            return 0.0
+        s_sum = float(stat.get("sum_ratio", 0.0))
+        s_cnt = float(stat.get("count", 0))
+        s_dis = float(stat.get("distinct", 0))
+        mean_ratio = s_sum / max(1.0, s_cnt)
+        s = 2.0 * math.log1p(max(0.0, mean_ratio)) + 0.35 * math.log1p(max(0.0, s_cnt)) + 0.9 * math.log1p(max(0.0, s_dis))
+        return float(s * weak_penalty)
+
+    s_net_loss = max(score(net_loss_n, require_distinct=1), score(net_loss_m, require_distinct=1))
+    s_net_delay = max(score(net_delay_n, require_distinct=1), score(net_delay_m, require_distinct=1))
+    s_db_conn = score(db_conn, require_distinct=2, weak_penalty=1.0 if db_conn.get("strong_hit") else 0.25)
+    s_db_close = score(db_close, require_distinct=2)
+    s_cpu = max(score(cpu_c, require_distinct=1), score(cpu_n, require_distinct=1))
+
+    scored = [
+        ("network loss", s_net_loss, net_loss),
+        ("network delay", s_net_delay, net_delay),
+        ("db connection limit", s_db_conn, db_conn),
+        ("db close", s_db_close, db_close),
+        ("CPU fault", s_cpu, {"container": cpu_c, "node": cpu_n}),
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_reason = scored[0][0] if scored else ""
+    best_score = float(scored[0][1]) if scored else 0.0
+    second_score = float(scored[1][1]) if len(scored) > 1 else 0.0
+    gap = best_score - second_score
+    evidence: Dict[str, Any] = {
+        "time_window": {"date_dir": date_dir, "start": start.strftime("%Y-%m-%d %H:%M:%S"), "end": end.strftime("%Y-%m-%d %H:%M:%S")},
+        "scores": {r: float(s) for r, s, _ in scored},
+        "gap": float(gap),
+        "best": {"reason": best_reason, "score": float(best_score)},
+        "stats": {
+            "network_loss": net_loss,
+            "network_delay": net_delay,
+            "db_connection_limit": db_conn,
+            "db_close": db_close,
+            "cpu_container": cpu_c,
+            "cpu_node": cpu_n,
+        },
+        "top_metrics": {
+            "network_loss": net_loss.get("top_metrics", []),
+            "network_delay": net_delay.get("top_metrics", []),
+            "db_connection_limit": db_conn.get("top_metrics", []),
+            "db_close": db_close.get("top_metrics", []),
+            "cpu_container": cpu_c.get("top_metrics", []),
+            "cpu_node": cpu_n.get("top_metrics", []),
+        },
+        "keyword_hits": {
+            "network_delay": 0,
+            "network_loss": 0,
+            "db_connection_limit": int(db_conn.get("strong_count", 0) or 0),
+            "db_close": 0,
+            "cpu": 0,
+        },
+        "trace_spread": {},
+    }
+
+    def _count_hits(metrics: List[str], tokens: List[str]) -> int:
+        blob = " ".join([str(x).lower() for x in metrics])
+        return int(sum(1 for t in tokens if t and t in blob))
+
+    evidence["keyword_hits"]["network_delay"] = _count_hits(evidence["top_metrics"]["network_delay"], ["tnsping", "ping", "rtt", "latency", "delay"])
+    evidence["keyword_hits"]["network_loss"] = _count_hits(evidence["top_metrics"]["network_loss"], ["timeout", "retrans", "loss", "drop", "reset", "error"])
+    evidence["keyword_hits"]["db_close"] = _count_hits(evidence["top_metrics"]["db_close"], ["close", "disconnect", "logout", "onoff", "shutdown", "restart"])
+    evidence["keyword_hits"]["cpu"] = _count_hits(evidence["top_metrics"]["cpu_node"] + evidence["top_metrics"]["cpu_container"], ["cpu", "load", "iowait", "util"])
+
+    evidence["trace_spread"] = _trace_spread_stats(trace_path, start, end)
+    evidence["trace_component"] = _trace_component_strength(trace_path, start, end)
+
+    spread = evidence["trace_spread"]
+    spread_ratio = float(spread.get("affected_ratio", 0.0) or 0.0)
+    hits = evidence["keyword_hits"]
+    scores = evidence["scores"]
+    tc = evidence["trace_component"]
+    db_max = float(tc.get("db_max_ratio", 0.0) or 0.0)
+    node_max = float(tc.get("node_max_ratio", 0.0) or 0.0)
+    cont_max = float(tc.get("container_max_ratio", 0.0) or 0.0)
+    top_type = str(tc.get("top_type") or "")
+    if spread_ratio >= 0.35 and (int(hits.get("network_loss", 0)) > 0 or int(hits.get("network_delay", 0)) > 0):
+        if int(hits.get("network_loss", 0)) >= int(hits.get("network_delay", 0)):
+            scores["network loss"] = float(scores.get("network loss", 0.0) + 1.0)
+        else:
+            scores["network delay"] = float(scores.get("network delay", 0.0) + 1.0)
+        scores["CPU fault"] = float(max(0.0, scores.get("CPU fault", 0.0) - 0.4))
+        scores["db connection limit"] = float(max(0.0, scores.get("db connection limit", 0.0) - 0.3))
+        scores["db close"] = float(max(0.0, scores.get("db close", 0.0) - 0.3))
+    if spread_ratio <= 0.15 and float(scores.get("CPU fault", 0.0)) > 0:
+        scores["CPU fault"] = float(scores.get("CPU fault", 0.0) + 0.2)
+    if db_max >= 1.6 or top_type == "db":
+        scores["db connection limit"] = float(scores.get("db connection limit", 0.0) + 0.4)
+        scores["db close"] = float(scores.get("db close", 0.0) + 0.4)
+    if db_max <= 1.25 and top_type in ("node", "container"):
+        scores["db connection limit"] = float(max(0.0, scores.get("db connection limit", 0.0) - 0.6))
+        scores["db close"] = float(max(0.0, scores.get("db close", 0.0) - 0.6))
+    if (max(node_max, cont_max) >= 1.6) and spread_ratio <= 0.25 and int(hits.get("cpu", 0)) >= 1:
+        scores["CPU fault"] = float(scores.get("CPU fault", 0.0) + 0.3)
+        scores["network loss"] = float(max(0.0, scores.get("network loss", 0.0) - 0.2))
+        scores["network delay"] = float(max(0.0, scores.get("network delay", 0.0) - 0.2))
+    evidence["scores"] = scores
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    if ranked:
+        best_reason = ranked[0][0]
+        evidence["best"] = {"reason": best_reason, "score": float(ranked[0][1])}
+        evidence["gap"] = float(ranked[0][1] - (ranked[1][1] if len(ranked) > 1 else 0.0))
+
+    _REASON_INFERENCE_CACHE[cache_key] = (best_reason, evidence)
+    logger.info("reason_inference cache miss | metric_dir=%s | stored", metric_dir)
+    logger.info(
+        "reason_inference completed | metric_dir=%s | cache_hit=%s | elapsed_ms=%d",
+        str(metric_dir),
+        bool(cache_hit),
+        int((time.time() - t0) * 1000),
+    )
+    return best_reason, evidence
 
 
 def solve_time(*, dataset: str, instruction: str, scoring_points: str, need_time: bool) -> Tuple[str, Optional[int], Any]:

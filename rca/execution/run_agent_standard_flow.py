@@ -304,6 +304,10 @@ def _solve_with_evidence_gate(
         need_reason=need_reason,
         top_pairs=3,
     )
+    try:
+        pair_payload = [{"component": str(c or ""), "reason": str(r or ""), "score": float(s or 0.0)} for (c, r, s) in list(pairs or [])[:3]]
+    except Exception:
+        pair_payload = []
 
     top1_score = float(pairs[0][2]) if pairs else 0.0
     top2_score = float(pairs[1][2]) if len(pairs) >= 2 else 0.0
@@ -312,14 +316,40 @@ def _solve_with_evidence_gate(
     quick_need_gate = False
     score_gap_threshold = float(getattr(args, "evidence_score_gap_threshold", 0.15) or 0.15)
     top1_score_floor = float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30)
-    required_fields = int(need_time) + int(need_comp) + int(need_reason)
-    if allow_gate and len(pairs) >= 2 and required_fields >= 1:
-        if required_fields == 1:
-            if top1_score < top1_score_floor:
-                quick_need_gate = True
+    top1_score_floor_single = float(getattr(args, "evidence_top1_score_floor_single", 0.50) or 0.50)
+    required_fields = fields
+    n_required_fields = len(required_fields) if hasattr(required_fields, "__len__") else 1
+
+    trigger_reason = "skipped"
+    if allow_gate and n_required_fields >= 1:
+        if n_required_fields == 1:
+            quick_need_gate = bool(top1_score < top1_score_floor_single)
+            if quick_need_gate:
+                trigger_reason = "top1_below_floor_single"
         else:
-            if score_gap < score_gap_threshold or top1_score < top1_score_floor:
+            if score_gap < score_gap_threshold:
                 quick_need_gate = True
+                trigger_reason = "gap_below_threshold"
+            elif top1_score < top1_score_floor:
+                quick_need_gate = True
+                trigger_reason = "top1_below_floor"
+
+    gate_debug = {
+        "required_fields": int(n_required_fields),
+        "top1_score": float(top1_score),
+        "top2_score": float(top2_score),
+        "score_gap": float(score_gap),
+        "quick_need_gate": bool(quick_need_gate),
+        "trigger_reason": str(trigger_reason),
+        "pairs": list(pair_payload),
+        "det_dt": str(dt or ""),
+        "det_comp": str(comp or ""),
+        "det_reason": str(det_reason or ""),
+        "allow_gate": bool(allow_gate),
+        "score_gap_threshold": float(score_gap_threshold),
+        "top1_score_floor": float(top1_score_floor),
+        "top1_score_floor_single": float(top1_score_floor_single),
+    }
 
     time_cands: List[TimeCandidate] = []
     quick_need_time = False
@@ -337,6 +367,8 @@ def _solve_with_evidence_gate(
         if len(time_cands) >= 2:
             if float(time_cands[0].score) - float(time_cands[1].score) < 0.20:
                 quick_need_time = True
+    gate_debug["quick_need_time"] = bool(quick_need_time)
+    gate_debug["allow_time_llm"] = bool(allow_time_llm)
 
     gate_skip_gap_threshold = float(getattr(args, "gate_skip_gap_threshold", 0.30) or 0.30)
     if quick_need_gate and (not quick_need_time) and score_gap >= gate_skip_gap_threshold:
@@ -382,7 +414,16 @@ def _solve_with_evidence_gate(
             "postprocess_seconds": 0.0,
         }
         traj = [
-            {"step": "evidence_gate", "action": "evidence_gate", "dataset": str(dataset), "task_id": int(spec.task_id), "need_llm": False},
+            {
+                "step": "evidence_gate",
+                "action": "evidence_gate",
+                "dataset": str(dataset),
+                "task_id": int(spec.task_id),
+                "need_llm": False,
+                "gate_path": "skipped",
+                "gate_debug": gate_debug,
+                "chosen": {"datetime": str(dt or ""), "component": str(comp or ""), "reason": str(root_reason or "")},
+            },
             {"step": "timing", "action": "timing", "strategy": "evidence_gate", "timing_breakdown_seconds": timing_breakdown},
         ]
         return json.dumps(obj_pred, ensure_ascii=False), traj, []
@@ -424,7 +465,16 @@ def _solve_with_evidence_gate(
             "postprocess_seconds": 0.0,
         }
         traj = [
-            {"step": "evidence_gate", "action": "evidence_gate", "dataset": str(dataset), "task_id": int(spec.task_id), "need_llm": False},
+            {
+                "step": "evidence_gate",
+                "action": "evidence_gate",
+                "dataset": str(dataset),
+                "task_id": int(spec.task_id),
+                "need_llm": False,
+                "gate_path": "skipped",
+                "gate_debug": gate_debug,
+                "chosen": {"datetime": str(dt or ""), "component": str(comp or ""), "reason": str(root_reason or "")},
+            },
             {"step": "timing", "action": "timing", "strategy": "evidence_gate", "timing_breakdown_seconds": timing_breakdown},
         ]
         return json.dumps(obj_pred, ensure_ascii=False), traj, []
@@ -620,6 +670,8 @@ def _solve_with_evidence_gate(
             "dataset": str(dataset),
             "task_id": int(spec.task_id),
             "need_llm": bool(unc.get("need_llm")),
+            "gate_path": str(gate_path),
+            "gate_debug": gate_debug,
             "uncertainty": unc,
             "chosen": {"datetime": final_dt, "component": final_comp, "reason": final_reason},
             "time_candidates": time_stats[:10],
