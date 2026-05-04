@@ -6,6 +6,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from rca.memory.telemetry_cache import TelemetryCache
+
 
 @dataclass(frozen=True)
 class ComponentEvidence:
@@ -27,6 +29,7 @@ class ComponentEvidence:
     top2: str = ""
     gap_norm: float = 0.0
     explanation: str = ""
+    timings: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -58,31 +61,55 @@ def parse_time_window_generic(instruction: str, tz: str = "Asia/Shanghai") -> Tu
     text_l = text.lower()
     date = ""
     y = mo = d = None
-    m = re.search(r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})", text)
+    m = re.search(r"([A-Za-z]+)\s+(\d{1,2})(?:,)?\s*(\d{4})", text)
     if m:
         mon, day, year = m.groups()
-        mo = _MONTH[mon.lower()]
+        mo = _MONTH.get(mon.lower())
+        if mo is None:
+            raise ValueError("Cannot parse time window from instruction.")
         d = int(day)
         y = int(year)
         date = f"{y:04d}-{mo:02d}-{d:02d}"
     else:
-        m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+        m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
         if m:
-            date = m.group(1)
-            y, mo, d = [int(x) for x in date.split("-")]
+            y, mo, d = [int(x) for x in m.groups()]
+            date = f"{y:04d}-{mo:02d}-{d:02d}"
+        else:
+            m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?", text)
+            if m:
+                y, mo, d = [int(x) for x in m.groups()]
+                date = f"{y:04d}-{mo:02d}-{d:02d}"
 
     hm1 = hm2 = ""
-    m = re.search(r"from\s*(\d{1,2}:\d{2})\s*to\s*(\d{1,2}:\d{2})", text_l)
+    m = re.search(r"from\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*to\s*(\d{1,2}:\d{2}(?::\d{2})?)", text_l)
     if m:
         hm1, hm2 = m.groups()
     else:
-        m = re.search(r"between\s*(\d{1,2}:\d{2})\s*(?:and|to)\s*(\d{1,2}:\d{2})", text_l)
+        m = re.search(r"between\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:and|to)\s*(\d{1,2}:\d{2}(?::\d{2})?)", text_l)
         if m:
             hm1, hm2 = m.groups()
+        else:
+            m = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:-|–|—|~|～|to|至|到)\s*(\d{1,2}:\d{2}(?::\d{2})?)", text_l)
+            if m:
+                hm1, hm2 = m.groups()
+            else:
+                m = re.search(r"从\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:到|至)\s*(\d{1,2}:\d{2}(?::\d{2})?)", text)
+                if m:
+                    hm1, hm2 = m.groups()
+
+    hm1 = str(hm1 or "").strip()
+    hm2 = str(hm2 or "").strip()
+    if len(hm1) >= 5:
+        hm1 = hm1[:5]
+    if len(hm2) >= 5:
+        hm2 = hm2[:5]
 
     if date and hm1 and hm2 and y is not None and mo is not None and d is not None:
         start = pd.Timestamp(f"{date} {hm1}:00", tz=tz)
         end = pd.Timestamp(f"{date} {hm2}:00", tz=tz)
+        if end < start:
+            start, end = end, start
         return f"{y:04d}_{mo:02d}_{d:02d}", start, end
 
     raise ValueError("Cannot parse time window from instruction.")
@@ -221,9 +248,35 @@ def _metric_component_scores(
     return total, peak_time, first_time, top_metrics
 
 
-def _trace_component_scores(trace_path: str, start_s: int, end_s: int) -> Dict[str, float]:
+def _trace_component_scores(
+    trace_path: str,
+    start_s: int,
+    end_s: int,
+    dataset: str = "",
+    date_dir: str = "",
+) -> Dict[str, float]:
     if not os.path.exists(trace_path):
         return {}
+    if dataset and date_dir:
+        try:
+            cached = TelemetryCache.get_trace_minute_p95(dataset, date_dir, trace_path)
+            if not cached.empty:
+                start_minute = int((int(start_s) // 60) * 60)
+                end_minute = int((int(end_s) // 60) * 60)
+                win = cached[
+                    (cached["minute"] >= start_minute)
+                    & (cached["minute"] <= end_minute)
+                    & (cached["component"] != "__all__")
+                ].copy()
+                if not win.empty:
+                    p95 = win.groupby("component")["p95"].quantile(0.95)
+                    baseline = float(p95.median()) if not p95.empty else 0.0
+                    if baseline > 0:
+                        out = ((p95 / baseline) - 1.0).clip(lower=0.0)
+                        return {str(k): float(v) for k, v in out.items()}
+                return {}
+        except Exception:
+            pass
     df = pd.read_csv(trace_path, low_memory=False)
     if df.empty or "cmdb_id" not in df.columns:
         return {}
@@ -247,25 +300,8 @@ def _trace_component_scores(trace_path: str, start_s: int, end_s: int) -> Dict[s
     return {str(k): float(v) for k, v in out.items()}
 
 
-def _estimate_failure_time_from_trace(trace_path: str, start_s: int, end_s: int) -> int:
-    if not os.path.exists(trace_path):
-        return int((start_s // 60) * 60)
-    df = pd.read_csv(trace_path, low_memory=False)
-    if df.empty:
-        return int((start_s // 60) * 60)
-    ts_col = "timestamp" if "timestamp" in df.columns else ("startTime" if "startTime" in df.columns else None)
-    dur_col = "duration" if "duration" in df.columns else ("elapsedTime" if "elapsedTime" in df.columns else None)
-    if ts_col is None or dur_col is None:
-        return int((start_s // 60) * 60)
-    df = df[[ts_col, dur_col]].copy()
-    df["ts_s"] = _ts_to_seconds(df[ts_col])
-    df["dur"] = pd.to_numeric(df[dur_col], errors="coerce")
-    df = df.dropna(subset=["ts_s", "dur"])
-    df = df[(df["ts_s"] >= start_s) & (df["ts_s"] <= end_s)].copy()
-    if df.empty:
-        return int((start_s // 60) * 60)
-    df["minute"] = (df["ts_s"] // 60) * 60
-    p95 = df.groupby("minute")["dur"].quantile(0.95).sort_index()
+def _select_failure_minute_from_p95(p95: pd.Series, start_s: int) -> int:
+    p95 = p95.sort_index()
     if p95.empty:
         return int((start_s // 60) * 60)
     baseline = float(p95.median())
@@ -282,6 +318,51 @@ def _estimate_failure_time_from_trace(trace_path: str, start_s: int, end_s: int)
     if not candidates.empty:
         return int(candidates.index[0])
     return int(p95.sort_values(ascending=False).index[0])
+
+
+def _estimate_failure_time_from_trace(
+    trace_path: str,
+    start_s: int,
+    end_s: int,
+    dataset: str = "",
+    date_dir: str = "",
+) -> int:
+    if not os.path.exists(trace_path):
+        return int((start_s // 60) * 60)
+    if dataset and date_dir:
+        try:
+            cached = TelemetryCache.get_trace_minute_p95(dataset, date_dir, trace_path)
+            if not cached.empty:
+                start_minute = int((int(start_s) // 60) * 60)
+                end_minute = int((int(end_s) // 60) * 60)
+                win = cached[
+                    (cached["minute"] >= start_minute)
+                    & (cached["minute"] <= end_minute)
+                    & (cached["component"] == "__all__")
+                ].copy()
+                if not win.empty:
+                    p95 = win.set_index("minute")["p95"]
+                    return _select_failure_minute_from_p95(p95, start_s)
+                return int((start_s // 60) * 60)
+        except Exception:
+            pass
+    df = pd.read_csv(trace_path, low_memory=False)
+    if df.empty:
+        return int((start_s // 60) * 60)
+    ts_col = "timestamp" if "timestamp" in df.columns else ("startTime" if "startTime" in df.columns else None)
+    dur_col = "duration" if "duration" in df.columns else ("elapsedTime" if "elapsedTime" in df.columns else None)
+    if ts_col is None or dur_col is None:
+        return int((start_s // 60) * 60)
+    df = df[[ts_col, dur_col]].copy()
+    df["ts_s"] = _ts_to_seconds(df[ts_col])
+    df["dur"] = pd.to_numeric(df[dur_col], errors="coerce")
+    df = df.dropna(subset=["ts_s", "dur"])
+    df = df[(df["ts_s"] >= start_s) & (df["ts_s"] <= end_s)].copy()
+    if df.empty:
+        return int((start_s // 60) * 60)
+    df["minute"] = (df["ts_s"] // 60) * 60
+    p95 = df.groupby("minute")["dur"].quantile(0.95).sort_index()
+    return _select_failure_minute_from_p95(p95, start_s)
 
 
 def _comp_type(comp: str) -> str:
@@ -305,13 +386,70 @@ def build_component_candidates(
     w_trace: float = 1.0,
     center_time_s: Optional[int] = None,
     delta_s: int = 300,
+    use_basil: bool = False,
+    basil_config: Optional[Any] = None,
+    basil_reasons: Optional[Sequence[str]] = None,
 ) -> ComponentEvidence:
+    if bool(use_basil):
+        try:
+            from rca.memory.query import basil_query_config_from_mapping, query_basil_components
+
+            cfg_obj = basil_config or {}
+            if isinstance(cfg_obj, dict):
+                cfg = basil_query_config_from_mapping(cfg_obj, top_k=int(cfg_obj.get("top_k", top_k)))
+            else:
+                cfg = cfg_obj
+
+            res = query_basil_components(
+                dataset=dataset,
+                instruction=instruction,
+                top_k=top_k,
+                center_time_s=center_time_s,
+                delta_s=delta_s,
+                reasons=basil_reasons or [],
+                config=cfg,
+            )
+            if res.candidates:
+                ranked_cand = sorted(res.candidates, key=lambda c: float(res.combined_scores.get(c, 0.0)), reverse=True)
+                top1 = ranked_cand[0] if ranked_cand else ""
+                top2 = ranked_cand[1] if len(ranked_cand) > 1 else ""
+                s1 = float(res.combined_scores.get(top1, 0.0)) if top1 else 0.0
+                s2 = float(res.combined_scores.get(top2, 0.0)) if top2 else 0.0
+                gap_norm = abs(s1 - s2) / max(abs(s1), 1e-9)
+                return ComponentEvidence(
+                    dataset=dataset,
+                    date_dir=res.date_dir,
+                    start_local=res.start_local,
+                    end_local=res.end_local,
+                    candidates=list(ranked_cand[: max(1, int(top_k))]),
+                    metric_scores=res.metric_scores,
+                    trace_scores=res.trace_scores,
+                    combined_scores=res.combined_scores,
+                    peak_times=res.peak_times,
+                    first_times=res.first_times,
+                    top_metrics=res.top_metrics,
+                    estimated_failure_time=res.estimated_failure_time,
+                    local_start_s=int(res.local_start_s),
+                    local_end_s=int(res.local_end_s),
+                    top1=top1,
+                    top2=top2,
+                    gap_norm=float(gap_norm),
+                    explanation=res.explanation,
+                    timings=dict(res.stats.timings or {}),
+                )
+        except Exception:
+            pass
+
     date_dir, start, end = parse_time_window_generic(instruction)
     metric_dir = os.path.join("dataset", dataset, "telemetry", date_dir, "metric")
     trace_path = os.path.join("dataset", dataset, "telemetry", date_dir, "trace", "trace_span.csv")
     start_s, end_s = _to_epoch_seconds(start), _to_epoch_seconds(end)
 
-    t_star = int(center_time_s) if center_time_s is not None else _estimate_failure_time_from_trace(trace_path, start_s, end_s)
+    t_star = (
+        int(center_time_s)
+        if center_time_s is not None
+        else _estimate_failure_time_from_trace(trace_path, start_s, end_s, dataset=dataset, date_dir=date_dir)
+    )
     delta_s = int(delta_s) if int(delta_s) > 0 else 300
     local_start_s = max(int(start_s), int(t_star) - delta_s)
     local_end_s = min(int(end_s), int(t_star) + delta_s)
@@ -319,7 +457,7 @@ def build_component_candidates(
         local_start_s, local_end_s = int(start_s), int(end_s)
 
     metric_scores, peak_times, first_times, top_metrics = _metric_component_scores(metric_dir, local_start_s, local_end_s)
-    trace_scores = _trace_component_scores(trace_path, local_start_s, local_end_s)
+    trace_scores = _trace_component_scores(trace_path, local_start_s, local_end_s, dataset=dataset, date_dir=date_dir)
 
     def norm(m: Dict[str, float]) -> Dict[str, float]:
         if not m:

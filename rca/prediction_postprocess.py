@@ -90,14 +90,21 @@ def normalize_prediction_for_eval(
     k = required_root_count(scoring_points)
 
     roots: List[Dict[str, Any]] = []
+    root_was_missing: List[bool] = []
     for i in range(1, int(k) + 1):
         v = obj.get(str(i))
+        missing_root = not isinstance(v, dict)
         if not isinstance(v, dict):
             v = obj.get("1") if isinstance(obj.get("1"), dict) else {}
         roots.append(dict(v))
+        root_was_missing.append(bool(missing_root))
 
     dts: Optional[List[str]] = None
-    if need_time:
+    missing_time = need_time and any(
+        root_was_missing[i] or not str(r.get("root cause occurrence datetime") or "").strip()
+        for i, r in enumerate(roots)
+    )
+    if missing_time:
         if dataset.startswith("Market/") and int(k) >= 1:
             dts = _log_trace_times(dataset=dataset, instruction=instruction, k=int(k))
         else:
@@ -113,7 +120,7 @@ def normalize_prediction_for_eval(
                 dt = dts[i] if i < len(dts) else dts[-1]
             else:
                 dt = ""
-            if not str(r.get("root cause occurrence datetime") or "").strip():
+            if root_was_missing[i] or not str(r.get("root cause occurrence datetime") or "").strip():
                 r["root cause occurrence datetime"] = dt
         if need_comp:
             key2 = "root cause component".replace(" ", "_")

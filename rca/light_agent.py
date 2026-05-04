@@ -92,3 +92,37 @@ def choose_from_candidates(
         raw_response=resp if isinstance(resp, str) else str(resp),
     )
 
+
+def estimate_token_count(text: str) -> int:
+    s = str(text or "")
+    if not s:
+        return 0
+    try:
+        return max(1, int(len(s.encode("utf-8")) / 4))
+    except Exception:
+        return max(1, int(len(s) / 4))
+
+
+def call_json_only(
+    *,
+    system: str,
+    user: str,
+    temperature: float = 0.0,
+) -> Tuple[Dict[str, Any], str, int, int, List[Dict[str, str]]]:
+    messages = [{"role": "system", "content": str(system)}, {"role": "user", "content": str(user)}]
+    raw = get_chat_completion(messages=messages, temperature=float(temperature))
+    raw_s = raw if isinstance(raw, str) else str(raw)
+    obj: Dict[str, Any] = {}
+    try:
+        obj = json.loads(raw_s)
+    except Exception:
+        start = raw_s.find("{")
+        end = raw_s.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                obj = json.loads(raw_s[start : end + 1])
+            except Exception:
+                obj = {}
+    in_tokens = estimate_token_count(system) + estimate_token_count(user)
+    out_tokens = estimate_token_count(raw_s)
+    return obj if isinstance(obj, dict) else {}, raw_s, int(in_tokens), int(out_tokens), messages

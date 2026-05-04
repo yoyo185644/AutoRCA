@@ -14,6 +14,19 @@ _REASON_PATTERN = r"The (?:\d+-th|only) predicted root cause reason is ([^\n]+)"
 _TIME_PATTERN = r"The (?:\d+-th|only) root cause occurrence time is within 1 minutes \(i.e., <=1min\) of ([^\n]+)"
 
 
+def _read_csv_with_python_fallback(path: str, **kwargs) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, **kwargs)
+    except Exception as exc:
+        msg = str(exc)
+        if "Try engine='python'" not in msg and "Error tokenizing data" not in msg:
+            raise
+        kwargs = dict(kwargs)
+        kwargs["engine"] = "python"
+        kwargs.pop("low_memory", None)
+        return pd.read_csv(path, **kwargs)
+
+
 def required_root_count(scoring_points: str) -> int:
     text = str(scoring_points or "")
     comps = re.findall(_COMP_PATTERN, text)
@@ -63,12 +76,13 @@ def estimate_k_occurrence_datetimes_from_trace(dataset: str, instruction: str, k
     trace_path = os.path.join("dataset", dataset, "telemetry", date_dir, "trace", "trace_span.csv")
     if not os.path.exists(trace_path) or k <= 1:
         return [start.floor("min").strftime("%Y-%m-%d %H:%M:%S")]
-    df = pd.read_csv(trace_path, low_memory=False)
-    if df.empty:
-        return [start.floor("min").strftime("%Y-%m-%d %H:%M:%S")]
-    ts_col = "startTime" if "startTime" in df.columns else ("timestamp" if "timestamp" in df.columns else None)
-    dur_col = "elapsedTime" if "elapsedTime" in df.columns else ("duration" if "duration" in df.columns else None)
+    columns = set(_read_csv_with_python_fallback(trace_path, nrows=0).columns)
+    ts_col = "startTime" if "startTime" in columns else ("timestamp" if "timestamp" in columns else None)
+    dur_col = "elapsedTime" if "elapsedTime" in columns else ("duration" if "duration" in columns else None)
     if ts_col is None or dur_col is None:
+        return [start.floor("min").strftime("%Y-%m-%d %H:%M:%S")]
+    df = _read_csv_with_python_fallback(trace_path, low_memory=False, usecols=[ts_col, dur_col])
+    if df.empty:
         return [start.floor("min").strftime("%Y-%m-%d %H:%M:%S")]
     ts_unit = "ms" if df[ts_col].dropna().astype(str).str.len().max() >= 13 else "s"
     df = df[[ts_col, dur_col]].copy()
@@ -112,7 +126,7 @@ def estimate_k_occurrence_datetimes_from_logs(dataset: str, instruction: str, k:
     frames = []
 
     def _load_and_filter_time(p: str) -> pd.DataFrame:
-        df = pd.read_csv(p, low_memory=False, usecols=["timestamp", "value"] if "log_proxy" in p or "log_service" in p else None)
+        df = _read_csv_with_python_fallback(p, low_memory=False, usecols=["timestamp", "value"] if "log_proxy" in p or "log_service" in p else None)
         if df.empty or not {"timestamp", "value"}.issubset(df.columns):
             return pd.DataFrame()
         df["ts"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Shanghai")
@@ -165,7 +179,7 @@ def estimate_top_components_from_logs(dataset: str, instruction: str, center_dt:
         filter_start, filter_end = start, end
         
     def _load_and_filter_time(p: str) -> pd.DataFrame:
-        df = pd.read_csv(p, low_memory=False, usecols=["timestamp", "cmdb_id", "value"] if "log_proxy" in p or "log_service" in p else None)
+        df = _read_csv_with_python_fallback(p, low_memory=False, usecols=["timestamp", "cmdb_id", "value"] if "log_proxy" in p or "log_service" in p else None)
         if df.empty or not {"timestamp", "cmdb_id", "value"}.issubset(df.columns):
             return pd.DataFrame()
         df["ts"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Shanghai")

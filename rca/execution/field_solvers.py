@@ -17,6 +17,7 @@ from rca.reason_candidates import predict_reason_universal
 from rca.component_candidates import build_component_candidates
 from rca.time_candidates import estimate_occurrence_datetime_from_trace
 from rca.fast_solver import evidence_supports_reason, infer_reason_with_evidence
+from rca.memory.config import basil_config_from_args, basil_enabled
 
 
 def solve_time(*, dataset: str, instruction: str, scoring_points: str, need_time: bool) -> Tuple[str, Optional[int], Any]:
@@ -109,6 +110,9 @@ def solve_component(
         top_k=top_k,
         center_time_s=center_time_s_for_comp,
         delta_s=delta_s,
+        use_basil=basil_enabled(args),
+        basil_config=basil_config_from_args(args, top_k, required_fields=getattr(spec, "required_fields", None), task_id=getattr(spec, "task_id", None)),
+        basil_reasons=[x for x in [det_reason, det_reason_other] if str(x or "").strip()] if need_reason else [],
     )
 
     def _ctype(c: str) -> str:
@@ -260,7 +264,15 @@ def assemble_prediction(
                 comp_i = canonicalize_component(log_comps[0])
             else:
                 top_k = int(getattr(args, "task3_top_k", 12))
-                ev3_i = build_component_candidates(dataset=dataset, instruction=instruction, top_k=top_k, center_time_s=ct_s)
+                ev3_i = build_component_candidates(
+                    dataset=dataset,
+                    instruction=instruction,
+                    top_k=top_k,
+                    center_time_s=ct_s,
+                    use_basil=basil_enabled(args),
+                    basil_config=basil_config_from_args(args, top_k, required_fields=getattr(spec, "required_fields", None), task_id=getattr(spec, "task_id", None)),
+                    basil_reasons=extract_reasons_from_scoring_points(scoring_points) if need_reason else [],
+                )
                 comp_i = ev3_i.top1
                 if dataset.startswith("Market/"):
                     comp_i = canonicalize_component(comp_i)
