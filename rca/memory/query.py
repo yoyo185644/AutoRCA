@@ -506,6 +506,11 @@ def query_basil_components(
     date_dir, start, end = parse_time_window_generic(instruction)
     start_s, end_s = _to_epoch_seconds(start), _to_epoch_seconds(end)
     incident_id = f"{dataset}:{date_dir}:{start_s}:{end_s}"
+    if center_time_s is None:
+        try:
+            center_time_s = int((int(start_s) + int(end_s)) // 2)
+        except Exception:
+            center_time_s = None
 
     t0 = time.perf_counter()
     segments, ctx = extract_anomaly_segments(
@@ -518,15 +523,21 @@ def query_basil_components(
     timings["basil.evidence_extract_segments_seconds"] = time.perf_counter() - t0
 
     t_edges = time.perf_counter()
-    expanded_start_s = max(0, start_s - int(cfg.max_lag_s))
-    expanded_end_s = end_s + int(cfg.max_lag_s)
-    edges = extract_trace_topology_edges(
-        dataset=dataset,
-        date_dir=date_dir,
-        start_s=expanded_start_s,
-        end_s=expanded_end_s,
-        max_rows=cfg.max_trace_rows,
+    edges: List[TraceTopologyEdge] = []
+    use_topology = not (
+        float(getattr(cfg, "similarity_topology_weight", 0.0) or 0.0) <= 1e-12
+        and float(getattr(cfg, "w_causal", 0.0) or 0.0) <= 1e-12
     )
+    if use_topology:
+        expanded_start_s = max(0, start_s - int(cfg.max_lag_s))
+        expanded_end_s = end_s + int(cfg.max_lag_s)
+        edges = extract_trace_topology_edges(
+            dataset=dataset,
+            date_dir=date_dir,
+            start_s=expanded_start_s,
+            end_s=expanded_end_s,
+            max_rows=cfg.max_trace_rows,
+        )
     timings["basil.evidence_extract_topology_seconds"] = time.perf_counter() - t_edges
 
     t_write = time.perf_counter()

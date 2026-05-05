@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -131,6 +131,26 @@ def query_basil_evidence(
         reasons=reasons or [],
         config=cfg,
     )
+    if int(getattr(cfg, "time_tolerance_s", 300) or 300) <= 120 and not list(getattr(result, "hypotheses", []) or []):
+        try:
+            relaxed = BasilQueryConfig(**{**cfg.__dict__, "time_tolerance_s": 600})
+            result = query_basil_components(
+                dataset=dataset,
+                instruction=instruction,
+                top_k=top_k,
+                center_time_s=center_time_s,
+                delta_s=delta_s,
+                reasons=reasons or [],
+                config=relaxed,
+            )
+            logging.getLogger(__name__).warning(
+                "basil_time_tolerance_relaxed task_id=%s tolerance_s=%s relaxed_s=%s",
+                str(int(task_id)),
+                str(int(getattr(cfg, "time_tolerance_s", 300) or 300)),
+                "600",
+            )
+        except Exception:
+            pass
 
     start_dt = _to_utc_datetime(result.start_local) or datetime.now(timezone.utc)
     end_dt = _to_utc_datetime(result.end_local) or start_dt
@@ -146,6 +166,31 @@ def query_basil_evidence(
                 times.append(parsed)
         if times:
             time_by_component[str(comp)] = times
+    hyp_components: List[str] = []
+    for hyp in getattr(result, "hypotheses", []) or []:
+        comp = str(getattr(hyp, "component", "") or "").strip()
+        if not comp:
+            continue
+        onset_s = getattr(hyp, "onset_s", None)
+        if onset_s is None:
+            onset_s = getattr(hyp, "occurrence_time", None)
+        if onset_s is None:
+            continue
+        try:
+            dt = datetime.fromtimestamp(int(onset_s), tz=timezone.utc)
+        except Exception:
+            continue
+        cur = list(time_by_component.get(comp, []))
+        if dt not in cur:
+            cur.append(dt)
+        time_by_component[comp] = cur
+        hyp_components.append(comp)
+    if hyp_components:
+        logging.getLogger(__name__).info(
+            "basil_hypothesis_times_merged n_components=%s sample_components=%s",
+            str(len(set(hyp_components))),
+            str(list(dict.fromkeys(hyp_components))[:5]),
+        )
 
     reason_by_component = _reason_scores_from_hypotheses(result, component_scores.keys())
     low_confidence = bool((result.stats.ub_slack or {}).get("low_confidence", 0.0))
@@ -185,33 +230,193 @@ def build_component_candidates(evidence: BasilEvidence, *, top_k: int = 12) -> B
     )
 
 
-def build_time_candidates(evidence: BasilEvidence, *, top_k: int = 8) -> BasilTimeCandidates:
+def build_time_candidates(
+    evidence: BasilEvidence,
+    *,
+    top_k: int = 8,
+    focus_components: Optional[Sequence[str]] = None,
+) -> BasilTimeCandidates:
+    def _compute_impact_times(first_dt: datetime, peak_dt: Optional[datetime]) -> List[datetime]:
+        if first_dt.tzinfo is None:
+            first_dt = first_dt.replace(tzinfo=timezone.utc)
+        out: List[datetime] = []
+        seen: set[str] = set()
+
+        def add(dt: datetime) -> None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+            if dt < first_dt.astimezone(timezone.utc):
+                return
+            key = dt.isoformat()
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(dt)
+
+        evolution_s = 0.0
+        if peak_dt is not None:
+            if peak_dt.tzinfo is None:
+                peak_dt = peak_dt.replace(tzinfo=timezone.utc)
+            evolution_s = max(0.0, float((peak_dt - first_dt).total_seconds()))
+
+        for minutes in [5, 8, 10, 15, 20]:
+            add(first_dt + timedelta(minutes=int(minutes)))
+
+        if evolution_s >= 180.0:
+            for factor in [0.6, 0.8, 1.0, 1.2]:
+                offset_s = min(evolution_s * float(factor), 1200.0)
+                add(first_dt + timedelta(seconds=float(offset_s)))
+        return out
+
     out: List[TimeCandidate] = []
     ranked_components = sorted(evidence.component_scores.items(), key=lambda x: float(x[1]), reverse=True)
     if not ranked_components:
         ranked_components = [(c, 0.0) for c in evidence.time_candidates.keys()]
+    try:
+        max_comp_s = max([float(s) for _, s in ranked_components] + [0.0])
+    except Exception:
+        max_comp_s = 0.0
+    if max_comp_s <= 1e-12:
+        max_comp_s = 1.0
 
     for comp, comp_score in ranked_components:
-        times = evidence.time_candidates.get(str(comp), []) or []
-        for idx, dt in enumerate(times[:2]):
-            src = "basil_first_anomaly_time" if idx == 0 else "basil_peak_time"
-            score = max(0.0, float(comp_score)) * (1.0 if idx == 0 else 0.85)
+        comp_key = str(comp)
+        comp_norm = max(0.0, float(comp_score)) / float(max_comp_s)
+        first_dt = _to_utc_datetime((evidence.first_times or {}).get(comp_key)) if evidence.first_times else None
+        peak_dt = _to_utc_datetime((evidence.peak_times or {}).get(comp_key)) if evidence.peak_times else None
+        extra_times = list((evidence.time_candidates or {}).get(comp_key, []) or [])
+        if first_dt is None and extra_times:
+            first_dt = extra_times[0]
+        if peak_dt is None and len(extra_times) >= 2:
+            peak_dt = extra_times[1]
+        if first_dt is None:
+            continue
+
+        base_ev = {
+            "incident_id": evidence.incident_id,
+            "low_confidence": bool(evidence.low_confidence),
+            "confidence_reason": evidence.confidence_reason or "",
+            "supporting_metrics": evidence.supporting_metrics.get(comp_key, []),
+        }
+
+        evolution_s = 0.0
+        if peak_dt is not None:
+            try:
+                evolution_s = max(0.0, float((peak_dt - first_dt).total_seconds()))
+            except Exception:
+                evolution_s = 0.0
+
+        out.append(
+            TimeCandidate(
+                datetime=_to_local_string(first_dt),
+                source="basil_first_anomaly_time",
+                score=float(comp_norm * 1.0),
+                component=comp_key,
+                reason="",
+                evidence=dict(base_ev) | {"evolution_s": int(evolution_s)},
+            )
+        )
+        if peak_dt is not None:
             out.append(
                 TimeCandidate(
-                    datetime=_to_local_string(dt),
-                    source=src,
-                    score=float(score),
-                    component=str(comp),
+                    datetime=_to_local_string(peak_dt),
+                    source="basil_peak_time",
+                    score=float(comp_norm * 0.85),
+                    component=comp_key,
                     reason="",
-                    evidence={
-                        "incident_id": evidence.incident_id,
-                        "low_confidence": bool(evidence.low_confidence),
-                        "confidence_reason": evidence.confidence_reason or "",
-                        "supporting_metrics": evidence.supporting_metrics.get(str(comp), []),
-                    },
+                    evidence=dict(base_ev) | {"evolution_s": int(evolution_s)},
+                )
+            )
+
+        if peak_dt is not None:
+            if evolution_s >= 180.0:
+                ramp_dt = (first_dt + timedelta(seconds=float(min(0.60 * evolution_s, 1200.0)))).replace(second=0, microsecond=0)
+                confirm_dt = (first_dt + timedelta(seconds=float(min(0.40 * evolution_s, 1200.0)))).replace(second=0, microsecond=0)
+            else:
+                ramp_dt = (first_dt + timedelta(minutes=3)).replace(second=0, microsecond=0)
+                confirm_dt = (first_dt + timedelta(minutes=2)).replace(second=0, microsecond=0)
+            out.append(
+                TimeCandidate(
+                    datetime=_to_local_string(ramp_dt),
+                    source="basil_ramp_time",
+                    score=float(comp_norm * 0.90),
+                    component=comp_key,
+                    reason="",
+                    evidence=dict(base_ev) | {"evolution_s": int(evolution_s)},
+                )
+            )
+            out.append(
+                TimeCandidate(
+                    datetime=_to_local_string(confirm_dt),
+                    source="basil_confirm_time",
+                    score=float(comp_norm * 0.88),
+                    component=comp_key,
+                    reason="",
+                    evidence=dict(base_ev) | {"evolution_s": int(evolution_s)},
+                )
+            )
+
+        impact_times = _compute_impact_times(first_dt, peak_dt)
+        for t in impact_times:
+            out.append(
+                TimeCandidate(
+                    datetime=_to_local_string(t),
+                    source="basil_impact_time",
+                    score=float(comp_norm * 1.02),
+                    component=comp_key,
+                    reason="",
+                    evidence=dict(base_ev) | {"evolution_s": int(evolution_s)},
+                )
+            )
+        if impact_times:
+            logging.getLogger(__name__).info(
+                "basil_impact_time_added component=%s evolution_s=%s n_impact_candidates=%s impact_times=%s",
+                comp_key,
+                str(int(evolution_s)),
+                str(len(impact_times)),
+                str([x.isoformat() for x in impact_times[:4]]),
+            )
+
+        hyp_times = list(extra_times[2:]) if len(extra_times) > 2 else []
+        for t in hyp_times:
+            if t is None:
+                continue
+            out.append(
+                TimeCandidate(
+                    datetime=_to_local_string(t),
+                    source="basil_hypothesis_time",
+                    score=float(comp_norm * 1.01),
+                    component=comp_key,
+                    reason="",
+                    evidence=dict(base_ev) | {"origin": "hypothesis"},
                 )
             )
     out.sort(key=lambda c: float(c.score), reverse=True)
+    focus = list(dict.fromkeys([str(x) for x in (focus_components or []) if str(x).strip()]))
+    if focus:
+        picked: List[TimeCandidate] = []
+        seen_dt: set[str] = set()
+        for comp in focus:
+            comp_best = None
+            for c in out:
+                if str(getattr(c, "component", "") or "") == comp:
+                    comp_best = c
+                    break
+            if comp_best is not None:
+                dt = str(getattr(comp_best, "datetime", "") or "")
+                if dt and dt not in seen_dt:
+                    picked.append(comp_best)
+                    seen_dt.add(dt)
+        for c in out:
+            if len(picked) >= int(max(1, int(top_k))):
+                break
+            dt = str(getattr(c, "datetime", "") or "")
+            if not dt or dt in seen_dt:
+                continue
+            picked.append(c)
+            seen_dt.add(dt)
+        out = picked
     return BasilTimeCandidates(
         candidates=out[: max(1, int(top_k))],
         by_component=dict(evidence.time_candidates),
