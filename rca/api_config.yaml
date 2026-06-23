@@ -1,11 +1,11 @@
-# SOURCE:   "OpenAI"
-# MODEL:    "gpt-4o-2024-05-13"
-# API_KEY:  "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"
-# API_BASE: ""
+SOURCE:   "OpenAI"
+MODEL:    "gpt-4o-2024-05-13"
+API_KEY:  "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"
+API_BASE: ""
 
 
 
-SOURCE:   "Anthropic"
-MODEL:    "kimi-k2.5"
-API_KEY:  "sk-TamTjsBrvOoOhx0VbNN4XrO1K6vays9kBOWhrqi2MxJuS3kZ"
-API_BASE: "https://api.moonshot.ai/anthropic"
+# SOURCE:   "Anthropic"
+# MODEL:    "kimi-k2.5"
+# API_KEY:  "sk-TamTjsBrvOoOhx0VbNN4XrO1K6vays9kBOWhrqi2MxJuS3kZ"
+# API_BASE: "https://api.moonshot.ai/anthropic"

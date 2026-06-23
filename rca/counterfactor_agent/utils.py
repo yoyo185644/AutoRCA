@@ -77,8 +77,45 @@ def format_prediction_json(
     occurrence_datetime: str = "",
 ) -> str:
     obj: Dict[str, Any] = {"1": {}}
-    obj["1"]["root cause component"] = str(component or "")
-    obj["1"]["root cause reason"] = str(reason or "")
     if str(occurrence_datetime or "").strip():
         obj["1"]["root cause occurrence datetime"] = str(occurrence_datetime)
+    obj["1"]["root cause component"] = str(component or "")
+    obj["1"]["root cause reason"] = str(reason or "")
     return json.dumps(obj, ensure_ascii=False)
+
+
+def format_prediction_json_multi(roots: List[Dict[str, Any]]) -> str:
+    obj: Dict[str, Any] = {}
+    for i, r in enumerate(list(roots or []), start=1):
+        entry: Dict[str, Any] = {}
+        if isinstance(r, dict):
+            dt = str(r.get("occurrence_datetime", "") or r.get("root cause occurrence datetime", "") or "").strip()
+            if dt:
+                entry["root cause occurrence datetime"] = dt
+            entry["root cause component"] = str(r.get("component", "") or r.get("root cause component", "") or "")
+            entry["root cause reason"] = str(r.get("reason", "") or r.get("root cause reason", "") or "")
+        else:
+            entry["root cause component"] = str(r)
+            entry["root cause reason"] = ""
+        obj[str(i)] = entry
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def normalize_prediction_json_for_eval(prediction_json: str, k: int = 1) -> str:
+    obj = safe_json_loads(str(prediction_json or ""), default={})
+    if not isinstance(obj, dict):
+        obj = {}
+    roots: List[Dict[str, Any]] = []
+    kk = max(1, int(k) if int(k) >= 1 else 1)
+    for i in range(1, kk + 1):
+        v = obj.get(str(i))
+        if not isinstance(v, dict):
+            v = obj.get(i) if isinstance(obj.get(i), dict) else {}
+        roots.append(
+            {
+                "occurrence_datetime": str(v.get("root cause occurrence datetime", "") or v.get("occurrence_datetime", "") or ""),
+                "component": str(v.get("root cause component", "") or v.get("component", "") or ""),
+                "reason": str(v.get("root cause reason", "") or v.get("reason", "") or ""),
+            }
+        )
+    return format_prediction_json_multi(roots)

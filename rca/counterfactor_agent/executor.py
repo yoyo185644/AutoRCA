@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from rca.api_router import get_chat_completion
-from rca.agent.evidence_builder import build_candidate_evidence
+from rca.execution.evidence_builder import build_candidate_evidence
 from .schemas import CandidateHypothesis, CounterfactualCheck, DeterministicEvidence
 from .utils import ensure_list, normalize_score, safe_json_loads
 
@@ -93,6 +93,7 @@ class CounterfactualExecutor:
         top = list(candidates or [])[: max(1, int(top_k))]
         if not top:
             raise ValueError("No candidates for LLM verification.")
+        enable_trace = bool(context.get("enable_trace_evidence", True))
 
         candidate_payload = []
         all_components = [str(c.component) for c in list(candidates or []) if str(getattr(c, "component", "") or "").strip()]
@@ -108,6 +109,7 @@ class CounterfactualExecutor:
                     score_gap_vs_next=max(0.0, float(cand.score) - next_score),
                     all_candidate_components=all_components,
                     topology_max_rows=context.get("basil_max_trace_rows"),
+                    enable_trace=bool(enable_trace),
                 ).to_dict()
             except Exception:
                 ev = {
@@ -188,6 +190,102 @@ Choose the most likely root-cause component/reason from the candidate list only.
         }
         return {"candidate": selected, "details": details}
 
+    def generate_multi_root_with_llm(
+        self,
+        *,
+        instruction: str,
+        evidence_groups: List[Dict[str, Any]],
+        target_k: int,
+        dataset_name: str = "",
+        task_focus: str = "",
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        context = context or {}
+        k = int(target_k) if int(target_k) >= 1 else 1
+        groups = list(evidence_groups or [])
+        component_level = str(context.get("component_level", "") or "").strip().lower()
+
+        system_prompt = f"""
+You are an RCA agent for multi-failure queries.
+
+The query explicitly contains {k} root causes / failures.
+The system has selected a candidate root-cause set using coverage-first joint selection.
+Each EvidenceGroup represents one possible root cause.
+
+Component naming note:
+- The expected component level for this dataset is: "{component_level or 'unknown'}".
+- Ensure your output component matches that level (pod vs service vs node) when possible.
+
+Your job:
+- Verify the evidence in each EvidenceGroup.
+- Output exactly {k} root causes.
+- Avoid duplicate components unless the evidence clearly indicates repeated independent failures.
+- For cascading cases, prefer upstream root causes unless the query asks for all failure sources.
+
+Output strictly in JSON with keys "1"..."{k}". Each item must include:
+- "root cause occurrence datetime"
+- "root cause component"
+- "root cause reason"
+- "supporting evidence" (list of short strings)
+"""
+
+        user_prompt = f"""
+Dataset: {dataset_name}
+Task focus: {task_focus}
+RCA query:
+{instruction}
+
+QueryMeta:
+{json.dumps(context.get("query_meta", {}), ensure_ascii=False)}
+
+Joint selection details:
+{json.dumps(context.get("multi_root_selection_details", {}), ensure_ascii=False)}
+
+EvidenceGroups (selected set, structured):
+{json.dumps(groups, ensure_ascii=False, indent=2)}
+"""
+
+        raw = self._chat(system_prompt, user_prompt)
+        data = safe_json_loads(raw, {})
+
+        out: Dict[str, Any] = {}
+        for i in range(1, k + 1):
+            key = str(i)
+            item = data.get(key) if isinstance(data, dict) else None
+            if not isinstance(item, dict):
+                item = {}
+            comp = str(item.get("root cause component", "") or "").strip()
+            reason = str(item.get("root cause reason", "") or "").strip()
+            dt = str(item.get("root cause occurrence datetime", "") or "").strip()
+            sup = ensure_list(item.get("supporting evidence", []))[:6]
+
+            fallback_comp = ""
+            fallback_reason = ""
+            fallback_dt = ""
+            if 0 <= (i - 1) < len(groups):
+                g = groups[i - 1] if isinstance(groups[i - 1], dict) else {}
+                fallback_comp = str(g.get("candidate_component", "") or "").strip()
+                fallback_reason = str(g.get("candidate_reason", "") or "").strip()
+                fallback_dt = str(g.get("candidate_time", "") or "").strip()
+
+            out[key] = {
+                "root cause component": comp or fallback_comp,
+                "root cause reason": reason or fallback_reason,
+            }
+            if dt or fallback_dt:
+                out[key]["root cause occurrence datetime"] = dt or fallback_dt
+            if sup:
+                out[key]["supporting evidence"] = sup
+
+        details = {
+            "target_k": int(k),
+            "group_count": int(len(groups)),
+            "raw_response": str(raw),
+            "approx_input_tokens": int(self.last_llm_call.get("approx_input_tokens", 0) or 0),
+            "elapsed_seconds": float(self.last_llm_call.get("elapsed_seconds", 0.0) or 0.0),
+        }
+        return {"prediction_json": json.dumps(out, ensure_ascii=False), "details": details}
+
     def select_time_with_llm(
         self,
         instruction: str,
@@ -201,8 +299,9 @@ Choose the most likely root-cause component/reason from the candidate list only.
     ) -> Dict[str, Any]:
         context = context or {}
         comp = str(component or "")
-        from rca.agent.evidence_builder import build_time_evidence
-        from rca.time_candidates import TimeCandidate
+        from rca.execution.evidence_builder import build_time_evidence
+        from rca.adapter.utils.time_candidates import TimeCandidate
+        enable_trace = bool(context.get("enable_trace_evidence", True))
 
         def _base_score(item: Dict[str, Any]) -> float:
             try:
@@ -298,6 +397,7 @@ Choose the most likely root-cause component/reason from the candidate list only.
                     ),
                     component=comp,
                     reason=str(reason or ""),
+                    enable_trace=bool(enable_trace),
                 ).to_dict()
             except Exception:
                 minute_evidence = {}
@@ -524,25 +624,47 @@ Select the best root-cause occurrence datetime from the candidate list only.
         allowed_reasons = context.get("allowed_reasons")
         component_scores = context.get("component_scores", {}) if isinstance(context.get("component_scores"), dict) else {}
         reason_scores = context.get("reason_scores", {}) if isinstance(context.get("reason_scores"), dict) else {}
-        if (
-            isinstance(allowed_components, list)
-            and isinstance(allowed_reasons, list)
-            and (allowed_components or allowed_reasons)
-        ):
+        det_components: List[str] = []
+        det_reasons: List[str] = []
+        if isinstance(allowed_components, list):
+            det_components = [str(x) for x in allowed_components if str(x or "").strip()]
+        if isinstance(allowed_reasons, list):
+            det_reasons = [str(x) for x in allowed_reasons if str(x or "").strip()]
+
+        if not det_components and component_scores:
+            try:
+                det_components = [
+                    str(k)
+                    for k, _v in sorted(component_scores.items(), key=lambda kv: float(kv[1] or 0.0), reverse=True)[:12]
+                    if str(k or "").strip()
+                ]
+            except Exception:
+                det_components = []
+        if not det_reasons and reason_scores:
+            try:
+                det_reasons = [
+                    str(k)
+                    for k, _v in sorted(reason_scores.items(), key=lambda kv: float(kv[1] or 0.0), reverse=True)[:12]
+                    if str(k or "").strip()
+                ]
+            except Exception:
+                det_reasons = []
+
+        if det_components or det_reasons:
             max_c = max([abs(float(v)) for v in component_scores.values()] + [0.0])
             max_r = max([abs(float(v)) for v in reason_scores.values()] + [0.0])
-            cand = []
-            comp_list = allowed_components if allowed_components else ["unknown"]
-            reason_list = allowed_reasons if allowed_reasons else ["unknown"]
+            comp_list = det_components[:12] if det_components else ["unknown"]
+            reason_list = det_reasons[:12] if det_reasons else ["unknown"]
+            cand: List[CandidateHypothesis] = []
             for c in comp_list:
                 cs = float(component_scores.get(str(c), 0.0) or 0.0)
                 cn = cs / max(max_c, 1e-9) if max_c > 0 else 0.0
                 for r in reason_list:
                     rs = float(reason_scores.get(str(r), 0.0) or 0.0)
                     rn = rs / max(max_r, 1e-9) if max_r > 0 else 0.0
-                    if not allowed_components:
+                    if not det_components:
                         joint = rn
-                    elif not allowed_reasons:
+                    elif not det_reasons:
                         joint = cn
                     else:
                         joint = 0.60 * cn + 0.40 * rn

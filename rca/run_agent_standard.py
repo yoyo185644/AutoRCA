@@ -11,7 +11,7 @@ import pandas as pd
 from loguru import logger
 
 from main.evaluate import evaluate
-from rca.execution.agent_standard import AgentStandardRuntimeExtras, build_agent_standard_runner
+from rca.agent.agent_standard import AgentStandardRuntimeExtras, build_agent_standard_runner
 from rca.execution.run_agent_standard_flow import get_task_spec, solve_by_mode
 
 
@@ -118,6 +118,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--light_agent_temperature", type=float, default=0.0)
     p.add_argument("--task3_top_k", type=int, default=12)
     p.add_argument("--task3_agent_gap", type=float, default=0.15)
+    p.set_defaults(enable_query_count_parser=True)
+    p.add_argument("--enable_query_count_parser", action="store_true")
+    p.add_argument("--disable_query_count_parser", action="store_false", dest="enable_query_count_parser")
+    p.set_defaults(enable_multi_root_joint_selection=True)
+    p.add_argument("--enable_multi_root_joint_selection", action="store_true")
+    p.add_argument("--disable_multi_root_joint_selection", action="store_false", dest="enable_multi_root_joint_selection")
+    p.add_argument("--multi_root_top_n", type=int, default=10)
     return p
 
 
@@ -173,8 +180,8 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     record_df = pd.read_csv(record_path) if os.path.exists(record_path) else pd.DataFrame()
 
     df = pd.read_csv(query_path).reset_index().rename(columns={"index": "row_id"})
-    start_idx = int(getattr(args_obj, "start_idx", 0) or 0)
-    end_idx = int(getattr(args_obj, "end_idx", 999999) or 999999)
+    start_idx = int(getattr(args_obj, "start_idx", 0) if getattr(args_obj, "start_idx", None) is not None else 0)
+    end_idx = int(getattr(args_obj, "end_idx", 999999) if getattr(args_obj, "end_idx", None) is not None else 999999)
     selected_task_ids = _parse_task_ids(getattr(args_obj, "task_ids", ""))
 
     out_dir = f"test/result/{dataset}"

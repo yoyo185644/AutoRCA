@@ -7,8 +7,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from rca.fast_solver import infer_reason_with_evidence
-from rca.component_candidates import build_component_candidates
+from rca.execution.fast_solver import infer_reason_with_evidence
+from rca.adapter.utils.component_candidates import build_component_candidates
 
 
 def main():

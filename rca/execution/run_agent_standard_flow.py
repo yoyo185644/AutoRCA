@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Optional, Set, Tuple
 
-from rca.execution.agent_standard import AgentStandardRuntimeExtras, build_task_context, infer_difficulty
+from rca.agent.agent_standard import AgentStandardRuntimeExtras, build_task_context, infer_difficulty
 from rca.execution.framework import Difficulty, UnifiedTaskRunner
 
 

@@ -1,0 +1,105 @@
+inherits: default
+dataset: Market/cloudbed-1
+
+adapter: market
+timezone: Asia/Shanghai
+
+paths:
+  telemetry_root: dataset/{dataset}/telemetry
+
+component_alias:
+  node_pod_pattern: '^(node-\d+)\.(.+)$'
+  pod_suffix_pattern: '^(.+)-\d+$'
+  service_suffixes:
+    - -grpc
+    - .ts
+
+telemetry:
+  metric_files:
+    container: metric_container.csv
+    node: metric_node.csv
+    service: metric_service.csv
+    mesh: metric_mesh.csv
+    runtime: metric_runtime.csv
+  log_files:
+    service: log_service.csv
+    proxy: log_proxy.csv
+  trace_file: trace_span.csv
+
+index:
+  type: market_alias_metric_log_index
+  cache:
+    enabled: true
+    dir: test/cache/basil_index/market_frames
+  build:
+    bucket_size_seconds: 60
+    severity_floor: 0.0
+    component_alias_merge: true
+    include_service_metrics: true
+  query:
+    top_k: 12
+    time_tolerance_seconds: 300
+    log_window_seconds: 180
+    component_window_seconds: 600
+
+weights:
+  component:
+    metric: 1.0
+    log: 0.85
+    trace: 0.35
+    service_alias: 0.65
+    node_alias: 0.35
+  time:
+    log_event: 1.0
+    metric_first_breach: 0.85
+    trace_onset: 0.45
+  reason:
+    taxonomy_token: 1.0
+    component_level_match: 0.35
+
+reason_taxonomy:
+  container CPU load:
+    level: pod
+    tokens: [cpu, load, usage, util, throttle]
+  container memory load:
+    level: pod
+    tokens: [memory, mem, rss, heap, working_set]
+  container read I/O load:
+    level: pod
+    tokens: [read, io, iops, diskio, blkio]
+  container write I/O load:
+    level: pod
+    tokens: [write, io, iops, diskio, blkio]
+  container network latency:
+    level: pod
+    tokens: [network, latency, rtt, delay]
+  container network packet retransmission:
+    level: pod
+    tokens: [network, retransmission, retrans, retry]
+  container network packet corruption:
+    level: pod
+    tokens: [network, corruption, corrupt, error]
+  container packet loss:
+    level: pod
+    tokens: [network, loss, drop, dropped, packet]
+  container process termination:
+    level: pod
+    tokens: [restart, terminated, termination, kill, killed, exit]
+  node CPU load:
+    level: node
+    tokens: [cpu, load, usage, util, iowait]
+  node CPU spike:
+    level: node
+    tokens: [cpu, spike, load, usage, util]
+  node memory consumption:
+    level: node
+    tokens: [memory, mem, consumption, available, used]
+  node disk read I/O consumption:
+    level: node
+    tokens: [disk, read, io, iops, await]
+  node disk write I/O consumption:
+    level: node
+    tokens: [disk, write, io, iops, await]
+  node disk space consumption:
+    level: node
+    tokens: [disk, space, filesystem, fs, used]

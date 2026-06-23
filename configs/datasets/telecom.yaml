@@ -1,0 +1,18 @@
+inherits: default
+dataset: Telecom
+
+# Telecom keeps the existing implementation path. This file exists so dataset
+# configuration is independent, but no new adapter is registered for Telecom.
+adapter: telecom
+
+index:
+  type: basil_telecom_existing
+  cache:
+    enabled: true
+    dir: test/cache/basil_index/telecom_frames
+  build:
+    bucket_size_seconds: 300
+    severity_floor: 0.0
+  query:
+    top_k: 12
+    time_tolerance_seconds: 300

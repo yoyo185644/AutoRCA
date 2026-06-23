@@ -9,19 +9,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from rca.light_agent import choose_from_candidates
-from rca.telemetry_solver import (
-    canonicalize_component,
-    estimate_k_occurrence_datetimes_from_logs,
+from rca.execution.light_agent import choose_from_candidates
+from rca.execution.telemetry_solver import (
     estimate_k_occurrence_datetimes_from_trace,
-    estimate_top_components_from_logs,
     extract_reasons_from_scoring_points,
-    required_root_count,
 )
-from rca.reason_candidates import predict_reason_universal
-from rca.component_candidates import build_component_candidates
-from rca.time_candidates import estimate_occurrence_datetime_from_trace
-from rca.fast_solver import (
+from rca.adapter.utils.reason_candidates import predict_reason_universal
+from rca.adapter.utils.component_candidates import build_component_candidates
+from rca.adapter.utils.time_candidates import estimate_occurrence_datetime_from_trace
+from rca.execution.fast_solver import (
     _norm_name,
     _parse_time_window,
     _to_tz_timestamp_ms,
@@ -30,8 +26,9 @@ from rca.fast_solver import (
     evidence_supports_reason,
     infer_reason_with_evidence as _infer_reason_with_evidence_raw,
  )
-from rca.memory.config import basil_config_from_args, basil_enabled
-from rca.memory.extractor import get_cached_header, get_cached_metric_baseline
+from rca.index.config import basil_config_from_args, basil_enabled
+from rca.index.extractor import get_cached_header, get_cached_metric_baseline
+from rca.adapter.registry import get_dataset_adapter
 
 
 _REASON_INFERENCE_CACHE: Dict[Tuple[str, str, str], Tuple[str, Dict[str, Any]]] = {}
@@ -348,15 +345,7 @@ def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
 def solve_time(*, dataset: str, instruction: str, scoring_points: str, need_time: bool) -> Tuple[str, Optional[int], Any]:
     if not need_time:
         return "", None, None
-    k_fail = required_root_count(scoring_points)
-    if dataset.startswith("Market/") and int(k_fail) > 1:
-        dts = estimate_k_occurrence_datetimes_from_logs(dataset=dataset, instruction=instruction, k=int(k_fail))
-        if not dts:
-            dts = estimate_k_occurrence_datetimes_from_trace(dataset=dataset, instruction=instruction, k=int(k_fail))
-        dt = dts[0] if dts else ""
-        ev_time = None
-    else:
-        dt, ev_time = estimate_occurrence_datetime_from_trace(dataset=dataset, instruction=instruction)
+    dt, ev_time = estimate_occurrence_datetime_from_trace(dataset=dataset, instruction=instruction)
     try:
         center_time_s = int(pd.Timestamp(dt, tz="Asia/Shanghai").tz_convert("UTC").timestamp())
     except Exception:
@@ -375,22 +364,11 @@ def solve_reason(
 ) -> Tuple[str, str, bool, Any]:
     if not need_reason:
         return "", "", False, None
-    if dataset == "Telecom":
-        det_reason, ev2 = infer_reason_with_evidence(instruction)
-        if bool(getattr(args, "light_agent", False)):
-            candidates = list((ev2.get("scores") or {}).keys())
-            dec = choose_from_candidates(
-                task_id=2,
-                instruction=instruction,
-                output_field="root cause reason",
-                candidates=candidates,
-                evidence=ev2,
-                temperature=float(args.light_agent_temperature),
-            )
-            agent_reason = dec.chosen
-            if agent_reason and evidence_supports_reason(ev2, agent_reason):
-                det_reason = agent_reason
-        return str(det_reason or ""), "", True, ev2
+    adapter = get_dataset_adapter(dataset)
+    if adapter:
+        ar = adapter.solve_reason(spec=spec, instruction=instruction, scoring_points=scoring_points, args=args, need_reason=need_reason)
+        if ar is not None:
+            return ar
 
     reason, ev2 = predict_reason_universal(
         dataset=dataset,
@@ -421,12 +399,15 @@ def solve_component(
     if not need_comp:
         return "", None, None, str(det_reason or "")
 
-    if dataset == "Telecom" and getattr(spec, "difficulty", "") != "easy":
-        delta_s = 1800
-        center_time_s_for_comp = None
+    adapter = get_dataset_adapter(dataset)
+    if adapter:
+        _delta_cfg = adapter.get_component_delta_s(spec=spec, need_comp=need_comp, need_time=need_time, center_time_s=center_time_s)
+        if isinstance(_delta_cfg, tuple) and len(_delta_cfg) == 2:
+            delta_s, center_time_s_for_comp = int(_delta_cfg[0]), _delta_cfg[1]
+        else:
+            delta_s, center_time_s_for_comp = int(_delta_cfg), center_time_s
     else:
-        delta_s = 1800 if (dataset == "Telecom" and need_time) else 300
-        center_time_s_for_comp = center_time_s
+        delta_s, center_time_s_for_comp = 300, center_time_s
 
     top_k = int(getattr(args, "task3_top_k", 12))
     ev3 = build_component_candidates(
@@ -464,28 +445,12 @@ def solve_component(
 
     comp = ev3.top1
     det_reason_out = str(det_reason or "")
-    if dataset == "Telecom" and need_reason and det_reason_ready:
-        rs = (ev2 or {}).get("scores", {}) if isinstance(ev2, dict) else {}
-        cs = ev3.combined_scores or {}
-        if rs and cs:
-            max_r = max([float(v) for v in rs.values()] + [0.0])
-            max_c = max([abs(float(v)) for v in cs.values()] + [0.0])
-            best_pair = None
-            best_joint = -1.0
-            for r, rv in rs.items():
-                rn = float(rv) / max(max_r, 1e-9)
-                desired_t = _rtype(r)
-                pool = [c for c in cs.keys() if desired_t and _ctype(c) == desired_t] if desired_t else list(cs.keys())
-                if not pool:
-                    pool = list(cs.keys())
-                c_best = max(pool, key=lambda c: float(cs.get(c, 0.0)))
-                cn = float(cs.get(c_best, 0.0)) / max(max_c, 1e-9)
-                joint = 0.55 * cn + 0.45 * rn
-                if joint > best_joint:
-                    best_joint = joint
-                    best_pair = (str(r), str(c_best))
-            if best_pair is not None:
-                det_reason_out, comp = best_pair
+    if adapter and need_reason and det_reason_ready:
+        fn = getattr(adapter, "solve_component_joint_scoring", None)
+        if callable(fn):
+            pair = fn(ev2=ev2, ev3=ev3, det_reason=det_reason, det_reason_ready=det_reason_ready)
+            if pair is not None:
+                det_reason_out, comp = pair
 
     top1_score = float(ev3.combined_scores.get(comp, 0.0))
     desired = ""
@@ -509,7 +474,13 @@ def solve_component(
 
     cand = list(ev3.candidates or [])
     filtered = [c for c in cand if desired and _ctype(c) == desired] if desired else []
-    allow_light_agent = (int(getattr(spec, "task_id", 0)) in light_agent_tasks) or (dataset == "Telecom" and getattr(spec, "difficulty", "") != "easy" and need_comp)
+    if adapter:
+        allow_light_agent = adapter.should_use_light_agent(
+            spec=spec, need_comp=need_comp, ev3_gap_norm=float(ev3.gap_norm),
+            no_llm_fallback=no_llm_fallback, args=args,
+        )
+    else:
+        allow_light_agent = (int(getattr(spec, "task_id", 0)) in light_agent_tasks)
     gap_thr = float(getattr(args, "task3_agent_gap", 0.15))
     use_agent = bool(args.light_agent) and (float(ev3.gap_norm) < gap_thr) and (not no_llm_fallback) and allow_light_agent
     if use_agent:
@@ -525,14 +496,9 @@ def solve_component(
         if dec.chosen:
             comp = dec.chosen
 
-    if dataset.startswith("Market/"):
-                comp = canonicalize_component(comp)
-
     dt_override = None
-    if dataset == "Telecom" and need_time:
-        dt2 = (ev3.first_times or {}).get(comp) or (ev3.peak_times or {}).get(comp) or str(getattr(ev3, "estimated_failure_time", "") or "")
-        if str(dt2 or "").strip():
-            dt_override = str(dt2)
+    if adapter:
+        dt_override = adapter.get_time_dt_override(need_time=need_time, comp=comp, ev3=ev3)
 
     _ = det_reason_other
     return str(comp or ""), dt_override, ev3, str(det_reason_out or "")
@@ -567,10 +533,8 @@ def assemble_prediction(
         return obj
 
     roots = []
-    dts = estimate_k_occurrence_datetimes_from_logs(dataset=dataset, instruction=instruction, k=int(k_fail)) if dataset.startswith("Market/") else []
-    if not dts:
-        dts = estimate_k_occurrence_datetimes_from_trace(dataset=dataset, instruction=instruction, k=int(k_fail))
-    reasons = extract_reasons_from_scoring_points(scoring_points) if (need_reason and dataset.startswith("Market/")) else []
+    dts = estimate_k_occurrence_datetimes_from_trace(dataset=dataset, instruction=instruction, k=int(k_fail))
+    reasons = []
     for i in range(int(k_fail)):
         r: dict = {}
         dt_i = dts[i] if i < len(dts) else dts[-1]
@@ -583,42 +547,27 @@ def assemble_prediction(
         else:
             ct_s = None
         if need_comp:
-            log_comps = estimate_top_components_from_logs(dataset=dataset, instruction=instruction, center_dt=dt_i) if dataset.startswith("Market/") else []
-            ev3_i = None
-            if log_comps:
-                comp_i = canonicalize_component(log_comps[0])
-            else:
-                top_k = int(getattr(args, "task3_top_k", 12))
-                ev3_i = build_component_candidates(
-                    dataset=dataset,
-                    instruction=instruction,
-                    top_k=top_k,
-                    center_time_s=ct_s,
-                    use_basil=basil_enabled(args),
-                    basil_config=basil_config_from_args(args, top_k, required_fields=getattr(spec, "required_fields", None), task_id=getattr(spec, "task_id", None)),
-                    basil_reasons=extract_reasons_from_scoring_points(scoring_points) if need_reason else [],
-                )
-                comp_i = ev3_i.top1
-                if dataset.startswith("Market/"):
-                    comp_i = canonicalize_component(comp_i)
+            top_k = int(getattr(args, "task3_top_k", 12))
+            ev3_i = build_component_candidates(
+                dataset=dataset,
+                instruction=instruction,
+                top_k=top_k,
+                center_time_s=ct_s,
+                use_basil=basil_enabled(args),
+                basil_config=basil_config_from_args(args, top_k, required_fields=getattr(spec, "required_fields", None), task_id=getattr(spec, "task_id", None)),
+                basil_reasons=extract_reasons_from_scoring_points(scoring_points) if need_reason else [],
+            )
+            comp_i = ev3_i.top1
             if any(x.get("root cause component") == comp_i for x in roots):
-                if log_comps:
-                    for c in log_comps[1:]:
-                        c2 = canonicalize_component(c)
-                        if not any(x.get("root cause component") == c2 for x in roots):
-                            comp_i = c2
-                            break
-                elif ev3_i is not None:
-                    ranked = sorted(
-                        list(ev3_i.candidates or []),
-                        key=lambda c: float(ev3_i.combined_scores.get(c, 0.0)),
-                        reverse=True,
-                    )
-                    for c in ranked:
-                        c2 = canonicalize_component(c) if dataset.startswith("Market/") else c
-                        if not any(x.get("root cause component") == c2 for x in roots):
-                            comp_i = c2
-                            break
+                ranked = sorted(
+                    list(ev3_i.candidates or []),
+                    key=lambda c: float(ev3_i.combined_scores.get(c, 0.0)),
+                    reverse=True,
+                )
+                for c in ranked:
+                    if not any(x.get("root cause component") == c for x in roots):
+                        comp_i = c
+                        break
             r["root cause component"] = comp_i
         if need_reason:
             if len(reasons) >= int(k_fail):

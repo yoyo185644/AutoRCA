@@ -4,8 +4,8 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from rca.fast_solver import infer_reason_with_evidence
-from rca.component_candidates import build_component_candidates
+from rca.execution.fast_solver import infer_reason_with_evidence
+from rca.adapter.utils.component_candidates import build_component_candidates
 
 
 def _extract_reason_from_pred(pred: str) -> str:

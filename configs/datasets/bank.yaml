@@ -1,0 +1,13 @@
+inherits: default
+dataset: Bank
+
+adapter: bank
+
+index:
+  type: generic_metric_trace_existing
+  build:
+    bucket_size_seconds: 300
+    severity_floor: 0.0
+  query:
+    top_k: 12
+    time_tolerance_seconds: 300

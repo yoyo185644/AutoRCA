@@ -1,0 +1,110 @@
+# Bank Dataset Configuration
+#
+# This file describes the schema for the Bank (financial transaction)
+# RCA dataset. Components, metrics, root causes, and data organization.
+
+dataset_name: "Bank"
+
+# Data paths
+data_path: "dataset/Bank/metrics"
+data_format: "csv"
+
+# Sampling configuration
+sampling_interval: 60  # 60 seconds default
+
+# Topology information
+has_topology: true
+topology_source: "config"
+
+# Component types in Bank
+components:
+  - id_pattern: "proc_*"
+    type: "processor"
+    examples:
+      - "proc_txn_1"
+      - "proc_txn_2"
+      - "proc_settle_1"
+
+  - id_pattern: "queue_*"
+    type: "queue"
+    examples:
+      - "queue_txn"
+      - "queue_settle"
+      - "queue_clear"
+
+  - id_pattern: "ledger_*"
+    type: "ledger"
+    examples:
+      - "ledger_account"
+      - "ledger_transaction"
+      - "ledger_settlement"
+
+  - id_pattern: "settle_*"
+    type: "settlement"
+    examples:
+      - "settle_engine_1"
+      - "settle_engine_2"
+
+  - id_pattern: "monitor_*"
+    type: "monitor"
+    examples:
+      - "monitor_system"
+      - "monitor_ledger"
+
+# Metric groups in Bank
+metric_groups:
+  # Transaction processor metrics
+  - name: "processor"
+    patterns:
+      - "proc_*"
+      - "txn_rate*"
+      - "txn_latency*"
+    sampling_interval_s: 60
+    threshold_percentile: 0.95
+
+  # Queue metrics
+  - name: "queue"
+    patterns:
+      - "queue_*"
+      - "queue_depth*"
+      - "queue_wait*"
+    sampling_interval_s: 60
+    threshold_percentile: 0.95
+
+  # Ledger metrics
+  - name: "ledger"
+    patterns:
+      - "ledger_*"
+      - "balance_*"
+      - "discrepancy*"
+    sampling_interval_s: 60
+    threshold_percentile: 0.95
+
+  # Settlement metrics
+  - name: "settlement"
+    patterns:
+      - "settle_*"
+      - "settlement_lag*"
+      - "settlement_success_rate*"
+    sampling_interval_s: 60
+    threshold_percentile: 0.95
+
+  # System-wide metrics
+  - name: "system"
+    patterns:
+      - "cpu_*"
+      - "memory_*"
+      - "disk_*"
+    sampling_interval_s: 60
+    threshold_percentile: 0.95
+
+# Root cause types in Bank
+root_cause_types:
+  - "transaction deadlock"
+  - "queue overflow"
+  - "ledger inconsistency"
+  - "settlement delay"
+  - "database lock"
+  - "insufficient memory"
+  - "cascading failure"
+  - "network partition"

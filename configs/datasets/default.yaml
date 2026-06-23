@@ -1,0 +1,18 @@
+timezone: Asia/Shanghai
+
+index:
+  type: generic_segment_index
+  cache:
+    enabled: true
+    dir: test/cache/basil_index/frames
+  build:
+    bucket_size_seconds: 300
+    severity_floor: 0.0
+  query:
+    top_k: 12
+    time_tolerance_seconds: 300
+
+paths:
+  telemetry_root: dataset/{dataset}/telemetry
+  query: dataset/{dataset}/query.csv
+  record: dataset/{dataset}/record.csv
