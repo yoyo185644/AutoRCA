@@ -67,12 +67,14 @@ class CounterfactualController:
                 continue
             comp = str(it.get("component", "") or "").strip()
             reason = str(it.get("reason", "") or "").strip()
-            if not comp and not reason:
+            dt = str(it.get("datetime", "") or it.get("root cause occurrence datetime", "") or "").strip()
+            if not comp and not reason and not dt:
                 continue
             out.append(
                 CandidateHypothesis(
                     component=comp,
                     reason=reason,
+                    datetime=dt,
                     evidence=[str(x) for x in list(it.get("evidence") or [])],
                     score=float(it.get("score", 0.0) or 0.0),
                     source=str(it.get("source", "basil_tuple") or "basil_tuple"),
@@ -159,6 +161,8 @@ class CounterfactualController:
                     "root cause component": str(getattr(cand, "component", "") or ""),
                     "root cause reason": str(getattr(cand, "reason", "") or ""),
                 }
+                if bool(context.get("need_time", False)):
+                    out[str(i)]["root cause occurrence datetime"] = str(getattr(cand, "datetime", "") or "")
             return json.dumps(out, ensure_ascii=False), trajectory, prompt
 
         top = candidates[0]
@@ -199,8 +203,25 @@ class CounterfactualController:
                         changed = (
                             str(getattr(proposed, "component", "") or "") != str(getattr(top, "component", "") or "")
                             or str(getattr(proposed, "reason", "") or "") != str(getattr(top, "reason", "") or "")
+                            or str(getattr(proposed, "datetime", "") or "") != str(getattr(top, "datetime", "") or "")
                         )
-                        if changed and (conf < min_conf or (det_score - prop_score) > max_drop):
+                        adapter_ok = True
+                        adapter_veto_reason = ""
+                        if changed and adapter is not None:
+                            try:
+                                adapter_ok, adapter_veto_reason = adapter.validate_llm_candidate_adoption(
+                                    proposed_component=str(getattr(proposed, "component", "") or ""),
+                                    proposed_reason=str(getattr(proposed, "reason", "") or ""),
+                                    deterministic_component=str(getattr(top, "component", "") or ""),
+                                    deterministic_reason=str(getattr(top, "reason", "") or ""),
+                                    context=dict(context or {}),
+                                    need_comp=bool(need_comp),
+                                    need_reason=bool(need_reason),
+                                )
+                            except Exception:
+                                adapter_ok = True
+                                adapter_veto_reason = ""
+                        if changed and ((not adapter_ok) or conf < min_conf or (det_score - prop_score) > max_drop):
                             trajectory.append(
                                 {
                                     "step": 2,
@@ -212,6 +233,8 @@ class CounterfactualController:
                                         "llm_confidence": float(conf),
                                         "det_score": float(det_score),
                                         "llm_selected_score": float(prop_score),
+                                        "adapter_consistency_ok": bool(adapter_ok),
+                                        "adapter_veto_reason": str(adapter_veto_reason or ""),
                                     },
                                 }
                             )
@@ -230,6 +253,7 @@ class CounterfactualController:
 
         comp_out = str(getattr(top, "component", "") or "")
         reason_out = str(getattr(top, "reason", "") or "")
+        dt_out = str(getattr(top, "datetime", "") or "")
         if adapter is not None:
             if need_comp:
                 try:
@@ -241,7 +265,14 @@ class CounterfactualController:
                     reason_out = str(adapter.parse_root_cause_label(str(reason_out)) or reason_out)
                 except Exception:
                     pass
-        out = {"1": {"root cause component": comp_out if need_comp else "", "root cause reason": reason_out if need_reason else ""}}
+        out = {
+            "1": {
+                "root cause component": comp_out if need_comp else "",
+                "root cause reason": reason_out if need_reason else "",
+            }
+        }
+        if bool(context.get("need_time", False)):
+            out["1"]["root cause occurrence datetime"] = dt_out
         return json.dumps(out, ensure_ascii=False), trajectory, prompt
 
 

@@ -206,6 +206,76 @@ def _parse_local_time_s(value: str, fallback: int) -> int:
         return int(fallback)
 
 
+def _component_channel(dataset: str, component: str) -> str:
+    """Return a channel key grouping components of the same infrastructure layer.
+
+    Telecom naming:
+        os_*        → node
+        docker_*    → container
+        db_*        → db
+        *           → other
+
+    Market naming:
+        node-N      (no dot)  → node   e.g. "node-1"
+        node-N.svc  (dot)     → container  e.g. "node-6.adservice2-0"
+        istio-* / *.source.* / *.destination.* → mesh
+        *:port                → runtime
+        *                     → service
+    """
+    ds = str(dataset or "").lower()
+    c = str(component or "")
+    if "telecom" in ds:
+        if c.startswith("os_") or c.startswith("node-") and "." not in c:
+            return "node"
+        if c.startswith("docker_") or c.startswith("container"):
+            return "container"
+        if c.startswith("db_"):
+            return "db"
+        return "other"
+    if "market" in ds:
+        if ":" in c:
+            return "runtime"
+        if c.startswith("istio-") or ".source." in c or ".destination." in c:
+            return "mesh"
+        if c.startswith("node-"):
+            return "node" if "." not in c else "container"
+        if "-" in c:
+            return "service"
+        return "other"
+    # Default: treat all as same channel (no cross-type bias correction)
+    return "default"
+
+
+def _normalize_scores_by_channel(
+    scores: Dict[str, float], dataset: str
+) -> Dict[str, float]:
+    """Normalise component scores within each infrastructure channel to [0, 1].
+
+    This prevents components with many monitoring metrics (e.g. OS nodes with
+    51 KPIs) from always outscoring components with fewer metrics (e.g. docker
+    containers with 9 KPIs) purely due to metric count, regardless of anomaly
+    severity.  Only applied for Telecom and Market which have separate metric
+    files per component type; Bank uses a single file and needs no correction.
+    """
+    ds = str(dataset or "").lower()
+    if "telecom" not in ds and "market" not in ds:
+        return dict(scores)
+
+    # Group by channel
+    channels: Dict[str, Dict[str, float]] = {}
+    for comp, score in scores.items():
+        ch = _component_channel(ds, comp)
+        channels.setdefault(ch, {})[comp] = float(score)
+
+    out: Dict[str, float] = {}
+    for ch, ch_scores in channels.items():
+        mx = max(ch_scores.values()) if ch_scores else 0.0
+        denom = mx if mx > 1e-9 else 1.0
+        for comp, score in ch_scores.items():
+            out[comp] = score / denom
+    return out
+
+
 def _reason_hints_from_metrics(metrics: List[str]) -> List[str]:
     blob = " ".join([str(m).lower() for m in metrics])
     hints: List[str] = []
@@ -366,9 +436,16 @@ def extract_anomaly_segments(
             )
             topm = by_metric.groupby("component", as_index=False).head(int(top_k_metrics))
             by_comp = topm.groupby("component", as_index=False)["breach_ratio"].sum()
+            # Per-file normalisation: scale this file's component scores to [0, 1]
+            # before accumulating into mscores.  Without this, metric_node.csv (51
+            # metrics) always outscores metric_container.csv (9 metrics) regardless
+            # of anomaly severity, which causes os_ nodes to dominate the candidate
+            # pool even when the root cause is a docker/service component.
+            file_max = float(by_comp["breach_ratio"].max()) if not by_comp.empty else 0.0
+            norm_denom = file_max if file_max > 1e-9 else 1.0
             for _, r in by_comp.iterrows():
                 c = str(r["component"])
-                base = float(r["breach_ratio"])
+                base = float(r["breach_ratio"]) / norm_denom  # normalised to [0, 1]
                 bonus = 0.0
                 if prio_tuple:
                     try:
@@ -416,6 +493,11 @@ def extract_anomaly_segments(
         metric_scores, peak_times, first_times, top_metrics = scan_metrics("global_p95" if mode != "window_pre_p95" else "window_pre_p95")
         if mode == "auto" and not metric_scores:
             metric_scores, peak_times, first_times, top_metrics = scan_metrics("window_pre_p95")
+        # Per-channel normalisation: within each infrastructure layer (node /
+        # container / db / mesh / runtime) scores are re-scaled to [0, 1] so
+        # that a component type with fewer monitored KPIs can still compete
+        # against one with many KPIs.  Applied only for Telecom and Market.
+        metric_scores = _normalize_scores_by_channel(metric_scores, dataset)
 
     trace_scores: Dict[str, float] = {}
     if bool(enable_trace_segments):

@@ -439,6 +439,7 @@ def _reason_from_breach_scores(metric_dir: str, start: pd.Timestamp, end: pd.Tim
     db_conn_strong = ["login_per_sec", "tps_per_sec", "exec_per_sec"]
     db_close_kws = ["on_off_state", "on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"]
     cpu_kws = ["proc_used_pct", "proc_user_used_pct", "cpu", "load", "iowait", "util"]
+    cpu_strong = ["proc_used_pct", "proc_user_used_pct"]  # specific; generic "load"/"util" don't qualify
 
     net_path = os.path.join(metric_dir, "metric_node.csv")
     mw_path = os.path.join(metric_dir, "metric_middleware.csv")
@@ -453,8 +454,8 @@ def _reason_from_breach_scores(metric_dir: str, start: pd.Timestamp, end: pd.Tim
     net_delay = max([net_delay_n, net_delay_m], key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))))
     db_conn = _breach_stats(svc_path, start, end, db_conn_kws, strong_keywords=db_conn_strong)
     db_close = _breach_stats(svc_path, start, end, db_close_kws)
-    cpu_c = _breach_stats(cont_path, start, end, cpu_kws)
-    cpu_n = _breach_stats(net_path, start, end, cpu_kws)
+    cpu_c = _breach_stats(cont_path, start, end, cpu_kws, strong_keywords=cpu_strong)
+    cpu_n = _breach_stats(net_path, start, end, cpu_kws, strong_keywords=cpu_strong)
 
     def score(stat: Dict[str, Any], require_distinct: int = 1, weak_penalty: float = 1.0) -> float:
         if int(stat.get("distinct", 0)) < require_distinct:
@@ -470,7 +471,12 @@ def _reason_from_breach_scores(metric_dir: str, start: pd.Timestamp, end: pd.Tim
     s_net_delay = max(score(net_delay_n, require_distinct=1), score(net_delay_m, require_distinct=1))
     s_db_conn = score(db_conn, require_distinct=2, weak_penalty=1.0 if db_conn.get("strong_hit") else 0.25)
     s_db_close = score(db_close, require_distinct=2)
-    s_cpu = max(score(cpu_c, require_distinct=1), score(cpu_n, require_distinct=1))
+    # CPU requires distinct>=2 and applies weak_penalty when no strong-keyword hit,
+    # symmetric with db_conn — prevents generic "load"/"util" noise from dominating.
+    s_cpu = max(
+        score(cpu_c, require_distinct=2, weak_penalty=1.0 if cpu_c.get("strong_hit") else 0.3),
+        score(cpu_n, require_distinct=2, weak_penalty=1.0 if cpu_n.get("strong_hit") else 0.3),
+    )
 
     scored = [
         ("network loss", s_net_loss, net_loss),
@@ -496,6 +502,7 @@ def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
     db_conn_strong = ["login_per_sec", "tps_per_sec", "exec_per_sec"]
     db_close_kws = ["on_off_state", "on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"]
     cpu_kws = ["proc_used_pct", "proc_user_used_pct", "cpu", "load", "iowait", "util"]
+    cpu_strong = ["proc_used_pct", "proc_user_used_pct"]  # specific; generic "load"/"util" don't qualify
 
     net_path = os.path.join(metric_dir, "metric_node.csv")
     mw_path = os.path.join(metric_dir, "metric_middleware.csv")
@@ -510,8 +517,8 @@ def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
     net_delay = max([net_delay_n, net_delay_m], key=lambda d: (float(d.get("sum_ratio", 0.0)), int(d.get("distinct", 0)), int(d.get("count", 0))))
     db_conn = _breach_stats(svc_path, start, end, db_conn_kws, strong_keywords=db_conn_strong)
     db_close = _breach_stats(svc_path, start, end, db_close_kws)
-    cpu_c = _breach_stats(cont_path, start, end, cpu_kws)
-    cpu_n = _breach_stats(net_path, start, end, cpu_kws)
+    cpu_c = _breach_stats(cont_path, start, end, cpu_kws, strong_keywords=cpu_strong)
+    cpu_n = _breach_stats(net_path, start, end, cpu_kws, strong_keywords=cpu_strong)
 
     def score(stat: Dict[str, Any], require_distinct: int = 1, weak_penalty: float = 1.0) -> float:
         if int(stat.get("distinct", 0)) < require_distinct:
@@ -527,7 +534,12 @@ def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
     s_net_delay = max(score(net_delay_n, require_distinct=1), score(net_delay_m, require_distinct=1))
     s_db_conn = score(db_conn, require_distinct=2, weak_penalty=1.0 if db_conn.get("strong_hit") else 0.25)
     s_db_close = score(db_close, require_distinct=2)
-    s_cpu = max(score(cpu_c, require_distinct=1), score(cpu_n, require_distinct=1))
+    # CPU requires distinct>=2 and applies weak_penalty when no strong-keyword hit,
+    # symmetric with db_conn — prevents generic "load"/"util" noise from dominating.
+    s_cpu = max(
+        score(cpu_c, require_distinct=2, weak_penalty=1.0 if cpu_c.get("strong_hit") else 0.3),
+        score(cpu_n, require_distinct=2, weak_penalty=1.0 if cpu_n.get("strong_hit") else 0.3),
+    )
 
     scored = [
         ("network loss", s_net_loss, net_loss),

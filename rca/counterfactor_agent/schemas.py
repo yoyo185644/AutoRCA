@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 class CandidateHypothesis:
     component: str
     reason: str
+    datetime: str = ""
     evidence: List[str] = field(default_factory=list)
     score: float = 0.0
     source: str = "llm"

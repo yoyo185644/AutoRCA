@@ -106,14 +106,22 @@ class AnomalySegmentIndex:
             return {}
         raw: Dict[str, float] = {}
         for seg in self.overlapping_segments(start_s, end_s):
-            metrics = " ".join([str(x).lower() for x in list(seg.top_metrics or []) + [seg.signal_name]])
+            # Build token set once per segment instead of joining into a string
+            # for each reason — O(|tokens|) set-lookup vs O(|metrics|×|tokens|).
+            token_set: set = set()
+            for m in list(seg.top_metrics or []) + [seg.signal_name]:
+                m_lower = str(m).lower()
+                token_set.add(m_lower)
+                for part in m_lower.replace(".", "_").split("_"):
+                    if part:
+                        token_set.add(part)
             hints = set([str(x) for x in seg.reason_hints or []])
             best = 0.0
             for r in reason_list:
                 score = 1.0 if r in hints else 0.0
                 toks = REASON_TOKENS.get(str(r), [])
                 if toks:
-                    hit = sum(1 for t in toks if t and t.lower() in metrics)
+                    hit = sum(1 for t in toks if t and t.lower() in token_set)
                     score = max(score, min(1.0, hit / max(1.0, min(3.0, float(len(toks))))))
                 if component_type(seg.component) in ("db", "service") and "db" in str(r).lower():
                     score = max(score, 0.25)

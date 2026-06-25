@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -24,6 +25,7 @@ from rca.index.schemas import (
     CausalEdgeSketch,
     RCAHypothesis,
     TraceTopologyEdge,
+    component_type,
 )
 
 
@@ -77,6 +79,7 @@ class ComponentEvidenceSummary:
     peak_time: datetime
     supporting_metrics: List[str]
     incident_id: str
+    component_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -121,19 +124,55 @@ def _normalize(scores: Mapping[str, float]) -> Dict[str, float]:
     return {str(k): max(0.0, _safe_float(v) / mx) for k, v in (scores or {}).items()}
 
 
+def _component_channel(dataset: str, component: str, fallback: str = "") -> str:
+    """Return the dataset adapter's semantic component channel when available."""
+
+    comp = str(component or "").strip()
+    if not comp:
+        return ""
+    try:
+        from rca.adapter.registry import get_dataset_adapter
+
+        adapter = get_dataset_adapter(str(dataset or ""))
+        if adapter is not None:
+            ch = str(adapter.component_semantic_type(comp) or "").strip()
+            if ch:
+                return ch
+    except Exception:
+        pass
+    return str(fallback or component_type(comp) or "").strip()
+
+
 def _reason_score_from_metrics(metrics: Iterable[str], hints: Iterable[str], reason: str) -> float:
+    """Score how well a set of metric names supports a given reason label.
+
+    Accepts either an Iterable[str] of raw metric names or a pre-built Set[str]
+    of lowercase tokens.  When a set is passed the inner tokenisation step is
+    skipped, giving O(|tokens|) set-lookup instead of O(|metrics|×|tokens|)
+    string-search.
+    """
     reason_s = str(reason or "")
     if not reason_s:
         return 0.0
-    if reason_s in set(str(x) for x in hints or []):
+    hint_set = set(str(x) for x in hints or [])
+    if reason_s in hint_set:
         return 1.0
     toks = REASON_TOKENS.get(reason_s, [])
     if not toks:
         toks = [x for x in reason_s.lower().replace("-", " ").split() if x]
     if not toks:
         return 0.0
-    blob = " ".join(str(m).lower() for m in metrics or [])
-    hits = sum(1 for t in toks if t and t.lower() in blob)
+    # Accept a pre-built token set (fast path) or build one from raw names
+    if isinstance(metrics, set):
+        token_set: set = metrics
+    else:
+        token_set = set()
+        for m in metrics or []:
+            for part in str(m).lower().replace(".", "_").split("_"):
+                if part:
+                    token_set.add(part)
+            token_set.add(str(m).lower())
+    hits = sum(1 for t in toks if t and t.lower() in token_set)
     return min(1.0, hits / max(1.0, min(3.0, float(len(toks)))))
 
 
@@ -147,13 +186,23 @@ def _segment_pattern(seg: AnomalySegment) -> str:
 
 
 class BasilEvidenceIndex:
-    """Thread-safe append-only evidence store plus retrieval utilities."""
+    """Thread-safe append-only evidence store plus retrieval utilities.
+
+    Maintains two inverted indexes (metric_inv, comp_inv) so that
+    retrieve_similar_incidents can skip incidents that share no metrics or
+    components with the current query, reducing the linear scan to only the
+    candidate set with non-zero Jaccard overlap.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._segments: Dict[str, List[AnomalySegment]] = {}
         self._edges: Dict[str, List[TraceTopologyEdge]] = {}
         self._incident_times: Dict[str, datetime] = {}
+        # Inverted indexes: token -> set of incident_ids
+        self._metric_inv: Dict[str, set] = defaultdict(set)
+        self._comp_inv: Dict[str, set] = defaultdict(set)
+        self._comp_incident_count: Dict[str, int] = defaultdict(int)
 
     def append_incident(
         self,
@@ -169,10 +218,19 @@ class BasilEvidenceIndex:
             if incident_id not in self._edges:
                 self._edges[incident_id] = []
             seen_seg = {s.segment_id for s in self._segments[incident_id]}
+            existing_components = {s.component for s in self._segments[incident_id]}
+            new_components: set[str] = set()
             for seg in segments or []:
                 if isinstance(seg, AnomalySegment) and seg.segment_id not in seen_seg:
                     self._segments[incident_id].append(seg)
                     seen_seg.add(seg.segment_id)
+                    # Update inverted indexes
+                    self._metric_inv[seg.signal_name].add(incident_id)
+                    self._comp_inv[seg.component].add(incident_id)
+                    if seg.component not in existing_components:
+                        new_components.add(seg.component)
+            for comp in new_components:
+                self._comp_incident_count[str(comp)] += 1
             seen_edge = {(e.src, e.dst, e.edge_type) for e in self._edges[incident_id]}
             for edge in edges or []:
                 if not isinstance(edge, TraceTopologyEdge):
@@ -198,17 +256,31 @@ class BasilEvidenceIndex:
         current_components = {s.component for s in current_segments or []}
         current_patterns = {_segment_pattern(s) for s in current_segments or []}
         current_metrics = {s.signal_name for s in current_segments or []}
+        cur_topo = {(e.src, e.dst) for e in current_edges or []}
         now_dt = datetime.now(timezone.utc)
         out: List[Tuple[str, float]] = []
         with self._lock:
-            incident_ids = [x for x in self._segments.keys() if x != str(current_incident_id)]
-            for incident_id in incident_ids:
+            # Use inverted indexes to find candidate incidents that share at least
+            # one metric or component with the current query, skipping unrelated ones.
+            candidates: set = set()
+            for m in current_metrics:
+                candidates |= self._metric_inv.get(m, set())
+            for c in current_components:
+                candidates |= self._comp_inv.get(c, set())
+            candidates.discard(str(current_incident_id))
+            # Fall back to full scan only when inverted index is empty
+            # (e.g., first incident ever stored)
+            if not candidates:
+                candidates = {x for x in self._segments.keys() if x != str(current_incident_id)}
+
+            for incident_id in candidates:
                 segs = list(self._segments.get(incident_id, []))
+                if not segs:
+                    continue
                 comps = {s.component for s in segs}
                 pats = {_segment_pattern(s) for s in segs}
                 mets = {s.signal_name for s in segs}
                 topo = {(e.src, e.dst) for e in self._edges.get(incident_id, [])}
-                cur_topo = {(e.src, e.dst) for e in current_edges or []}
 
                 ts_sim = _jaccard(current_metrics, mets)
                 topo_sim = _jaccard(current_components | {x for pair in cur_topo for x in pair}, comps | {x for pair in topo for x in pair})
@@ -225,6 +297,25 @@ class BasilEvidenceIndex:
                     out.append((incident_id, float(sim)))
         out.sort(key=lambda x: x[1], reverse=True)
         return out[: max(0, int(config.historical_top_k))]
+
+    def component_symptomness(self, components: Iterable[str], *, current_incident_id: str = "") -> Dict[str, float]:
+        comps = [str(c) for c in components or [] if str(c).strip()]
+        if not comps:
+            return {}
+        with self._lock:
+            total_incidents = max(1, len([i for i in self._segments.keys() if i != str(current_incident_id)]))
+            raw = {
+                comp: max(0, int(self._comp_incident_count.get(comp, 0)) - (1 if str(current_incident_id) in self._comp_inv.get(comp, set()) else 0))
+                for comp in comps
+            }
+        # A frequency prior is unreliable with very little history. Keep it
+        # disabled until the process has observed enough independent incidents.
+        if total_incidents < 5:
+            return {comp: 0.0 for comp in comps}
+        return {
+            comp: max(0.0, min(1.0, float(cnt) / float(max(1, total_incidents))))
+            for comp, cnt in raw.items()
+        }
 
 
 def _jaccard(a: Iterable[Any], b: Iterable[Any]) -> float:
@@ -259,13 +350,73 @@ class TaskAwareScoreFusion:
         top_k: int,
     ) -> List[Tuple[str, float]]:
         alpha, beta, gamma = self.weights.get(str(task_type), self.weights["COMPONENT_REASON_TIME"])
-        scored: List[Tuple[str, float]] = []
+
+        # Compute onset lead: how early each component's first anomaly appeared
+        # relative to the others.  Earlier = more likely root cause, later =
+        # more likely downstream symptom.  Used as a tie-breaker within score
+        # bands — no new parameter needed.
+        first_ts = {
+            item.component_id: item.first_anomaly_time.timestamp()
+            for item in (summaries or [])
+            if isinstance(item.first_anomaly_time, datetime)
+        }
+        if first_ts:
+            t_min = min(first_ts.values())
+            t_max = max(first_ts.values())
+            t_range = max(t_max - t_min, 1.0)
+            onset_lead = {comp: 1.0 - (t - t_min) / t_range for comp, t in first_ts.items()}
+        else:
+            onset_lead = {}
+
+        scored: List[Tuple[str, float, str]] = []
         for item in summaries or []:
             reason_max = max([_safe_float(v) for v in item.reason_scores.values()] + [0.0])
             score = float(alpha) * item.local_score + float(beta) * item.causal_score + float(gamma) * reason_max
-            scored.append((item.component_id, float(score)))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[: max(1, int(top_k))]
+            scored.append((item.component_id, float(score), item.component_type or component_type(item.component_id)))
+
+        # Sort by (score band, onset_lead, raw score).
+        # Band width = 0.20: components whose scores differ by less than 0.20
+        # are considered "tied" and broken by who showed anomalies first.
+        # A wider band lets onset lead override small metric-count advantages
+        # (e.g. os nodes with 51 KPIs vs docker containers with 9 KPIs).
+        band_width = 0.20
+        scored.sort(
+            key=lambda x: (
+                -math.floor(x[1] / band_width),   # higher band first
+                -onset_lead.get(x[0], 0.0),        # earlier onset first within band
+                -x[1],                              # raw score as final tiebreak
+            )
+        )
+
+        # Preserve the strongest candidate from each typed evidence channel in
+        # addition to the global ranking.  This avoids a high-severity symptom
+        # channel (often node/OS metrics) evicting root candidates from other
+        # channels before the downstream root-likelihood reranker can compare
+        # them.  It is coverage-based, not dataset-specific weight tuning.
+        limit = max(1, int(top_k))
+        selected: Dict[str, float] = {}
+        for comp, score, _ch in scored[:limit]:
+            selected.setdefault(comp, float(score))
+        seen_channels = {ch for comp, _score, ch in scored[:limit] if comp in selected}
+        all_channels = [ch for _comp, _score, ch in scored if ch]
+        for ch in dict.fromkeys(all_channels):
+            if ch in seen_channels:
+                continue
+            for comp, score, comp_ch in scored:
+                if comp_ch == ch:
+                    selected.setdefault(comp, float(score))
+                    seen_channels.add(ch)
+                    break
+
+        out = [(comp, score) for comp, score in selected.items()]
+        out.sort(
+            key=lambda x: (
+                -math.floor(x[1] / band_width),
+                -onset_lead.get(x[0], 0.0),
+                -x[1],
+            )
+        )
+        return out
 
 
 class CandidateExpansion:
@@ -387,6 +538,7 @@ def _summary_evidence(summary: ComponentEvidenceSummary) -> Dict[str, Any]:
         "supporting_metrics": list(summary.supporting_metrics),
         "first_anomaly_time": summary.first_anomaly_time.isoformat(),
         "peak_time": summary.peak_time.isoformat(),
+        "component_type": summary.component_type or component_type(summary.component_id),
     }
 
 
@@ -415,16 +567,34 @@ def _summaries_from_segments(
         if not comp_segs:
             continue
         reason_scores = {}
-        metric_blob: List[str] = []
+        # Build a flat token set from all metric names (avoids repeated string join
+        # and enables O(|tokens|) set-lookup in _reason_score_from_metrics).
+        metric_token_set: set = set()
+        raw_metric_names: List[str] = []
         hints: List[str] = []
         for seg in comp_segs:
-            metric_blob.extend(seg.top_metrics or [])
-            metric_blob.append(seg.signal_name)
+            for m in seg.top_metrics or []:
+                raw_metric_names.append(str(m))
+                m_lower = str(m).lower()
+                metric_token_set.add(m_lower)
+                for part in m_lower.replace(".", "_").split("_"):
+                    if part:
+                        metric_token_set.add(part)
+            sn = str(seg.signal_name)
+            raw_metric_names.append(sn)
+            sn_lower = sn.lower()
+            metric_token_set.add(sn_lower)
+            for part in sn_lower.replace(".", "_").split("_"):
+                if part:
+                    metric_token_set.add(part)
             hints.extend(seg.reason_hints or [])
         for reason in reasons or []:
-            reason_scores[str(reason)] = _reason_score_from_metrics(metric_blob, hints, str(reason))
+            # Pass the pre-built set directly — _reason_score_from_metrics fast path
+            reason_scores[str(reason)] = _reason_score_from_metrics(metric_token_set, hints, str(reason))
         first_s = min(int(s.start_s) for s in comp_segs)
         peak_seg = max(comp_segs, key=lambda s: float(s.severity or 0.0))
+        dataset_name = str(getattr(comp_segs[0], "dataset", "") or "") if comp_segs else ""
+        seg_type = str(getattr(comp_segs[0], "component_type", "") or "") if comp_segs else ""
         summaries.append(
             ComponentEvidenceSummary(
                 component_id=comp,
@@ -433,8 +603,9 @@ def _summaries_from_segments(
                 reason_scores=reason_scores,
                 first_anomaly_time=_to_utc_dt(first_s),
                 peak_time=_to_utc_dt(int(peak_seg.peak_s)),
-                supporting_metrics=list(dict.fromkeys(metric_blob))[:8],
+                supporting_metrics=list(dict.fromkeys(raw_metric_names))[:8],
                 incident_id=incident_id,
+                component_type=_component_channel(dataset_name, comp, seg_type),
             )
         )
     return summaries, causal_index.edge_sketches, metric_scores, trace_scores, causal_scores
@@ -462,16 +633,11 @@ def _merge_historical_boosts(
         for hist in hist_summaries:
             old = by_comp.get(hist.component_id)
             if old is None:
-                by_comp[hist.component_id] = ComponentEvidenceSummary(
-                    component_id=hist.component_id,
-                    local_score=0.25 * float(sim) * hist.local_score,
-                    causal_score=0.25 * float(sim) * hist.causal_score,
-                    reason_scores={k: 0.25 * float(sim) * v for k, v in hist.reason_scores.items()},
-                    first_anomaly_time=hist.first_anomaly_time,
-                    peak_time=hist.peak_time,
-                    supporting_metrics=hist.supporting_metrics,
-                    incident_id=hist.incident_id,
-                )
+                # Historical evidence is a prior, not a replacement for current
+                # incident evidence.  Do not introduce components that have no
+                # current-window segment; otherwise old incidents can become the
+                # top component for a new query and pollute component-only tasks.
+                continue
             else:
                 by_comp[hist.component_id] = ComponentEvidenceSummary(
                     component_id=old.component_id,
@@ -482,6 +648,7 @@ def _merge_historical_boosts(
                     peak_time=old.peak_time,
                     supporting_metrics=list(dict.fromkeys(list(old.supporting_metrics) + list(hist.supporting_metrics)))[:8],
                     incident_id=old.incident_id,
+                    component_type=old.component_type or hist.component_type,
                 )
     return list(by_comp.values())
 
@@ -724,13 +891,14 @@ def query_basil_components(
     summary_by_comp = {s.component_id: s for s in summaries}
     fused_scores = dict(fused)
     candidates = [comp for comp, _ in fused[: int(cfg.top_k)]]
+    symptomness = _GLOBAL_EVIDENCE_INDEX.component_symptomness(summary_by_comp.keys(), current_incident_id=incident_id)
     first_times = {s.component_id: _to_local_string(int(s.first_anomaly_time.timestamp())) for s in summaries}
     peak_times = {s.component_id: _to_local_string(int(s.peak_time.timestamp())) for s in summaries}
     top_metrics = {s.component_id: list(s.supporting_metrics) for s in summaries}
     reason_scores = {s.component_id: max([float(v) for v in s.reason_scores.values()] + [0.0]) for s in summaries}
 
     hypotheses: List[RCAHypothesis] = []
-    for cand in reranked[: int(cfg.top_k)]:
+    for cand in reranked[: max(int(cfg.top_k), int(cfg.rerank_top_n))]:
         summary = summary_by_comp.get(cand.component_id)
         hypotheses.append(
             RCAHypothesis(
@@ -746,6 +914,7 @@ def query_basil_components(
                     "incident_id": incident_id,
                     "low_confidence": bool(low_confidence),
                     "historical_matches": [{"incident_id": i, "similarity": s} for i, s in historical],
+                    "symptomness": float(symptomness.get(cand.component_id, 0.0)),
                     "expanded_candidate": {
                         "component_id": cand.component_id,
                         "reason": cand.reason,
@@ -769,6 +938,7 @@ def query_basil_components(
         ub_slack={
             "low_confidence": float(bool(low_confidence)),
             "historical_matches": float(len(historical)),
+            "max_symptomness": max([float(v) for v in symptomness.values()] + [0.0]),
             "segments": float(len(segments)),
             "expanded_candidates": float(len(expanded)),
         },

@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import pandas as pd
 
 from rca.common.io import resolve_date_dir
-from rca.execution.light_agent import choose_from_candidates
 from rca.adapter.utils.query_parsing import extract_reason_candidates
 from rca.adapter.utils.component_candidates import parse_time_window_generic
 
@@ -148,7 +147,6 @@ def predict_reason_universal(
     dataset: str,
     instruction: str,
     scoring_points: str,
-    temperature: float = 0.0,
 ) -> Tuple[str, Dict[str, Any]]:
     date_dir, start, end = parse_time_window_generic(instruction)
     date_dir = resolve_date_dir(dataset, date_dir)
@@ -171,12 +169,6 @@ def predict_reason_universal(
         "keyword_hits": hits,
         "trace_spread": spread,
     }
-    dec = choose_from_candidates(
-        task_id=2,
-        instruction=instruction,
-        output_field="root cause reason",
-        candidates=cands,
-        evidence=evidence,
-        temperature=float(temperature),
-    )
-    return (dec.chosen or (cands[0] if cands else "")), evidence
+    # LLM call removed: evidence is returned as-is; the caller (field_solvers.solve_reason)
+    # is responsible for the unified LLM rerank step.
+    return (cands[0] if cands else ""), evidence

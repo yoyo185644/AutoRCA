@@ -207,50 +207,47 @@ class TelemetryCache:
         if not c["ts"] or not c["component"] or not c["duration"]:
             return pd.DataFrame(columns=["minute", "component", "p95", "count"])
 
-        by_component: Dict[Tuple[int, str], List[float]] = defaultdict(list)
-        by_minute: Dict[int, List[float]] = defaultdict(list)
         usecols = [c["ts"], c["component"], c["duration"]]
+        # Collect only the three columns we need from each chunk; avoid the
+        # Python-level dict accumulation that was copying large lists per group.
+        parts: List[pd.DataFrame] = []
         for chunk in cls._read_csv_chunks(trace_path, usecols=usecols, chunksize=cls._chunk_size):
             if chunk.empty:
                 continue
             ts_s = cls._timestamp_to_s(chunk[c["ts"]])
             dur = pd.to_numeric(chunk[c["duration"]], errors="coerce")
-            comp = chunk[c["component"]].astype(str)
-            work = pd.DataFrame({"ts_s": ts_s, "component": comp, "dur": dur}).dropna(subset=["ts_s", "component", "dur"])
+            comp = chunk[c["component"]].astype("category")
+            work = pd.DataFrame({"ts_s": ts_s, "component": comp, "dur": dur}).dropna(
+                subset=["ts_s", "component", "dur"]
+            )
             if work.empty:
                 continue
             work["minute"] = (work["ts_s"].astype("int64") // 60) * 60
-            for (minute, component), group in work.groupby(["minute", "component"], sort=False):
-                values = group["dur"].astype(float).tolist()
-                by_component[(int(minute), str(component))].extend(values)
-                by_minute[int(minute)].extend(values)
+            parts.append(work[["minute", "component", "dur"]])
 
-        rows = []
-        for (minute, component), values in by_component.items():
-            if not values:
-                continue
-            rows.append(
-                {
-                    "minute": int(minute),
-                    "component": str(component),
-                    "p95": float(np.percentile(values, 95)),
-                    "count": int(len(values)),
-                }
-            )
-        for minute, values in by_minute.items():
-            if not values:
-                continue
-            rows.append(
-                {
-                    "minute": int(minute),
-                    "component": "__all__",
-                    "p95": float(np.percentile(values, 95)),
-                    "count": int(len(values)),
-                }
-            )
-        if not rows:
+        if not parts:
             return pd.DataFrame(columns=["minute", "component", "p95", "count"])
-        return pd.DataFrame(rows).sort_values(["minute", "component"]).reset_index(drop=True)
+
+        # Single concat + two groupby-quantile passes (Cython path, no Python loop)
+        merged = pd.concat(parts, ignore_index=True)
+        merged["component"] = merged["component"].astype(str)
+
+        per_comp = (
+            merged.groupby(["minute", "component"], sort=False)["dur"]
+            .agg(p95=lambda x: float(np.percentile(x, 95)), count="count")
+            .reset_index()
+        )
+
+        # Global "__all__" row per minute (same semantics as before)
+        per_minute = (
+            merged.groupby("minute", sort=False)["dur"]
+            .agg(p95=lambda x: float(np.percentile(x, 95)), count="count")
+            .reset_index()
+        )
+        per_minute["component"] = "__all__"
+
+        result = pd.concat([per_comp, per_minute[["minute", "component", "p95", "count"]]], ignore_index=True)
+        return result.sort_values(["minute", "component"]).reset_index(drop=True)
 
     @classmethod
     def _compute_topology_edges(cls, trace_path: str, max_rows: Optional[int] = None) -> pd.DataFrame:

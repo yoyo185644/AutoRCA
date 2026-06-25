@@ -1,9 +1,10 @@
 import json
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from rca.api_router import get_chat_completion
+from rca.adapter.registry import get_dataset_adapter
 from rca.execution.evidence_builder import build_candidate_evidence
 from .schemas import CandidateHypothesis, CounterfactualCheck, DeterministicEvidence
 from .utils import ensure_list, normalize_score, safe_json_loads
@@ -18,6 +19,83 @@ def deduplicate_keep_order(items: List[str]) -> List[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _top_metric_events(rows: List[Dict[str, Any]], *, limit: int = 5) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        if not isinstance(row, Mapping):
+            continue
+        ratio = _safe_float(row.get("ratio", 0.0), 0.0)
+        events.append(
+            {
+                "minute": str(row.get("minute", "") or ""),
+                "metric": str(row.get("metric", "") or ""),
+                "ratio": round(float(ratio), 3),
+                "first_breach": bool(row.get("is_first_breach", False)),
+            }
+        )
+    events.sort(key=lambda x: (bool(x.get("first_breach")), _safe_float(x.get("ratio", 0.0))), reverse=True)
+    return events[: int(limit)]
+
+
+def _top_trace_events(rows: List[Dict[str, Any]], *, limit: int = 3) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        if not isinstance(row, Mapping):
+            continue
+        events.append(
+            {
+                "minute": str(row.get("minute", "") or ""),
+                "ratio": round(_safe_float(row.get("ratio", 0.0), 0.0), 3),
+                "p95": row.get("p95", ""),
+            }
+        )
+    events.sort(key=lambda x: _safe_float(x.get("ratio", 0.0)), reverse=True)
+    return events[: int(limit)]
+
+
+def _reason_rules(dataset_name: str) -> List[str]:
+    adapter = get_dataset_adapter(str(dataset_name or ""))
+    if adapter is not None:
+        try:
+            rules = [str(x) for x in list(adapter.llm_reason_rules() or []) if str(x).strip()]
+            if rules:
+                return rules
+        except Exception:
+            pass
+    return [
+        "Prefer candidates whose reason label is semantically consistent with their anomalous metrics.",
+        "Prefer upstream/root components over downstream symptoms when causal evidence is available.",
+    ]
+
+
+def _compact_candidate_evidence(ev: Dict[str, Any], *, candidate_id: int) -> Dict[str, Any]:
+    causal = dict(ev.get("causal_evidence", {}) or {})
+    return {
+        "id": int(candidate_id),
+        "component": str(ev.get("component", "") or ""),
+        "reason": str(ev.get("reason", "") or ""),
+        "datetime": str(ev.get("datetime", "") or ""),
+        "score": round(_safe_float(ev.get("score", 0.0)), 4),
+        "score_gap_vs_next": round(_safe_float(ev.get("score_gap_vs_next", 0.0)), 4),
+        "evidence_for": [str(x) for x in list(ev.get("evidence_for") or [])[:4]],
+        "evidence_against": [str(x) for x in list(ev.get("evidence_against") or [])[:3]],
+        "key_metric_events": _top_metric_events(list(ev.get("metric_timeline") or []), limit=5),
+        "key_trace_events": _top_trace_events(list(ev.get("trace_timeline") or []), limit=3),
+        "causal_position": {
+            "first_anomaly_among_candidates": bool(causal.get("first_anomaly_among_candidates", False)),
+            "upstream_of": [str(x) for x in list(causal.get("upstream_of") or [])[:4]],
+            "impacted_by": [str(x) for x in list(causal.get("impacted_by") or [])[:4]],
+        },
+    }
 
 
 class CounterfactualExecutor:
@@ -90,12 +168,13 @@ class CounterfactualExecutor:
         top_k: int = 3,
     ) -> Dict[str, Any]:
         context = context or {}
-        top = list(candidates or [])[: max(1, int(top_k))]
+        max_prompt_candidates = min(8, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
+        top = list(candidates or [])[: max_prompt_candidates]
         if not top:
             raise ValueError("No candidates for LLM verification.")
         enable_trace = bool(context.get("enable_trace_evidence", True))
 
-        candidate_payload = []
+        candidate_payload: List[Dict[str, Any]] = []
         all_components = [str(c.component) for c in list(candidates or []) if str(getattr(c, "component", "") or "").strip()]
         for i, cand in enumerate(top, start=1):
             next_score = float(top[i].score) if i < len(top) else 0.0
@@ -115,6 +194,7 @@ class CounterfactualExecutor:
                 ev = {
                     "component": str(cand.component),
                     "reason": str(cand.reason),
+                    "datetime": str(getattr(cand, "datetime", "") or ""),
                     "score": float(cand.score),
                     "score_gap_vs_next": max(0.0, float(cand.score) - next_score),
                     "metric_timeline": [],
@@ -123,26 +203,40 @@ class CounterfactualExecutor:
                     "evidence_for": [str(x) for x in list(cand.evidence or [])[:4]],
                     "evidence_against": ["Evidence builder failed; fallback to candidate summary."],
                 }
-            ev["id"] = i
-            candidate_payload.append(ev)
+            compact_ev = _compact_candidate_evidence(ev, candidate_id=i)
+            compact_ev["datetime"] = str(getattr(cand, "datetime", "") or compact_ev.get("datetime", "") or "")
+            if list(getattr(cand, "evidence", []) or []):
+                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:4]]
+            candidate_payload.append(compact_ev)
+
+        uncertainty = dict(context.get("uncertainty_gate", {}) or {})
+        min_conf = _safe_float(context.get("llm_change_min_confidence", 0.85), 0.85)
+        max_drop = _safe_float(context.get("llm_max_score_drop_vs_det_top1", 0.05), 0.05)
 
         system_prompt = """
-You are an RCA evidence judge. Your job is to choose between candidates based on
-evidence, not just scores.
+You are an RCA evidence judge. Your job is bounded reranking, not open-ended RCA.
 
-You must choose exactly one candidate from the given top-k list. Do not invent a
-new component or reason. Focus on:
-- which anomaly appeared first
-- which candidate has stronger metric timeline evidence
-- which candidate is causally upstream rather than merely impacted downstream
-- whether the reason matches the anomalous metrics
+Rules:
+1. Choose exactly one candidate id from the provided list. Do not invent a new component, reason, or datetime.
+2. Candidate #1 is the deterministic BASIL top-1. Keep #1 unless another candidate has direct evidence that is clearly stronger.
+3. To change away from #1, all must hold:
+   - candidate score is close to #1;
+   - component type and reason are compatible;
+   - metric evidence directly supports the reason;
+   - confidence is high.
+4. Penalize candidates that look downstream/symptomatic, have no metric evidence, or whose reason does not match metrics.
+5. Do not choose a common reason such as CPU fault unless the metric evidence explicitly supports it.
 
 Output strictly in JSON:
 {
   "selected_id": 1,
   "confidence": 0.0,
-  "rationale": "one sentence: why this candidate over the others",
-  "supporting_evidence": ["decisive evidence item", "..."]
+  "change_from_top1": false,
+  "rationale": "one sentence",
+  "decisive_evidence": "specific evidence item that decided the choice",
+  "rejected_candidates": [
+    {"id": 2, "reason": "short evidence-based rejection"}
+  ]
 }
 """
 
@@ -152,13 +246,21 @@ Task focus: {task_focus}
 RCA query:
 {instruction}
 
-Uncertainty gate:
-{json.dumps(context.get("uncertainty_gate", {}), ensure_ascii=False)}
+Uncertainty gate summary:
+{json.dumps(uncertainty, ensure_ascii=False)}
 
-Candidate evidence comparison:
+Adoption policy:
+- If selected_id is not 1, confidence should be >= {min_conf:.2f}.
+- If selected candidate score is lower than candidate #1 by more than {max_drop:.3f}, keep candidate #1.
+
+Reason compatibility rules:
+{json.dumps(_reason_rules(dataset_name), ensure_ascii=False, indent=2)}
+
+Candidate evidence table:
 {json.dumps(candidate_payload, ensure_ascii=False, indent=2)}
 
-Choose the most likely root-cause component/reason from the candidate list only.
+Choose the most likely root-cause candidate tuple from the candidate list only.
+Prefer direct component-specific metric evidence over global symptoms.
 """
 
         raw = self._chat(system_prompt, user_prompt)
@@ -183,10 +285,14 @@ Choose the most likely root-cause component/reason from the candidate list only.
             "selected_candidate": selected.to_dict(),
             "confidence": normalize_score(data.get("confidence", selected.score)),
             "rationale": str(data.get("rationale", "")).strip(),
-            "supporting_evidence": ensure_list(data.get("supporting_evidence")),
+            "change_from_top1": bool(data.get("change_from_top1", selected_id != 1)),
+            "decisive_evidence": str(data.get("decisive_evidence", "") or "").strip(),
+            "rejected_candidates": ensure_list(data.get("rejected_candidates")),
+            "supporting_evidence": ensure_list(data.get("supporting_evidence")) or ensure_list(data.get("decisive_evidence")),
             "raw_response": raw,
             "approx_input_tokens": int(self.last_llm_call.get("approx_input_tokens", 0) or 0),
             "elapsed_seconds": float(self.last_llm_call.get("elapsed_seconds", 0.0) or 0.0),
+            "prompt_candidate_count": int(len(candidate_payload)),
         }
         return {"candidate": selected, "details": details}
 
@@ -424,12 +530,14 @@ EvidenceGroups (selected set, structured):
 You are a concise RCA time verifier.
 
 Choose exactly one root-cause occurrence datetime from the provided time candidates.
-Do not invent a new datetime. Prefer the earliest stable root-cause onset.
+Do not invent a new datetime. Your task is bounded reranking, not time generation.
 
-Use minute_evidence heavily:
-- Prefer candidates where component metrics show FIRST_BREACH at this minute or just started breaching,
-  and trace is not yet severely impacted at this minute.
-- If a later candidate is explained by trace already being impacted, it is likely too late.
+Decision rules:
+1. Candidate #1 is deterministic BASIL top-1. Keep it unless another candidate has clearer component-specific onset evidence.
+2. Prefer component-specific metric FIRST_BREACH aligned with the fixed reason.
+3. Prefer stable root-cause onset over global trace symptom or query-window boundary.
+4. If trace is already severely impacted at a candidate time, that time may be too late.
+5. If all candidates have weak evidence, keep #1 with low confidence.
 
 You may only rerank the provided candidates.
 If the deterministic top-1 candidate has trace_first_breach/trace_onset/trace_stable_onset with score >= 1.0,
@@ -440,7 +548,9 @@ Output strictly in JSON:
 {
   "selected_id": 1,
   "confidence": 0.0,
-  "rationale": "short reason"
+  "change_from_top1": false,
+  "rationale": "short reason",
+  "decisive_evidence": "specific metric/trace evidence"
 }
 """
 
@@ -462,6 +572,7 @@ Time candidates:
 {json.dumps(time_payload, ensure_ascii=False, indent=2)}
 
 Select the best root-cause occurrence datetime from the candidate list only.
+Prefer component-specific first breach over global trace onset when the evidence is strong.
 """
 
         raw = self._chat(system_prompt, user_prompt)
@@ -599,6 +710,8 @@ Select the best root-cause occurrence datetime from the candidate list only.
             "datetime": str(selected.get("datetime", "")),
             "confidence": normalize_score(data.get("confidence", selected.get("score", 0.0))),
             "rationale": str(data.get("rationale", "")).strip(),
+            "change_from_top1": bool(data.get("change_from_top1", selected_id != 1)),
+            "decisive_evidence": str(data.get("decisive_evidence", "") or "").strip(),
             "rerank_policy": "llm_may_rerank_top_candidates_with_protected_trace_onset_veto",
             "score_drop_from_deterministic_top1": float(score_drop),
             "protected_deterministic_top1": bool(protected_deterministic_top1),

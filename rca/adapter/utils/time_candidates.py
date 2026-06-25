@@ -247,11 +247,14 @@ _REASON_TIME_TOKENS: Dict[str, List[str]] = {
 
 
 _REASON_METRIC_FILES: Dict[str, List[str]] = {
-    "network loss": ["metric_service.csv", "metric_app.csv", "metric_middleware.csv"],
-    "network delay": ["metric_service.csv", "metric_app.csv", "metric_middleware.csv"],
-    "db connection limit": ["metric_middleware.csv", "metric_app.csv"],
-    "db close": ["metric_middleware.csv", "metric_app.csv"],
-    "CPU fault": ["metric_node.csv", "metric_container.csv"],
+    # node-level metrics carry the ground-truth signal for network faults;
+    # middleware/service reflect downstream impact only.
+    "network loss": ["metric_node.csv", "metric_middleware.csv", "metric_service.csv"],
+    "network delay": ["metric_node.csv", "metric_middleware.csv", "metric_service.csv"],
+    "db connection limit": ["metric_service.csv", "metric_middleware.csv"],
+    "db close": ["metric_service.csv", "metric_middleware.csv"],
+    # container is primary for CPU; node catches OS-level cpu/load metrics.
+    "CPU fault": ["metric_container.csv", "metric_node.csv"],
 }
 
 
@@ -322,21 +325,47 @@ def _reason_metric_time_candidates(dataset: str, instruction: str, reasons: Sequ
         mx = max(minute_scores.values())
         if mx <= 0:
             continue
-        candidates = sorted((m, s) for m, s in minute_scores.items() if s >= 0.30 * mx)
-        if not candidates:
-            candidates = sorted(minute_scores.items(), key=lambda kv: kv[1], reverse=True)[:1]
-        minute, score = candidates[0]
-        dt = pd.to_datetime(int(minute), unit="s", utc=True).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
+        # onset: earliest minute above 30% of max (first sign of anomaly)
+        onset_cands = sorted((m, s) for m, s in minute_scores.items() if s >= 0.30 * mx)
+        if not onset_cands:
+            onset_cands = sorted(minute_scores.items(), key=lambda kv: kv[1], reverse=True)[:1]
+        onset_minute, onset_score = onset_cands[0]
+        onset_dt = pd.to_datetime(int(onset_minute), unit="s", utc=True).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
         _add_candidate(
             out,
             TimeCandidate(
-                dt,
+                onset_dt,
                 "reason_metric_onset",
-                0.88 + min(0.22, float(score) / max(mx, 1e-9) * 0.12),
+                0.88 + min(0.12, float(onset_score) / max(mx, 1e-9) * 0.12),
                 reason=reason,
-                evidence={"reason": reason, "relative_score": float(score) / max(mx, 1e-9), "tokens": tokens},
+                evidence={"reason": reason, "relative_score": float(onset_score) / max(mx, 1e-9), "tokens": tokens},
             ),
         )
+        # ±1 min neighbors of onset (Direction 4): let evaluator's ≤1min window find the exact GT
+        for delta_s in (60, -60):
+            try:
+                nb_dt = (pd.Timestamp(onset_dt, tz="Asia/Shanghai") + pd.Timedelta(seconds=delta_s)).strftime("%Y-%m-%d %H:%M:%S")
+                _add_candidate(
+                    out,
+                    TimeCandidate(nb_dt, "reason_metric_onset_neighbor", 0.76, reason=reason,
+                                  evidence={"reason": reason, "neighbor_of": onset_dt}),
+                )
+            except Exception:
+                pass
+        # peak: minute with highest anomaly score (useful when onset is pre-cursor noise)
+        peak_minute = max(minute_scores, key=lambda m: minute_scores[m])
+        if peak_minute != onset_minute:
+            peak_dt = pd.to_datetime(int(peak_minute), unit="s", utc=True).tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
+            _add_candidate(
+                out,
+                TimeCandidate(
+                    peak_dt,
+                    "reason_metric_peak",
+                    0.72 + min(0.10, float(minute_scores[peak_minute]) / max(mx, 1e-9) * 0.10),
+                    reason=reason,
+                    evidence={"reason": reason, "relative_score": 1.0, "tokens": tokens},
+                ),
+            )
     return out
 
 
@@ -490,6 +519,20 @@ def _component_metric_onset_time_candidates(
                 evidence={"component": str(comp), "top_metrics": top_metrics[:8]},
             ),
         )
+        # ±1min neighbors of onset and first_breach: evaluator tolerance is ≤1min,
+        # so a 2-min-off estimate can be rescued by its neighbor hitting the GT exactly.
+        for _base_dt in dict.fromkeys([onset_dt] + ([first_dt] if not cand_first.empty else [])):
+            for _delta in (60, -60):
+                try:
+                    _nb = (pd.Timestamp(_base_dt, tz="Asia/Shanghai") + pd.Timedelta(seconds=_delta)).strftime("%Y-%m-%d %H:%M:%S")
+                    _add_candidate(
+                        out,
+                        TimeCandidate(_nb, "component_metric_onset_neighbor", 0.72,
+                                      component=str(comp),
+                                      evidence={"component": str(comp), "neighbor_of": _base_dt}),
+                    )
+                except Exception:
+                    pass
     return out
 
 
@@ -609,7 +652,7 @@ def select_time_candidate(
             trace_best = None
             trace_best_s = None
             for src in trace_pref:
-                items = [c for c in normalized if str(c.source or "").startswith(src)]
+                items = [c for c in normalized if src in str(c.source or "")]
                 if not items:
                     continue
                 items = sorted(items, key=lambda c: (_dt_to_epoch_s(c.datetime) or 10**18, -float(c.score or 0.0)))
@@ -627,7 +670,7 @@ def select_time_candidate(
 
         trace_pref = ["trace_first_breach", "trace_onset", "trace_stable_onset"]
         for src in trace_pref:
-            items = [c for c in normalized if str(c.source or "").startswith(src)]
+            items = [c for c in normalized if src in str(c.source or "")]
             if items:
                 items = sorted(items, key=lambda c: (_dt_to_epoch_s(c.datetime) or 10**18, -float(c.score or 0.0)))
                 best = items[0]

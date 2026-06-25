@@ -3,8 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from rca.adapter.base import DatasetAdapter
-from rca.execution.light_agent import choose_from_candidates
-from rca.execution.fast_solver import evidence_supports_reason, infer_reason_with_evidence
+from rca.execution.fast_solver import infer_reason_with_evidence
 from rca.adapter.utils.time_candidates import (
     estimate_occurrence_datetime_candidates,
     select_time_candidate,
@@ -40,6 +39,108 @@ class TelecomAdapter(DatasetAdapter):
 
     def coerce_closed_set_lists(self) -> bool:
         return True
+
+    def constrain_llm_to_index_candidates(self) -> bool:
+        return True
+
+    def index_candidate_pool_k(
+        self,
+        *,
+        task_id: int,
+        k: int,
+        default_pool_k: int,
+        context: Dict[str, Any],
+    ) -> int:
+        if int(task_id) in {2, 3, 4, 5, 6, 7}:
+            return max(int(default_pool_k), 20)
+        return int(default_pool_k)
+
+    def refine_index_llm_gate(
+        self,
+        *,
+        gate: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+        context: Dict[str, Any],
+        task_id: int,
+    ) -> Dict[str, Any]:
+        out = dict(gate or {})
+        reasons = [str(x) for x in list(out.get("reasons") or [])]
+        need_time = bool((context or {}).get("need_time", False))
+        need_comp = bool((context or {}).get("need_comp", False))
+        need_reason = bool((context or {}).get("need_reason", False))
+
+        diversity = dict(out.get("candidate_diversity") or {})
+        time_candidates = [x for x in list((context or {}).get("time_candidates") or []) if isinstance(x, Mapping)]
+        time_clusters: set[str] = set()
+        time_scores: List[float] = []
+        for item in time_candidates[:12]:
+            dt = str(item.get("datetime", "") or "")
+            if dt:
+                # Use the same coarse cluster as the shared gate. The LLM is
+                # useful only when there are genuinely different time anchors.
+                parts = dt.split()
+                hm = parts[-1] if parts else dt
+                toks = hm.split(":")
+                if len(toks) >= 2:
+                    try:
+                        time_clusters.add(f"{int(toks[0]):02d}:{(int(toks[1]) // 5) * 5:02d}")
+                    except Exception:
+                        time_clusters.add(dt)
+                else:
+                    time_clusters.add(dt)
+            time_scores.append(self._safe_float(item.get("score", 0.0)))
+
+        time_gap = 1.0
+        time_top_score = max(time_scores or [0.0])
+        if len(time_scores) >= 2:
+            ranked_time_scores = sorted(time_scores, reverse=True)
+            time_gap = max(0.0, ranked_time_scores[0] - ranked_time_scores[1])
+        if need_time and len(time_clusters) >= 2 and (time_gap < 0.12 or time_top_score < 0.55):
+            out["need_llm"] = True
+            reasons.append("telecom_critical_time_ambiguity")
+
+        if bool(out.get("need_llm")):
+            if need_comp and int(diversity.get("component_family", 0) or 0) <= 1:
+                out["need_llm"] = False
+                reasons.append("telecom_skip_llm_low_component_diversity")
+            if need_reason and int(diversity.get("reason", 0) or 0) <= 1:
+                out["need_llm"] = False
+                reasons.append("telecom_skip_llm_low_reason_diversity")
+            if need_time and len(time_clusters) <= 1:
+                out["need_llm"] = False
+                reasons.append("telecom_skip_llm_low_time_diversity")
+
+        top1_score = self._safe_float(out.get("top1_score", 0.0))
+        gap = self._safe_float(out.get("score_gap", 0.0))
+        if bool(out.get("need_llm")) and top1_score >= 0.55 and gap >= 0.12 and "telecom_critical_time_ambiguity" not in reasons:
+            out["need_llm"] = False
+            reasons.append("telecom_skip_llm_confident_deterministic")
+
+        # Soft evidence sufficiency penalty: when the pool lacks metric support,
+        # let the LLM run only under a stricter adoption policy rather than
+        # hard-dropping all difficult cases.
+        top_metrics = dict((context or {}).get("top_metrics", {}) or {})
+        has_metric_support = False
+        for item in list(candidates or [])[:8]:
+            if not isinstance(item, Mapping):
+                continue
+            comp = str(item.get("component", "") or "")
+            if comp and list(top_metrics.get(comp, []) or []):
+                has_metric_support = True
+                break
+            if list(item.get("supporting_metrics", []) or []) or list(item.get("evidence", []) or []):
+                has_metric_support = True
+                break
+        if bool(out.get("need_llm")) and not has_metric_support:
+            context["llm_change_min_confidence"] = max(self._safe_float(context.get("llm_change_min_confidence", 0.85)), 0.92)
+            context["llm_max_score_drop_vs_det_top1"] = min(self._safe_float(context.get("llm_max_score_drop_vs_det_top1", 0.05)), 0.02)
+            reasons.append("telecom_llm_evidence_sufficiency_soft_penalty")
+
+        out["telecom_time_cluster_count"] = int(len(time_clusters))
+        out["telecom_time_score_gap"] = float(time_gap)
+        out["telecom_time_top_score"] = float(time_top_score)
+        out["reasons"] = list(dict.fromkeys(reasons))
+        return out
 
     def parse_root_cause_label(self, raw_reason: str) -> str:
         text = str(raw_reason or "").strip()
@@ -94,7 +195,8 @@ class TelecomAdapter(DatasetAdapter):
         return ""
 
     @classmethod
-    def _type_consistency(cls, component: str, reason: str, top_metrics: Sequence[str] = ()) -> float:
+    def _type_consistency_impl(cls, component: str, reason: str, top_metrics: Sequence[str] = ()) -> float:
+        """Component–reason type alignment score (classmethod for internal reuse)."""
         rtype = cls._reason_type(reason)
         if not rtype:
             return 0.0
@@ -121,6 +223,13 @@ class TelecomAdapter(DatasetAdapter):
             return -0.10
         return 0.35 if ctype == rtype else -0.35
 
+    def _type_consistency(self, comp: str, reason: str, metrics: List[str]) -> float:
+        """Instance-method hook required by base.rerank_candidate_hypotheses."""
+        score = self._type_consistency_impl(comp, reason, metrics) if reason else 0.0
+        if reason and reason not in _TELECOM_REASON_TAXONOMY:
+            score -= 0.25
+        return score
+
     @classmethod
     def _reason_compatible_types(cls, reason: str) -> Set[str]:
         reason = str(reason or "")
@@ -133,6 +242,31 @@ class TelecomAdapter(DatasetAdapter):
         if reason == "high memory usage":
             return {"container", "node"}
         return set()
+
+    def component_semantic_type(self, component: str) -> str:
+        return self._component_type(str(component or ""))
+
+    def reason_semantic_type(self, reason: str) -> str:
+        return self._reason_type(self.parse_root_cause_label(str(reason or "")))
+
+    def reason_metric_keywords(self, reason: str) -> List[str]:
+        reason = self.parse_root_cause_label(str(reason or ""))
+        return {
+            "CPU fault": ["cpu", "proc", "load", "iowait", "util"],
+            "db close": ["close", "closed", "abort", "disconnect"],
+            "db connection limit": ["conn", "connection", "login", "session", "tps", "sql", "query", "lock"],
+            "network delay": ["delay", "latency", "rtt", "ping", "tnsping"],
+            "network loss": ["loss", "drop", "retrans", "timeout", "reset", "packet"],
+            "high memory usage": ["mem", "memory", "rss", "heap", "gc"],
+        }.get(reason, [])
+
+    def llm_reason_rules(self) -> List[str]:
+        return [
+            "CPU fault: prefer docker/container components only when metrics contain cpu/proc/load/iowait/util.",
+            "db close or db connection limit: prefer db components only when metrics contain conn/session/query/sql/close/disconnect.",
+            "network delay or network loss: prefer os/node components only when metrics contain packet/loss/drop/retrans/latency/delay.",
+            "Do not switch to a common reason unless component type and metric evidence both support it.",
+        ]
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -157,25 +291,12 @@ class TelecomAdapter(DatasetAdapter):
             "high memory usage": float(hits(["mem", "memory", "rss", "heap", "gc"])),
         }
 
-    def should_use_light_agent(
-        self,
-        *,
-        spec: Any,
-        need_comp: bool,
-        ev3_gap_norm: float,
-        no_llm_fallback: bool,
-        args: Any,
-        **kwargs: Any,
-    ) -> bool:
+    def _allow_light_agent(self, *, spec: Any, need_comp: bool) -> bool:
         task_id = int(getattr(spec, "task_id", 0) or 0)
         difficulty = str(getattr(spec, "difficulty", "") or "")
-        allow = (task_id in _TELECOM_LIGHT_AGENT_TASKS) or (
-            difficulty != "easy" and need_comp
+        return (task_id in _TELECOM_LIGHT_AGENT_TASKS) or (
+            difficulty != "easy" and bool(need_comp)
         )
-        gap_thr = float(getattr(args, "task3_agent_gap", 0.15) or 0.15)
-        return bool(getattr(args, "light_agent", False)) and (
-            float(ev3_gap_norm or 0.0) < gap_thr
-        ) and (not no_llm_fallback) and allow
 
     def get_component_delta_s(
         self,
@@ -191,7 +312,7 @@ class TelecomAdapter(DatasetAdapter):
             return 1800, None
         if need_time:
             return 1800, center_time_s
-        return 300, center_time_s
+        return 600, center_time_s
 
     def get_time_dt_override(
         self,
@@ -228,20 +349,7 @@ class TelecomAdapter(DatasetAdapter):
         if not need_reason:
             return None
         det_reason, ev2 = infer_reason_with_evidence(instruction)
-        if bool(getattr(args, "light_agent", False)):
-            candidates = list((ev2.get("scores") or {}).keys()) if isinstance(ev2, dict) else []
-            if candidates:
-                dec = choose_from_candidates(
-                    task_id=2,
-                    instruction=instruction,
-                    output_field="root cause reason",
-                    candidates=candidates,
-                    evidence=ev2,
-                    temperature=float(getattr(args, "light_agent_temperature", 0.0)),
-                )
-                agent_reason = dec.chosen if dec else ""
-                if agent_reason and evidence_supports_reason(ev2, agent_reason):
-                    det_reason = agent_reason
+        # LLM call removed: field_solvers.solve_reason owns the unified LLM rerank step.
         return str(det_reason or ""), "", True, ev2
 
     def solve_component_joint_scoring(
@@ -331,13 +439,16 @@ class TelecomAdapter(DatasetAdapter):
         desired_ratio = 0.0
         if det_reason_out in ("db close", "db connection limit"):
             desired = "db"
-            desired_ratio = 0.62
+            # After per-file normalisation in the extractor, db and node scores are
+            # on the same scale.  Lower threshold so a db component at 30 % of the
+            # top-1 node score still wins over the node.
+            desired_ratio = 0.30
         elif det_reason_out == "CPU fault":
             desired = "container"
-            desired_ratio = 0.66
+            desired_ratio = 0.30
         elif det_reason_out in ("network delay", "network loss"):
             desired = "node"
-            desired_ratio = 0.62
+            desired_ratio = 0.30
         if desired and top1_score > 1e-12:
             pool = [c for c in (ev3.combined_scores or {}).keys() if _ctype(c) == desired]
             if pool:
@@ -549,6 +660,10 @@ class TelecomAdapter(DatasetAdapter):
                                 "datetime": str((context or {}).get("time_choice", "") or "") if need_time else "",
                                 "score": float(score),
                                 "source": "telecom_reason_evidence",
+                                "evidence": [
+                                    f"reason_score={ev_norm:.3f}",
+                                    f"hypothesis_score={hyp_norm:.3f}",
+                                ],
                             }
                         )
                     if out:
@@ -560,6 +675,25 @@ class TelecomAdapter(DatasetAdapter):
         reason_scores = dict((context or {}).get("reason_scores", {}) or {})
         top_metrics = dict((context or {}).get("top_metrics", {}) or {})
         first_times = dict((context or {}).get("component_first_times", {}) or {})
+
+        if need_comp and not need_reason and not need_time:
+            out: List[Dict[str, Any]] = []
+            seen: Set[str] = set()
+            for item in base_items:
+                comp = str(item.get("component", "") or "").strip()
+                if not comp or comp in seen:
+                    continue
+                seen.add(comp)
+                candidate = dict(item)
+                candidate["datetime"] = str(first_times.get(comp, "") or candidate.get("datetime", "") or "")
+                candidate["first_anomaly_time"] = str(first_times.get(comp, "") or candidate.get("first_anomaly_time", "") or "")
+                candidate["component_type"] = self._component_type(comp)
+                candidate["symptomness"] = self._safe_float(candidate.get("symptomness", 0.0))
+                if not candidate.get("supporting_metrics"):
+                    candidate["supporting_metrics"] = [str(x) for x in list(top_metrics.get(comp, []) or [])]
+                out.append(candidate)
+            if out:
+                return out
 
         ranked_components = [
             str(c)
@@ -640,7 +774,7 @@ class TelecomAdapter(DatasetAdapter):
                     if metric_reason.get(reason, 0.0) <= 0:
                         continue
                 reason_norm = self._safe_float(reason_scores.get(reason, 0.0)) / max(max_reason, 1e-9)
-                consistency = self._type_consistency(comp, reason, metrics)
+                consistency = self._type_consistency_impl(comp, reason, metrics)
                 metric_bonus = min(0.25, 0.08 * self._safe_float(metric_reason.get(reason, 0.0)))
                 score = (
                     0.45 * comp_norm
@@ -666,55 +800,5 @@ class TelecomAdapter(DatasetAdapter):
 
         return sorted(merged.values(), key=lambda x: self._safe_float(x.get("score")), reverse=True)
 
-    def rerank_candidate_hypotheses(
-        self,
-        *,
-        candidates: Sequence[Any],
-        context: Dict[str, Any],
-        component_level: str,
-        need_comp: bool,
-        need_reason: bool,
-        need_time: bool,
-    ) -> Optional[List[Any]]:
-        if not candidates:
-            return None
-        comp_scores = dict((context or {}).get("component_scores", {}) or {})
-        reason_scores = dict((context or {}).get("reason_scores", {}) or {})
-        top_metrics = dict((context or {}).get("top_metrics", {}) or {})
-        first_times = dict((context or {}).get("component_first_times", {}) or {})
-        peak_times = dict((context or {}).get("component_peak_times", {}) or {})
-        query_start = str((context or {}).get("query_start_local", "") or "")
-        max_comp = max([abs(self._safe_float(v)) for v in comp_scores.values()] + [0.0])
-        max_reason = max([abs(self._safe_float(v)) for v in reason_scores.values()] + [0.0])
-        max_base = max([abs(self._safe_float(getattr(c, "score", 0.0))) for c in candidates] + [0.0])
-
-        scored: List[Tuple[float, Any]] = []
-        for cand in list(candidates or []):
-            comp = str(getattr(cand, "component", "") or "")
-            reason = self.parse_root_cause_label(str(getattr(cand, "reason", "") or ""))
-            base = self._safe_float(getattr(cand, "score", 0.0)) / max(max_base, 1e-9)
-            comp_norm = self._safe_float(comp_scores.get(comp, 0.0)) / max(max_comp, 1e-9) if comp else 0.0
-            reason_norm = self._safe_float(reason_scores.get(reason, 0.0)) / max(max_reason, 1e-9) if reason else 0.0
-            metrics = [str(x) for x in list(top_metrics.get(comp, []) or [])]
-
-            score = 0.50 * base
-            if need_comp:
-                score += 0.25 * comp_norm
-            if need_reason:
-                score += 0.25 * reason_norm
-            if need_reason and comp:
-                score += self._type_consistency(comp, reason, metrics)
-            if need_reason and reason not in _TELECOM_REASON_TAXONOMY:
-                score -= 0.25
-            try:
-                cand.reason = reason
-                cand.score = float(score)
-                if metrics:
-                    old_ev = [str(x) for x in list(getattr(cand, "evidence", []) or [])]
-                    cand.evidence = list(dict.fromkeys(old_ev + metrics[:6]))
-            except Exception:
-                pass
-            scored.append((float(score), cand))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [cand for _score, cand in scored]
+    # rerank_candidate_hypotheses: uses base implementation.
+    # Telecom-specific behaviour is injected via _type_consistency() override above.

@@ -12,10 +12,11 @@ from rca.execution.field_solvers import assemble_prediction, solve_component, so
 from rca.execution.framework import ExecutionResult, Strategy, TaskContext, TaskRuntime, TaskSpec, UnifiedTaskRunner
 from rca.execution.indexed_evidence_agent import IndexedEvidenceAgentRunner
 from rca.execution.indexed_evidence_agent import _collect_agent_stats, _load_counterfactual_prompts, _safe_prediction_to_tuples, _safe_prediction_to_tuples_constrained
-from rca.index.config import apply_dataset_basil_config, basil_config_from_args, basil_enabled
+from rca.index.config import apply_adaptive_profile_config, apply_dataset_basil_config, basil_config_from_args, basil_enabled
 from rca.index.query import basil_query_config_from_mapping, query_basil_components
 from rca.execution.telemetry_solver import canonicalize_prediction, extract_reasons_from_scoring_points, required_root_count
 from rca.execution.telemetry_solver import estimate_k_occurrence_datetimes_from_trace
+from rca.adapter.utils.time_candidates import estimate_occurrence_datetime_candidates
 from rca.adapter.utils.component_candidates import build_component_candidates, parse_time_window_generic
 from rca.counterfactor_agent.agent import CounterfactualRCAAgent
 
@@ -130,6 +131,7 @@ def _timing_step(
     postprocess_seconds: float = 0.0,
     llm_input_tokens: int = 0,
     llm_called: bool = False,
+    candidate_pool_diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     bt = dict(basil_timings or {})
     evidence_build = float(bt.get("basil.stage1_evidence_index_seconds", 0.0) or 0.0)
@@ -151,6 +153,22 @@ def _timing_step(
         "llm_gate_called": bool(llm_called),
         "postprocess_seconds": float(postprocess_seconds),
     }
+    diag = dict(candidate_pool_diagnostics or {})
+    for key in [
+        "candidate_pool_count",
+        "candidate_component_count",
+        "candidate_reason_count",
+        "candidate_time_count",
+        "candidate_component_family_count",
+        "candidate_time_cluster_count",
+        "llm_max_prompt_candidates",
+        "needs_component",
+        "needs_reason",
+        "needs_time",
+        "candidate_pool_preview",
+    ]:
+        if key in diag:
+            breakdown[key] = diag.get(key)
     return {
         "step": "timing",
         "action": "timing",
@@ -175,6 +193,8 @@ class BasilIndexStrategy:
         top_k = int(getattr(args, "task3_top_k", 12) or 12)
         k_fail = max(1, int(required_root_count(spec.scoring_points)))
         cfg_map = basil_config_from_args(args, top_k, required_fields=_task_fields(spec.task_id), task_id=spec.task_id)
+        cfg_map = apply_adaptive_profile_config(cfg_map, dataset=spec.dataset, args=args)
+        top_k = int(cfg_map.get("top_k", top_k) or top_k)
         cfg_map = apply_dataset_basil_config(cfg_map, dataset=spec.dataset, args=args)
         adapter = get_dataset_adapter(spec.dataset)
         component_level = ""
@@ -192,6 +212,7 @@ class BasilIndexStrategy:
                 )
             except Exception:
                 pass
+        top_k = int(cfg_map.get("top_k", top_k) or top_k)
         cfg = basil_query_config_from_mapping(cfg_map, top_k=top_k)
 
         t_query = time.perf_counter()
@@ -256,6 +277,7 @@ class BasilIndexStrategy:
                 postprocess_seconds=post_seconds,
                 llm_input_tokens=int(decision.input_tokens),
                 llm_called=bool(decision.llm_called),
+                candidate_pool_diagnostics=dict(decision.candidate_pool_diagnostics or {}),
             )
         )
         return ExecutionResult(prediction=str(pred), trajectory=trajectory, prompt=list(decision.prompt or []))
@@ -279,8 +301,9 @@ class FieldSolverStrategy:
         adapter_for_non_basil = get_dataset_adapter(spec.dataset)
         is_bank = adapter_for_non_basil is not None and adapter_for_non_basil.__class__.__name__ == "BankAdapter"
         is_market = adapter_for_non_basil is not None and adapter_for_non_basil.__class__.__name__ == "MarketAdapter"
+        is_telecom = adapter_for_non_basil is not None and adapter_for_non_basil.__class__.__name__ == "TelecomAdapter"
         use_non_basil_counterfactual = (
-            (bool(is_bank) or bool(is_market))
+            (bool(is_bank) or bool(is_market) or bool(is_telecom))
             and (not basil_enabled(args))
             and bool(getattr(args, "uncertainty_llm", False))
             and (not bool(getattr(args, "deterministic_only", False)))
@@ -334,35 +357,39 @@ class FieldSolverStrategy:
 
             time_candidates: List[Dict[str, Any]] = []
             if bool(need_time):
-                query_start_local = ""
-                query_end_local = ""
                 try:
-                    _date_dir, _start, _end = parse_time_window_generic(spec.instruction)
-                    query_start_local = _start.strftime("%Y-%m-%d %H:%M:%S")
-                    query_end_local = _end.strftime("%Y-%m-%d %H:%M:%S")
+                    # Multi-signal fusion: trace onset/peak + reason-aware metric onset + ±1min neighbors
+                    _fused_cands = estimate_occurrence_datetime_candidates(
+                        dataset=spec.dataset,
+                        instruction=spec.instruction,
+                        reasons=list(hint_reasons) or [],
+                        top_k=max(16, int(getattr(args, "time_candidate_top_k", 8) or 8) * 2),
+                    )
+                    for cand in _fused_cands[: max(1, int(getattr(args, "time_candidate_top_k", 8) or 8))]:
+                        time_candidates.append({
+                            "datetime": str(cand.datetime),
+                            "source": str(cand.source),
+                            "score": float(cand.score),
+                            "component": str(cand.component or ""),
+                            "reason": str(cand.reason or ""),
+                            "evidence": dict(cand.evidence or {}),
+                        })
                 except Exception:
-                    query_start_local = ""
-                    query_end_local = ""
-                try:
-                    k_time = max(8, int(k_fail) * 4)
-                    dts = estimate_k_occurrence_datetimes_from_trace(dataset=spec.dataset, instruction=spec.instruction, k=int(k_time))
-                except Exception:
-                    dts = []
-                for rank, dt in enumerate(list(dts or [])[: max(1, int(getattr(args, "time_candidate_top_k", 8) or 8))], start=1):
-                    time_candidates.append(
-                        {
+                    # Fallback to legacy trace-only candidates
+                    try:
+                        k_time = max(8, int(k_fail) * 4)
+                        dts = estimate_k_occurrence_datetimes_from_trace(dataset=spec.dataset, instruction=spec.instruction, k=int(k_time))
+                    except Exception:
+                        dts = []
+                    for rank, dt in enumerate(list(dts or [])[: max(1, int(getattr(args, "time_candidate_top_k", 8) or 8))], start=1):
+                        time_candidates.append({
                             "datetime": str(dt),
                             "source": "trace_p95_duration",
                             "score": float(1.0 - (rank - 1) / float(max(1, len(dts) - 1))) if len(dts) > 1 else 1.0,
                             "component": "",
                             "reason": "",
-                            "evidence": (
-                                {"from_trace_p95": True, "query_start_local": query_start_local, "query_end_local": query_end_local}
-                                if is_market
-                                else {"from_trace_p95": True}
-                            ),
-                        }
-                    )
+                            "evidence": {},
+                        })
 
             comp_scores: Dict[str, float] = {}
             comp_candidates: List[str] = []
@@ -488,6 +515,11 @@ class FieldSolverStrategy:
                 "llm_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
                 "llm_time_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
                 "llm_verify_top_k": max(3, int(k_fail) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)),
+                "llm_max_prompt_candidates": (
+                    min(8, max(len(reasons), int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)))
+                    if bool(need_reason) and not bool(need_comp)
+                    else min(8, max(5, int(k_fail) * 4))
+                ),
                 "evidence_score_gap_threshold": float(getattr(args, "evidence_score_gap_threshold", 0.15) or 0.15),
                 "evidence_top1_score_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
                 "evidence_top1_score_floor_single": float(getattr(args, "evidence_top1_score_floor_single", 0.50) or 0.50),
@@ -495,6 +527,31 @@ class FieldSolverStrategy:
                 "evidence_time_gap_threshold": 0.20,
                 "basil_max_trace_rows": int(getattr(args, "basil_max_trace_rows", 0) or 0),
             }
+
+            # Inject reason_evidence so CounterfactualRCAAgent can do evidence-grounded
+            # reason reranking (fixes CPU-bias for Telecom non-basil path).
+            if bool(need_reason) and adapter is not None:
+                try:
+                    from rca.execution.light_agent import _format_reason_evidence
+                    from rca.adapter.utils.reason_candidates import predict_reason_universal
+                    raw = adapter.solve_reason(
+                        spec=None,
+                        instruction=str(spec.instruction or ""),
+                        scoring_points=str(spec.scoring_points or ""),
+                        args=args,
+                        need_reason=True,
+                    )
+                    raw_ev = raw[3] if (raw is not None and len(raw) >= 4) else None
+                    if raw_ev is None:
+                        _, raw_ev = predict_reason_universal(
+                            dataset=str(spec.dataset or ""),
+                            instruction=str(spec.instruction or ""),
+                            scoring_points=str(spec.scoring_points or ""),
+                        )
+                    if isinstance(raw_ev, dict):
+                        context["reason_evidence"] = _format_reason_evidence(raw_ev)
+                except Exception:
+                    pass
 
             agent_prompt, basic_prompt = _load_counterfactual_prompts(spec.dataset)
             agent = CounterfactualRCAAgent(agent_prompt=agent_prompt, basic_prompt=basic_prompt)

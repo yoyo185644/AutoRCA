@@ -62,6 +62,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--evidence_top1_score_floor", type=float, default=0.30)
     p.add_argument("--evidence_top1_score_floor_single", type=float, default=0.50)
     p.add_argument("--gate_skip_gap_threshold", type=float, default=0.30)
+    p.add_argument("--llm_change_min_confidence", type=float, default=0.85)
+    p.add_argument("--llm_max_score_drop_vs_det_top1", type=float, default=0.05)
+    p.set_defaults(adaptive_profile=False)
+    p.add_argument("--adaptive_profile", action="store_true")
+    p.add_argument("--confidence_level", type=float, default=0.95)
+    p.add_argument("--evidence_budget", type=str, default="medium", choices=["small", "medium", "large", "fast", "accurate"])
+    p.add_argument("--history_weight", type=float, default=0.0)
+    p.add_argument("--llm_risk_tolerance", type=str, default="conservative", choices=["conservative", "balanced", "aggressive"])
+    p.add_argument("--adaptive_profile_max_files", type=int, default=80)
+    p.add_argument("--adaptive_profile_max_rows_per_file", type=int, default=200000)
     p.set_defaults(basil_index=False)
     p.add_argument("--basil_index", action="store_true")
     p.add_argument("--basil_bucket_size", type=int, default=300)
@@ -215,6 +225,14 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         "component_candidate_seconds",
         "time_candidate_seconds",
         "total_execution_seconds",
+        "candidate_pool_count",
+        "candidate_component_count",
+        "candidate_reason_count",
+        "candidate_time_count",
+        "candidate_component_family_count",
+        "candidate_time_cluster_count",
+        "llm_max_prompt_candidates",
+        "candidate_pool_preview",
     ]
     pd.DataFrame(columns=columns).to_csv(out_path, index=False)
 
@@ -300,6 +318,15 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
             f"index_query_seconds={basil_index_query_seconds:.6f}, "
             f"index_total_seconds={basil_index_total_seconds:.6f}"
         )
+        if timing.get("candidate_pool_count") is not None:
+            logger.info(
+                "Candidate pool: "
+                f"total={int(timing.get('candidate_pool_count', 0) or 0)}, "
+                f"components={int(timing.get('candidate_component_count', 0) or 0)}, "
+                f"reasons={int(timing.get('candidate_reason_count', 0) or 0)}, "
+                f"times={int(timing.get('candidate_time_count', 0) or 0)}, "
+                f"prompt_limit={int(timing.get('llm_max_prompt_candidates', 0) or 0)}"
+            )
 
         row_obj = {
             "instruction": instruction,
@@ -323,6 +350,14 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
             "component_candidate_seconds": float(timing.get("component_candidate_seconds", 0.0) or 0.0),
             "time_candidate_seconds": float(timing.get("time_candidate_seconds", 0.0) or 0.0),
             "total_execution_seconds": float(timing.get("total_execution_seconds", solve_seconds) or solve_seconds),
+            "candidate_pool_count": int(timing.get("candidate_pool_count", 0) or 0),
+            "candidate_component_count": int(timing.get("candidate_component_count", 0) or 0),
+            "candidate_reason_count": int(timing.get("candidate_reason_count", 0) or 0),
+            "candidate_time_count": int(timing.get("candidate_time_count", 0) or 0),
+            "candidate_component_family_count": int(timing.get("candidate_component_family_count", 0) or 0),
+            "candidate_time_cluster_count": int(timing.get("candidate_time_cluster_count", 0) or 0),
+            "llm_max_prompt_candidates": int(timing.get("llm_max_prompt_candidates", 0) or 0),
+            "candidate_pool_preview": json.dumps(timing.get("candidate_pool_preview", []) or [], ensure_ascii=False),
         }
         rows.append(row_obj)
         n_total += 1

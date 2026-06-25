@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 from rca.common.config import load_dataset_config
+from rca.adapter.profiler import AdaptiveKnobs, DatasetProfiler, build_adaptive_basil_config
 
 
 def basil_enabled(args: Any) -> bool:
@@ -132,3 +134,95 @@ def apply_dataset_basil_config(config: Mapping[str, Any], *, dataset: str, args:
         out["time_tolerance_s"] = int(query_cfg.get("time_tolerance_seconds") or out.get("time_tolerance_s", 300))
 
     return out
+
+
+def apply_adaptive_profile_config(config: Mapping[str, Any], *, dataset: str, args: Any = None) -> Dict[str, Any]:
+    """Derive BASIL defaults from unlabeled telemetry profile.
+
+    This is intentionally a default generator, not a hard override. If a legacy
+    command-line parameter differs from its parser default, that explicit user
+    value wins over the adaptive profile.
+    """
+
+    out: Dict[str, Any] = dict(config or {})
+    if args is None or not bool(getattr(args, "adaptive_profile", False)):
+        return out
+
+    try:
+        profile, adaptive = _cached_adaptive_profile_config(
+            str(dataset),
+            int(getattr(args, "adaptive_profile_max_files", 80) or 80),
+            int(getattr(args, "adaptive_profile_max_rows_per_file", 200000) or 200000),
+            float(getattr(args, "confidence_level", 0.95) or 0.95),
+            str(getattr(args, "evidence_budget", "medium") or "medium"),
+            float(getattr(args, "history_weight", 0.0) or 0.0),
+            str(getattr(args, "llm_risk_tolerance", "conservative") or "conservative"),
+        )
+    except Exception as exc:
+        try:
+            setattr(args, "_adaptive_profile_error", str(exc))
+        except Exception:
+            pass
+        return out
+
+    mapping = adaptive.to_basil_mapping()
+
+    def arg_is_default(name: str, default: Any) -> bool:
+        return getattr(args, name, default) == default
+
+    def set_if_default(config_key: str, arg_name: str, default: Any, cast: Any = None) -> None:
+        if config_key not in mapping or not arg_is_default(arg_name, default):
+            return
+        value = mapping[config_key]
+        if cast is not None:
+            value = cast(value)
+        out[config_key] = value
+        try:
+            setattr(args, arg_name, value)
+        except Exception:
+            pass
+
+    set_if_default("top_k", "task3_top_k", 12, int)
+    set_if_default("bucket_size_s", "basil_bucket_size", 300, int)
+    set_if_default("max_lag_s", "basil_max_lag", 900, int)
+    set_if_default("severity_floor", "basil_severity_floor", 0.0, float)
+    set_if_default("historical_top_k", "basil_historical_top_k", 5, int)
+    set_if_default("candidate_reason_top_r", "basil_candidate_reason_top_r", 3, int)
+    set_if_default("time_candidate_top_k", "time_candidate_top_k", 8, int)
+    set_if_default("evidence_score_gap_threshold", "evidence_score_gap_threshold", 0.15, float)
+    set_if_default("evidence_top1_score_floor", "evidence_top1_score_floor", 0.30, float)
+    set_if_default("gate_skip_gap_threshold", "gate_skip_gap_threshold", 0.30, float)
+
+    try:
+        setattr(args, "_adaptive_profile", profile.to_dict())
+        setattr(args, "_adaptive_basil_config", adaptive.to_dict())
+    except Exception:
+        pass
+    return out
+
+
+@lru_cache(maxsize=16)
+def _cached_adaptive_profile_config(
+    dataset: str,
+    max_files: int,
+    max_rows_per_file: int,
+    confidence_level: float,
+    evidence_budget: str,
+    history_weight: float,
+    llm_risk_tolerance: str,
+) -> Any:
+    profile = DatasetProfiler(
+        str(dataset),
+        max_files=int(max_files),
+        max_rows_per_file=int(max_rows_per_file),
+    ).build()
+    adaptive = build_adaptive_basil_config(
+        profile,
+        AdaptiveKnobs(
+            confidence_level=float(confidence_level),
+            evidence_budget=str(evidence_budget),
+            history_weight=float(history_weight),
+            llm_risk_tolerance=str(llm_risk_tolerance),
+        ),
+    )
+    return profile, adaptive

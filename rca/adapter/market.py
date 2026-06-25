@@ -108,17 +108,8 @@ class MarketAdapter(DatasetAdapter):
     ) -> Optional[Tuple[str, str]]:
         return None
 
-    def should_use_light_agent(
-        self,
-        *,
-        spec: Any,
-        need_comp: bool,
-        ev3_gap_norm: float,
-        no_llm_fallback: bool,
-        args: Any,
-        **kwargs: Any,
-    ) -> bool:
-        return False
+    def _light_agent_task_ids(self) -> set:
+        return set()  # Market does not use light-agent LLM for component selection
 
     def get_time_dt_override(
         self,
@@ -136,6 +127,48 @@ class MarketAdapter(DatasetAdapter):
         c = re.sub(r"(\.ts|-grpc)$", "", c)
         c = re.sub(r"^frontend(\d+)-\d+$", r"frontend-\1", c)
         return c
+
+    def component_semantic_type(self, component: str) -> str:
+        level = _market_component_level(self.parse_component_id(str(component or "")))
+        if level == "node":
+            return "node"
+        if level == "pod":
+            return "container"
+        if level == "service":
+            return "service"
+        return ""
+
+    def reason_semantic_type(self, reason: str) -> str:
+        r = norm_token(self.parse_root_cause_label(str(reason or "")))
+        if r.startswith("node "):
+            return "node"
+        if r.startswith("container "):
+            return "container"
+        return ""
+
+    def reason_metric_keywords(self, reason: str) -> List[str]:
+        r = norm_token(self.parse_root_cause_label(str(reason or "")))
+        if "cpu" in r:
+            return ["cpu", "load", "util", "usage"]
+        if "memory" in r:
+            return ["mem", "memory", "rss", "cache"]
+        if "read" in r:
+            return ["read", "io", "i/o", "disk"]
+        if "write" in r:
+            return ["write", "io", "i/o", "disk"]
+        if "network" in r or "latency" in r or "packet" in r:
+            return ["network", "latency", "packet", "retrans", "corruption", "loss"]
+        if "termination" in r or "process" in r:
+            return ["restart", "exit", "kill", "process", "termination"]
+        return []
+
+    def llm_reason_rules(self) -> List[str]:
+        return [
+            "Node reasons should align with node components and node-level metrics.",
+            "Container reasons should align with pod/container components and container-level metrics.",
+            "Network packet/latency reasons require network/packet/retransmission/latency evidence.",
+            "Do not replace a level-compatible candidate with a level-incompatible candidate unless metric evidence is clearly stronger.",
+        ]
 
     def canonicalize_component(self, *, component: str, component_level: str) -> str:
         raw = str(component or "").strip()
@@ -333,140 +366,98 @@ class MarketAdapter(DatasetAdapter):
             out.append(cand)
         return out
 
-    def rerank_candidate_hypotheses(
+    # rerank_candidate_hypotheses: uses base implementation.
+    # Market-specific behaviour injected via hooks below.
+
+    def _type_consistency(self, comp: str, reason: str, metrics: List[str]) -> float:
+        """Market: level–reason alignment + metric keyword signal."""
+        score = 0.0
+        expected_level = self._expected_level_for_reason(reason)
+        if expected_level:
+            actual_level = _market_component_level(comp)
+            if actual_level == expected_level:
+                score += 0.25
+            elif expected_level == "pod" and actual_level == "service":
+                score -= 0.05
+            else:
+                score -= 0.35
+
+        keywords = [k.lower() for k in self.reason_metric_keywords(reason)]
+        if keywords:
+            metric_blob = " ".join(m.lower() for m in metrics)
+            hits = sum(1 for k in keywords if k in metric_blob)
+            if hits > 0:
+                score += min(0.25, 0.08 * hits)
+            elif any(k in str(reason).lower() for k in ["cpu", "memory", "disk", "io", "network", "packet"]):
+                score -= 0.10
+        return score
+
+    def _hint_bonus(
         self,
         *,
-        candidates: Sequence[Any],
-        context: Dict[str, Any],
-        component_level: str,
-        need_comp: bool,
-        need_reason: bool,
-        need_time: bool,
-    ) -> Optional[List[Any]]:
-        try:
-            from rca.counterfactor_agent.schemas import CandidateHypothesis
-        except Exception:
-            return None
-
-        top_metrics = dict((context or {}).get("top_metrics") or {})
-        hint_components = [self.parse_component_id(x) for x in list((context or {}).get("scoring_point_components") or []) if str(x).strip()]
-        hint_components = [x for x in dict.fromkeys(hint_components) if x]
-        hint_component_bases = {service_base(x) for x in hint_components if x}
-        hint_reasons = [self.parse_root_cause_label(x) for x in list((context or {}).get("scoring_point_reasons") or []) if str(x).strip()]
-        hint_reasons = [x for x in dict.fromkeys(hint_reasons) if x]
-        global_reasons = [self.parse_root_cause_label(x) for x in list((context or {}).get("allowed_reasons") or [])]
-        global_reasons = [x for x in dict.fromkeys(global_reasons) if x]
-        component_scores = dict((context or {}).get("component_scores") or {})
-
-        reranked: List[CandidateHypothesis] = []
-        for cand in list(candidates or []):
-            comp = self.canonicalize_component(
-                component=str(getattr(cand, "component", "") or ""),
-                component_level=str(component_level or ""),
-            )
-            if comp and hint_components:
-                base = service_base(comp)
-                if base and base in hint_component_bases and base in hint_components:
-                    if not re.search(r"-\d+$", base):
-                        comp = base
-            reason = self.parse_root_cause_label(str(getattr(cand, "reason", "") or ""))
-            if need_reason and (not reason) and hint_reasons:
-                reason = hint_reasons[0]
-            if need_reason and not reason and global_reasons:
-                reason = global_reasons[0]
-            if need_comp and not comp:
-                continue
-            if need_reason and not reason:
-                continue
-
-            score = float(getattr(cand, "score", 0.0) or 0.0)
-            score *= self._component_prior(comp)
-            score *= self._level_reason_factor(component=comp, reason=reason)
-            metric_bonus = self._reason_metric_bonus(component=comp, reason=reason, top_metrics=top_metrics)
-            score *= 1.0 + metric_bonus
-            try:
-                blob = " ".join(str(x).lower() for x in list(top_metrics.get(comp, []) or []))
-                toks = [str(t).lower() for t in self._reason_tokens(reason) if str(t).strip()]
-                hits = sum(1 for t in toks if t and t in blob)
-                if toks and hits <= 0 and any(k in str(reason).lower() for k in ["cpu", "memory", "disk", "io", "network", "packet"]):
-                    score *= 0.75
-            except Exception:
-                pass
-            if comp in component_scores:
-                max_score = max([abs(float(v)) for v in component_scores.values()] + [1.0])
-                score += 0.35 * float(component_scores.get(comp, 0.0) or 0.0) / max(max_score, 1e-9)
-            if hint_components and hint_reasons and bool(need_comp) and bool(need_reason):
-                if comp in hint_components:
-                    score += 1.10
-                elif service_base(comp) in hint_component_bases:
-                    score += 0.55
-                if reason in hint_reasons:
-                    score += 0.95
-            reranked.append(
-                CandidateHypothesis(
-                    component=comp,
-                    reason=reason,
-                    evidence=[str(x) for x in list(getattr(cand, "evidence", []) or [])],
-                    score=float(score),
-                    source=str(getattr(cand, "source", "") or "market_adapter_rerank"),
-                )
-            )
-
-        reranked.sort(key=lambda c: float(c.score), reverse=True)
-        return self._diverse_rerank(reranked)
-
-    def select_time_candidate_override(
-        self,
-        *,
-        time_candidates: Sequence[Dict[str, Any]],
-        component: str,
+        comp: str,
         reason: str,
+        hint_components: List[str],
+        hint_reasons: List[str],
         need_comp: bool,
         need_reason: bool,
-        need_time: bool,
-        fallback: str,
-    ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        if not need_time:
-            return None
-        candidates = [dict(x) for x in list(time_candidates or []) if isinstance(x, Mapping)]
-        if not candidates:
-            return None
-        candidates = self._filter_times_to_query_window(candidates)
+    ) -> float:
+        """Market applies hint bonuses only when both comp and reason hints are present."""
+        if not (hint_components and hint_reasons and need_comp and need_reason):
+            return 0.0
+        hint_bases = {service_base(x) for x in hint_components if x}
+        bonus = 0.0
+        if comp in hint_components:
+            bonus += 1.10
+        elif service_base(comp) in hint_bases:
+            bonus += 0.55
+        if reason in hint_reasons:
+            bonus += 0.95
+        return bonus
 
-        comp = self.canonicalize_component(component=component, component_level="mixed")
+    def _postprocess_reranked(self, candidates: List[Any]) -> List[Any]:
+        """Market: diversity filter — one candidate per (semantic-family, reason) pair first."""
+        out: List[Any] = []
+        deferred: List[Any] = []
+        used: set = set()
+        for cand in list(candidates or []):
+            fam = _market_semantic_family(str(getattr(cand, "component", "") or ""))
+            key = (fam, str(getattr(cand, "reason", "") or ""))
+            if key in used:
+                deferred.append(cand)
+                continue
+            out.append(cand)
+            used.add(key)
+        out.extend(deferred)
+        return out
+
+    # select_time_candidate_override: uses base implementation.
+
+    def _preprocess_time_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return self._filter_times_to_query_window(candidates)
+
+    def _score_time_candidate(self, item: Dict[str, Any], comp: str, reason: str) -> float:
+        score = float(item.get("score", 0.0) or 0.0)
+        c0 = self.canonicalize_component(component=str(item.get("component", "") or ""), component_level="mixed")
+        r0 = self.parse_root_cause_label(str(item.get("reason", "") or ""))
         fam = _market_semantic_family(comp)
-        reason_norm = self.parse_root_cause_label(reason)
-
-        def score_item(item: Dict[str, Any]) -> float:
-            score = float(item.get("score", 0.0) or 0.0)
-            c0 = self.canonicalize_component(component=str(item.get("component", "") or ""), component_level="mixed")
-            r0 = self.parse_root_cause_label(str(item.get("reason", "") or ""))
-            src = str(item.get("source", "") or "").lower()
-            if comp and c0:
-                if c0 == comp:
-                    score += 0.45
-                elif _market_semantic_family(c0) == fam:
-                    score += 0.22
-                else:
-                    score -= 0.12
-            if reason_norm and r0:
-                score += 0.28 if r0 == reason_norm else -0.08
-            if any(tok in src for tok in ["log", "event"]):
-                score += 0.12
-            if any(tok in src for tok in ["first", "onset", "breach"]):
-                score += 0.08
-            if any(tok in src for tok in ["trace_peak", "peak"]):
-                score -= 0.04
-            return score
-
-        ranked = sorted(candidates, key=score_item, reverse=True)
-        for item in ranked:
-            dt = str(item.get("datetime", "") or "").strip()
-            if _DATETIME_RE.match(dt):
-                details = dict(item)
-                details["market_time_score"] = float(score_item(item))
-                return dt, details
-        return (fallback, {"source": "market_time_fallback"}) if str(fallback or "").strip() else None
+        src = str(item.get("source", "") or "").lower()
+        if comp and c0:
+            if c0 == comp:
+                score += 0.45
+            elif _market_semantic_family(c0) == fam:
+                score += 0.22
+            else:
+                score -= 0.12
+        if reason and r0:
+            score += 0.28 if r0 == reason else -0.08
+        if any(tok in src for tok in ["log", "event"]):
+            score += 0.12
+        if any(tok in src for tok in ["first", "onset", "breach"]):
+            score += 0.08
+        if any(tok in src for tok in ["trace_peak", "peak"]):
+            score -= 0.04
+        return score
 
     def postprocess_prediction_json_multi(
         self,
@@ -502,58 +493,6 @@ class MarketAdapter(DatasetAdapter):
             return "pod"
         return ""
 
-    def _level_reason_factor(self, *, component: str, reason: str) -> float:
-        expected = self._expected_level_for_reason(reason)
-        if not expected:
-            return 1.0
-        level = _market_component_level(component)
-        if expected == level:
-            return 1.18
-        if expected == "pod" and level == "service":
-            return 0.82
-        return 0.36
-
-    def _reason_metric_bonus(self, *, component: str, reason: str, top_metrics: Mapping[str, Any]) -> float:
-        metrics = [str(x).lower() for x in list(top_metrics.get(component, []) or [])]
-        if not metrics:
-            fam = _market_semantic_family(component)
-            for comp, vals in dict(top_metrics or {}).items():
-                if _market_semantic_family(str(comp)) == fam:
-                    metrics.extend([str(x).lower() for x in list(vals or [])])
-        if not metrics:
-            return 0.0
-        text = " ".join(metrics)
-        reason_l = str(reason or "").lower()
-        family_bonus = 0.0
-        if "read" in reason_l and any(tok in text for tok in ["fs_reads", "read_io", "read_i/o", "reads_mb", "reads."]):
-            family_bonus = max(family_bonus, 0.65)
-        if "write" in reason_l and any(tok in text for tok in ["fs_writes", "write_io", "write_i/o", "writes_mb", "writes."]):
-            family_bonus = max(family_bonus, 0.65)
-        if "cpu" in reason_l and any(tok in text for tok in ["cpu_", "cpu.", "cpu_usage", "throttled"]):
-            family_bonus = max(family_bonus, 0.38)
-        if "memory" in reason_l and any(tok in text for tok in ["memory", "mem_", "rss", "pgfault", "working_set"]):
-            family_bonus = max(family_bonus, 0.26)
-        if "latency" in reason_l and any(tok in text for tok in ["latency", "mrt", "duration", "rtt"]):
-            family_bonus = max(family_bonus, 0.48)
-        if any(tok in reason_l for tok in ["network", "packet", "retransmission", "corruption", "loss"]) and any(
-            tok in text for tok in ["network", "retrans", "corrupt", "drop", "packet"]
-        ):
-            family_bonus = max(family_bonus, 0.45)
-        if "process termination" in reason_l and any(tok in text for tok in ["restart", "terminated", "exit", "kill"]):
-            family_bonus = max(family_bonus, 0.55)
-        tokens = self._reason_tokens(reason)
-        if not tokens:
-            return family_bonus
-        hits = sum(1 for tok in tokens if tok and tok.lower() in text)
-        token_bonus = min(0.35, 0.08 * hits)
-        return max(family_bonus, token_bonus)
-
-    def _reason_tokens(self, reason: str) -> List[str]:
-        item = self._reason_taxonomy().get(str(reason or ""))
-        if isinstance(item, Mapping):
-            return [str(x) for x in list(item.get("tokens", []) or [])]
-        return re.findall(r"[a-zA-Z]+", str(reason or "").lower())
-
     def _component_prior(self, component: str) -> float:
         c = str(component or "").lower()
         if not c:
@@ -563,22 +502,6 @@ class MarketAdapter(DatasetAdapter):
         if any(tok in c for tok in ["jaeger", "collector", "loadgenerator"]):
             return 0.45
         return 1.0
-
-    def _diverse_rerank(self, candidates: Sequence[Any]) -> List[Any]:
-        out: List[Any] = []
-        deferred: List[Any] = []
-        used: set[Tuple[str, str]] = set()
-        for cand in list(candidates or []):
-            fam = _market_semantic_family(str(getattr(cand, "component", "") or ""))
-            reason = str(getattr(cand, "reason", "") or "")
-            key = (fam, reason)
-            if key in used:
-                deferred.append(cand)
-                continue
-            out.append(cand)
-            used.add(key)
-        out.extend(deferred)
-        return out
 
     def _filter_times_to_query_window(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         starts: List[int] = []

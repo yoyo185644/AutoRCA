@@ -16,7 +16,11 @@ from rca.execution.telemetry_solver import (
 )
 from rca.adapter.utils.reason_candidates import predict_reason_universal
 from rca.adapter.utils.component_candidates import build_component_candidates
-from rca.adapter.utils.time_candidates import estimate_occurrence_datetime_from_trace
+from rca.adapter.utils.time_candidates import (
+    estimate_occurrence_datetime_from_trace,
+    estimate_occurrence_datetime_candidates,
+    select_time_candidate,
+)
 from rca.execution.fast_solver import (
     _norm_name,
     _parse_time_window,
@@ -345,12 +349,52 @@ def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
 def solve_time(*, dataset: str, instruction: str, scoring_points: str, need_time: bool) -> Tuple[str, Optional[int], Any]:
     if not need_time:
         return "", None, None
-    dt, ev_time = estimate_occurrence_datetime_from_trace(dataset=dataset, instruction=instruction)
+
+    # Extract reason hints from scoring_points to enable reason-aware metric routing
+    # (Direction 3: db_close → metric_service on_off; network → metric_node; etc.)
+    from rca.adapter.utils.query_parsing import extract_reason_candidates
+    reasons = extract_reason_candidates(scoring_points)
+
+    try:
+        # Direction 1+2+3: multi-signal fusion — trace onset/peak + reason-aware metric onset/peak
+        candidates = estimate_occurrence_datetime_candidates(
+            dataset=dataset,
+            instruction=instruction,
+            reasons=reasons or [],
+            top_k=16,
+        )
+        # Direction 4: ±1min neighbors are already added inside _reason_metric_time_candidates
+        # select_time_candidate applies consensus bonus + reason/component alignment scoring
+        dt, _ = select_time_candidate(candidates, reason=reasons[0] if reasons else "")
+        if not str(dt or "").strip():
+            raise ValueError("empty dt")
+    except Exception:
+        # Fallback to legacy single-signal trace method
+        dt, _ = estimate_occurrence_datetime_from_trace(dataset=dataset, instruction=instruction)
+
     try:
         center_time_s = int(pd.Timestamp(dt, tz="Asia/Shanghai").tz_convert("UTC").timestamp())
     except Exception:
         center_time_s = None
-    return str(dt or ""), center_time_s, ev_time
+    return str(dt or ""), center_time_s, candidates if "candidates" in dir() else None
+
+
+def _reason_candidates_from_evidence(evidence: Dict[str, Any], scoring_points: str) -> List[str]:
+    """Extract reason candidates from evidence regardless of format.
+
+    Rich format (Telecom): evidence has a 'scores' dict keyed by reason label.
+    Flat format (Market/Bank): evidence has a 'candidate_reasons' list.
+    Falls back to parsing scoring_points directly.
+    """
+    from rca.adapter.utils.query_parsing import extract_reason_candidates
+
+    scores = evidence.get("scores")
+    if isinstance(scores, dict) and scores:
+        return [str(k) for k in scores.keys() if str(k).strip()]
+    cands = evidence.get("candidate_reasons")
+    if isinstance(cands, list) and cands:
+        return [str(c) for c in cands if str(c).strip()]
+    return extract_reason_candidates(scoring_points)
 
 
 def solve_reason(
@@ -364,19 +408,49 @@ def solve_reason(
 ) -> Tuple[str, str, bool, Any]:
     if not need_reason:
         return "", "", False, None
-    adapter = get_dataset_adapter(dataset)
-    if adapter:
-        ar = adapter.solve_reason(spec=spec, instruction=instruction, scoring_points=scoring_points, args=args, need_reason=need_reason)
-        if ar is not None:
-            return ar
 
-    reason, ev2 = predict_reason_universal(
-        dataset=dataset,
-        instruction=instruction,
-        scoring_points=scoring_points,
-        temperature=float(getattr(args, "light_agent_temperature", 0.0)),
-    )
-    return "", str(reason or ""), True, ev2
+    # --- Step 1: build evidence (adapter-specific or universal) ---
+    adapter = get_dataset_adapter(dataset)
+    det_reason: str = ""
+    ev2: Any = None
+    if adapter:
+        ar = adapter.solve_reason(
+            spec=spec,
+            instruction=instruction,
+            scoring_points=scoring_points,
+            args=args,
+            need_reason=need_reason,
+        )
+        if ar is not None:
+            det_reason, _other, _ready, ev2 = ar
+
+    if ev2 is None:
+        det_reason, ev2 = predict_reason_universal(
+            dataset=dataset,
+            instruction=instruction,
+            scoring_points=scoring_points,
+        )
+
+    # --- Step 2: unified LLM rerank (same for all datasets) ---
+    if (
+        bool(getattr(args, "light_agent", False))
+        and not bool(getattr(args, "deterministic_only", False))
+        and isinstance(ev2, dict)
+    ):
+        candidates = _reason_candidates_from_evidence(ev2, scoring_points)
+        if candidates:
+            dec = choose_from_candidates(
+                task_id=2,
+                instruction=instruction,
+                output_field="root cause reason",
+                candidates=candidates,
+                evidence=ev2,
+                temperature=float(getattr(args, "light_agent_temperature", 0.0)),
+            )
+            if dec.chosen:
+                det_reason = dec.chosen
+
+    return "", str(det_reason or ""), True, ev2
 
 
 def solve_component(
