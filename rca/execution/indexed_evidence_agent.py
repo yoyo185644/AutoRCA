@@ -676,16 +676,35 @@ def _safe_prediction_to_tuples_constrained(
     return selected[:limit] or deterministic
 
 
-def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool, int, List[str]]:
+def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool, int, List[str], Dict[str, int]]:
     llm_called = False
     input_tokens = 0
     reasons: List[str] = []
+    stats = {
+        "llm_verify_count": 0,
+        "llm_changed_count": 0,
+        "llm_veto_count": 0,
+        "llm_adopted_count": 0,
+    }
     for step in trajectory or []:
         if not isinstance(step, Mapping):
             continue
         action = str(step.get("action") or "")
         if action in {"llm_verify_topk", "llm_verify_topk_failed", "llm_verify_candidate", "llm_verify_candidate_failed"}:
             llm_called = True
+        if action == "llm_verify_candidate":
+            stats["llm_verify_count"] += 1
+            output = step.get("output")
+            changed = False
+            if isinstance(output, Mapping):
+                try:
+                    changed = bool(output.get("change_from_top1", False)) or int(output.get("selected_id", 1) or 1) != 1
+                except Exception:
+                    changed = bool(output.get("change_from_top1", False))
+            if changed:
+                stats["llm_changed_count"] += 1
+        if action == "llm_veto":
+            stats["llm_veto_count"] += 1
         if action == "uncertainty_gate":
             output = step.get("output")
             if isinstance(output, Mapping):
@@ -696,7 +715,109 @@ def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool,
         time_selection = step.get("time_selection")
         if isinstance(time_selection, Mapping):
             input_tokens += int(time_selection.get("approx_input_tokens", 0) or 0)
-    return bool(llm_called), int(input_tokens), _unique(reasons)
+    stats["llm_adopted_count"] = max(0, int(stats["llm_changed_count"]) - int(stats["llm_veto_count"]))
+    return bool(llm_called), int(input_tokens), _unique(reasons), stats
+
+
+def _candidate_evidence_profile(item: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[str, Any]:
+    comp = str(item.get("component", "") or "").strip()
+    reason = str(item.get("reason", "") or "").strip()
+    dt = str(item.get("datetime", "") or "").strip()
+    evidence = item.get("evidence", {}) if isinstance(item.get("evidence", {}), Mapping) else {}
+    source_blob = " ".join(
+        [
+            str(item.get("source", "") or ""),
+            " ".join(str(x) for x in list(item.get("supporting_metrics", []) or [])),
+            " ".join(str(x) for x in list(item.get("evidence", []) or []) if not isinstance(item.get("evidence", []), Mapping)),
+            " ".join(str(x) for x in list(evidence.get("merged_sources", []) or [])),
+            " ".join(str(x) for x in list((context or {}).get("top_metrics", {}).get(comp, []) or [])),
+        ]
+    ).lower()
+    has_metric = bool(
+        list(item.get("supporting_metrics", []) or [])
+        or list((context or {}).get("top_metrics", {}).get(comp, []) or [])
+        or any(tok in source_blob for tok in ("metric", "cpu", "memory", "disk", "network", "latency", "io", "breach", "peak"))
+    )
+    has_trace = any(tok in source_blob for tok in ("trace", "span", "topology", "causal", "p95", "duration"))
+    has_log = any(tok in source_blob for tok in ("log", "event", "error", "exception"))
+    has_time = bool(dt)
+    evidence_strength = int(has_metric) + int(has_trace) + int(has_log)
+    if has_time:
+        evidence_strength += 1
+    return {
+        "component": comp,
+        "component_family": _candidate_component_family(comp),
+        "reason": reason,
+        "time_cluster": _candidate_time_cluster(dt),
+        "has_metric": bool(has_metric),
+        "has_trace": bool(has_trace),
+        "has_log": bool(has_log),
+        "has_time": bool(has_time),
+        "evidence_strength": int(evidence_strength),
+        "sufficient": bool(evidence_strength >= 2 or (has_metric and has_time)),
+    }
+
+
+def _evidence_conflict_for_llm(
+    top1: Mapping[str, Any],
+    challengers: Sequence[Mapping[str, Any]],
+    context: Mapping[str, Any],
+    *,
+    need_time: bool,
+    need_comp: bool,
+    need_reason: bool,
+) -> Dict[str, Any]:
+    top1_profile = _candidate_evidence_profile(top1, context)
+    checked: List[Dict[str, Any]] = []
+    if not bool(top1_profile.get("sufficient")):
+        return {
+            "has_conflict": False,
+            "reason": "top1_lacks_sufficient_real_evidence",
+            "top1_profile": top1_profile,
+            "challenger_profile": {},
+            "checked_challengers": checked,
+        }
+
+    for raw in challengers:
+        if not isinstance(raw, Mapping):
+            continue
+        prof = _candidate_evidence_profile(raw, context)
+        checked.append(prof)
+        if not bool(prof.get("sufficient")):
+            continue
+        conflicts: List[str] = []
+        if bool(need_comp) and str(prof.get("component_family", "")) != str(top1_profile.get("component_family", "")):
+            conflicts.append("component_family")
+        if bool(need_reason) and str(prof.get("reason", "")) != str(top1_profile.get("reason", "")):
+            conflicts.append("reason")
+        if bool(need_time) and str(prof.get("time_cluster", "")) != str(top1_profile.get("time_cluster", "")):
+            conflicts.append("time_cluster")
+        if bool(top1_profile.get("has_trace")) and bool(prof.get("has_metric")) and not bool(top1_profile.get("has_metric")):
+            conflicts.append("trace_vs_metric")
+        if bool(top1_profile.get("has_metric")) and bool(prof.get("has_trace")) and not bool(prof.get("has_metric")):
+            conflicts.append("metric_vs_trace")
+        if conflicts:
+            return {
+                "has_conflict": True,
+                "reason": "evidence_supported_challenger_conflicts_with_top1",
+                "conflict_dimensions": list(dict.fromkeys(conflicts)),
+                "top1_profile": top1_profile,
+                "challenger_profile": prof,
+                "challenger_key": {
+                    "component": str(raw.get("component", "") or ""),
+                    "reason": str(raw.get("reason", "") or ""),
+                    "datetime": str(raw.get("datetime", "") or ""),
+                },
+                "checked_challengers": checked[:5],
+            }
+
+    return {
+        "has_conflict": False,
+        "reason": "no_evidence_supported_conflicting_challenger",
+        "top1_profile": top1_profile,
+        "challenger_profile": {},
+        "checked_challengers": checked[:5],
+    }
 
 
 def _uncertainty_gate_for_tuples(items: Sequence[Mapping[str, Any]], context: Mapping[str, Any]) -> Dict[str, Any]:
@@ -786,6 +907,24 @@ def _uncertainty_gate_for_tuples(items: Sequence[Mapping[str, Any]], context: Ma
             need_llm = False
             reasons.append("skip_llm_due_to_low_candidate_diversity")
 
+    evidence_conflict = _evidence_conflict_for_llm(
+        top1,
+        unique_items[1: min(len(unique_items), 8)],
+        context,
+        need_time=bool(need_time),
+        need_comp=bool(need_comp),
+        need_reason=bool(need_reason),
+    )
+    has_evidence_conflict = bool(evidence_conflict.get("has_conflict", False))
+    if need_llm and not has_evidence_conflict:
+        need_llm = False
+        reasons.append(f"skip_llm_no_evidence_conflict:{evidence_conflict.get('reason', '')}")
+    elif (not need_llm) and has_evidence_conflict and len(unique_items) >= 2 and gap < max(gap_th, skip_gap_th):
+        need_llm = True
+        reasons.append("call_llm_due_to_evidence_conflict")
+    if has_evidence_conflict:
+        context["llm_challenger_candidate_keys"] = [dict(evidence_conflict.get("challenger_key", {}) or {})]
+
     return {
         "need_llm": bool(need_llm),
         "reasons": list(dict.fromkeys(reasons)),
@@ -798,6 +937,7 @@ def _uncertainty_gate_for_tuples(items: Sequence[Mapping[str, Any]], context: Ma
         "skip_gap_threshold": float(skip_gap_th),
         "unique_required_candidate_count": int(len(unique_items)),
         "candidate_diversity": dict(diversity),
+        "evidence_conflict": dict(evidence_conflict),
     }
 
 
@@ -1787,7 +1927,8 @@ class IndexedEvidenceAgentRunner:
                 prediction=str(exc),
             )
         elapsed = float(time.perf_counter() - t0)
-        llm_called, input_tokens, reasons = _collect_agent_stats(trajectory)
+        llm_called, input_tokens, reasons, llm_stats = _collect_agent_stats(trajectory)
+        pool_diagnostics.update(dict(llm_stats or {}))
         adapter = get_dataset_adapter(str(dataset or ""))
         selected = _safe_prediction_to_tuples_constrained(
             prediction,

@@ -38,6 +38,8 @@ def _top_metric_events(rows: List[Dict[str, Any]], *, limit: int = 5) -> List[Di
             {
                 "minute": str(row.get("minute", "") or ""),
                 "metric": str(row.get("metric", "") or ""),
+                "value": row.get("value", ""),
+                "baseline": row.get("baseline", ""),
                 "ratio": round(float(ratio), 3),
                 "first_breach": bool(row.get("is_first_breach", False)),
             }
@@ -56,6 +58,7 @@ def _top_trace_events(rows: List[Dict[str, Any]], *, limit: int = 3) -> List[Dic
                 "minute": str(row.get("minute", "") or ""),
                 "ratio": round(_safe_float(row.get("ratio", 0.0), 0.0), 3),
                 "p95": row.get("p95", ""),
+                "baseline": row.get("baseline", ""),
             }
         )
     events.sort(key=lambda x: _safe_float(x.get("ratio", 0.0)), reverse=True)
@@ -210,22 +213,24 @@ class CounterfactualExecutor:
             candidate_payload.append(compact_ev)
 
         uncertainty = dict(context.get("uncertainty_gate", {}) or {})
+        evidence_conflict = dict(uncertainty.get("evidence_conflict", {}) or {})
         min_conf = _safe_float(context.get("llm_change_min_confidence", 0.85), 0.85)
         max_drop = _safe_float(context.get("llm_max_score_drop_vs_det_top1", 0.05), 0.05)
 
         system_prompt = """
 You are an RCA evidence judge. Your job is bounded reranking, not open-ended RCA.
 
+You are called only when BASIL finds an evidence-supported conflict between deterministic top-1 and at least one challenger.
+Your job is to resolve that conflict using the provided evidence, not to re-score all candidates mechanically.
+
 Rules:
 1. Choose exactly one candidate id from the provided list. Do not invent a new component, reason, or datetime.
-2. Candidate #1 is the deterministic BASIL top-1. Keep #1 unless another candidate has direct evidence that is clearly stronger.
-3. To change away from #1, all must hold:
-   - candidate score is close to #1;
-   - component type and reason are compatible;
-   - metric evidence directly supports the reason;
-   - confidence is high.
-4. Penalize candidates that look downstream/symptomatic, have no metric evidence, or whose reason does not match metrics.
-5. Do not choose a common reason such as CPU fault unless the metric evidence explicitly supports it.
+2. Candidate #1 is the deterministic BASIL top-1, but it is only a prior, not a final answer.
+3. Focus on the conflict dimensions reported by BASIL, such as component_family, reason, time_cluster, trace_vs_metric, or metric_vs_trace.
+4. Prefer candidates with direct component-specific metric evidence: value vs baseline, high ratio, first_breach, and reason-compatible metrics.
+5. Penalize candidates that look downstream/symptomatic: strong trace/global symptom but weak component-specific metric support.
+6. Do not choose a common reason such as CPU fault unless metric names and values explicitly support CPU.
+7. Change away from #1 only when the challenger has stronger direct evidence on the conflict dimension.
 
 Output strictly in JSON:
 {
@@ -233,7 +238,8 @@ Output strictly in JSON:
   "confidence": 0.0,
   "change_from_top1": false,
   "rationale": "one sentence",
-  "decisive_evidence": "specific evidence item that decided the choice",
+  "conflict_resolution": "how you resolved the top1-vs-challenger evidence conflict",
+  "decisive_evidence": "specific value/baseline/ratio/first_breach/trace evidence that decided the choice",
   "rejected_candidates": [
     {"id": 2, "reason": "short evidence-based rejection"}
   ]
@@ -249,6 +255,9 @@ RCA query:
 Uncertainty gate summary:
 {json.dumps(uncertainty, ensure_ascii=False)}
 
+Evidence conflict to resolve:
+{json.dumps(evidence_conflict, ensure_ascii=False, indent=2)}
+
 Adoption policy:
 - If selected_id is not 1, confidence should be >= {min_conf:.2f}.
 - If selected candidate score is lower than candidate #1 by more than {max_drop:.3f}, keep candidate #1.
@@ -260,7 +269,7 @@ Candidate evidence table:
 {json.dumps(candidate_payload, ensure_ascii=False, indent=2)}
 
 Choose the most likely root-cause candidate tuple from the candidate list only.
-Prefer direct component-specific metric evidence over global symptoms.
+Resolve the reported evidence conflict. Prefer direct component-specific metric evidence over global symptoms. Use concrete value/baseline/ratio fields, first_breach markers, and trace p95 evidence rather than scores alone.
 """
 
         raw = self._chat(system_prompt, user_prompt)
@@ -285,6 +294,7 @@ Prefer direct component-specific metric evidence over global symptoms.
             "selected_candidate": selected.to_dict(),
             "confidence": normalize_score(data.get("confidence", selected.score)),
             "rationale": str(data.get("rationale", "")).strip(),
+            "conflict_resolution": str(data.get("conflict_resolution", "") or "").strip(),
             "change_from_top1": bool(data.get("change_from_top1", selected_id != 1)),
             "decisive_evidence": str(data.get("decisive_evidence", "") or "").strip(),
             "rejected_candidates": ensure_list(data.get("rejected_candidates")),

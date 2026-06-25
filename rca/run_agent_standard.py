@@ -39,6 +39,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", type=str, default="Telecom")
     p.add_argument("--difficulty", type=str, default="")
     p.add_argument("--task_ids", type=str, default="")
+    p.add_argument("--row_ids", type=str, default="")
     p.add_argument("--start_idx", type=int, default=0)
     p.add_argument("--end_idx", type=int, default=999999)
     p.add_argument("--sample_num", type=int, default=1)
@@ -165,6 +166,22 @@ def _parse_task_ids(spec: str) -> Optional[set[int]]:
     return out if out else None
 
 
+def _parse_row_ids(spec: str) -> Optional[set[int]]:
+    s = str(spec or "").strip()
+    if not s:
+        return None
+    out: set[int] = set()
+    for part in s.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except Exception:
+            continue
+    return out if out else None
+
+
 def _extract_timing_breakdown(trajectory: Any) -> Dict[str, Any]:
     if not isinstance(trajectory, list):
         return {}
@@ -193,6 +210,7 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     start_idx = int(getattr(args_obj, "start_idx", 0) if getattr(args_obj, "start_idx", None) is not None else 0)
     end_idx = int(getattr(args_obj, "end_idx", 999999) if getattr(args_obj, "end_idx", None) is not None else 999999)
     selected_task_ids = _parse_task_ids(getattr(args_obj, "task_ids", ""))
+    selected_row_ids = _parse_row_ids(getattr(args_obj, "row_ids", ""))
 
     out_dir = f"test/result/{dataset}"
     os.makedirs(out_dir, exist_ok=True)
@@ -220,6 +238,12 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         "basil_index_query_seconds",
         "basil_index_total_seconds",
         "agent_call_seconds",
+        "llm_input_tokens",
+        "llm_gate_called",
+        "llm_verify_count",
+        "llm_changed_count",
+        "llm_veto_count",
+        "llm_adopted_count",
         "postprocess_seconds",
         "setup_seconds",
         "component_candidate_seconds",
@@ -242,6 +266,8 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     t0 = time.perf_counter()
     for _, r in df.iterrows():
         row_id = int(r["row_id"])
+        if selected_row_ids is not None and row_id not in selected_row_ids:
+            continue
         if row_id < start_idx or row_id > end_idx:
             continue
 
@@ -345,6 +371,12 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
             "basil_index_query_seconds": float(basil_index_query_seconds),
             "basil_index_total_seconds": float(basil_index_total_seconds),
             "agent_call_seconds": float(timing.get("agent_call_seconds", 0.0) or 0.0),
+            "llm_input_tokens": int(timing.get("llm_input_tokens", 0) or 0),
+            "llm_gate_called": bool(timing.get("llm_gate_called", False)),
+            "llm_verify_count": int(timing.get("llm_verify_count", 0) or 0),
+            "llm_changed_count": int(timing.get("llm_changed_count", 0) or 0),
+            "llm_veto_count": int(timing.get("llm_veto_count", 0) or 0),
+            "llm_adopted_count": int(timing.get("llm_adopted_count", 0) or 0),
             "postprocess_seconds": float(timing.get("postprocess_seconds", 0.0) or 0.0),
             "setup_seconds": float(timing.get("setup_seconds", 0.0) or 0.0),
             "component_candidate_seconds": float(timing.get("component_candidate_seconds", 0.0) or 0.0),

@@ -14,6 +14,111 @@ class CounterfactualController:
         self.logger = logger
 
     @staticmethod
+    def _field_level_adopt_candidate(
+        *,
+        deterministic: CandidateHypothesis,
+        proposed: CandidateHypothesis,
+        llm_details: Mapping[str, Any],
+        context: Mapping[str, Any],
+        adapter_ok: bool,
+        min_conf: float,
+        max_drop: float,
+        det_score: float,
+        prop_score: float,
+        need_comp: bool,
+        need_reason: bool,
+        need_time: bool,
+    ) -> tuple[CandidateHypothesis, Dict[str, Any]]:
+        conf = float(llm_details.get("confidence", 0.0) or 0.0)
+        score_drop = max(0.0, float(det_score) - float(prop_score))
+        evidence_conflict = dict((context or {}).get("uncertainty_gate", {}).get("evidence_conflict", {}) or {})
+        challenger_profile = dict(evidence_conflict.get("challenger_profile", {}) or {})
+        conflict_dims = {str(x) for x in list(evidence_conflict.get("conflict_dimensions") or []) if str(x).strip()}
+        challenger_sufficient = bool(challenger_profile.get("sufficient", False))
+        challenger_strength = int(challenger_profile.get("evidence_strength", 0) or 0)
+
+        def _same(field: str) -> bool:
+            return str(getattr(deterministic, field, "") or "") == str(getattr(proposed, field, "") or "")
+
+        def _proposed_matches_challenger(field: str) -> bool:
+            if field == "datetime":
+                return bool(str(getattr(proposed, "datetime", "") or "")) and str(getattr(proposed, "datetime", "") or "") == str(challenger_profile.get("time_cluster", "") or "")
+            key = "reason" if field == "reason" else "component"
+            return bool(str(challenger_profile.get(key, "") or "")) and str(getattr(proposed, field, "") or "") == str(challenger_profile.get(key, "") or "")
+
+        def _allow_field(field: str) -> tuple[bool, str]:
+            if _same(field):
+                return False, "unchanged"
+            if conf < max(0.65, min_conf - 0.15):
+                return False, "llm_confidence_too_low"
+            if score_drop > max_drop and not challenger_sufficient:
+                return False, "score_drop_without_sufficient_challenger"
+            if field in {"component", "reason"} and not adapter_ok:
+                return False, "adapter_rejected_component_reason_pair"
+            if field == "component":
+                if ({"component_family", "metric_vs_trace", "trace_vs_metric"} & conflict_dims) or _proposed_matches_challenger("component"):
+                    return bool(challenger_sufficient and challenger_strength >= 2), "component_conflict_evidence"
+                return False, "no_component_field_conflict"
+            if field == "reason":
+                if ("reason" in conflict_dims) or _proposed_matches_challenger("reason"):
+                    return bool(challenger_sufficient and challenger_strength >= 2), "reason_conflict_evidence"
+                return False, "no_reason_field_conflict"
+            if field == "datetime":
+                if {"time_cluster", "metric_vs_trace", "trace_vs_metric"} & conflict_dims:
+                    return bool(challenger_sufficient and challenger_strength >= 2), "time_conflict_evidence"
+                if score_drop <= max_drop and conf >= min_conf:
+                    return True, "high_confidence_low_score_drop_time_change"
+                return False, "no_time_field_conflict"
+            return False, "unknown_field"
+
+        component = str(getattr(deterministic, "component", "") or "")
+        reason = str(getattr(deterministic, "reason", "") or "")
+        datetime_s = str(getattr(deterministic, "datetime", "") or "")
+        adopted_fields: List[str] = []
+        rejected_fields: Dict[str, str] = {}
+
+        if need_comp:
+            ok, why = _allow_field("component")
+            if ok:
+                component = str(getattr(proposed, "component", "") or component)
+                adopted_fields.append("component")
+            elif why != "unchanged":
+                rejected_fields["component"] = why
+        if need_reason:
+            ok, why = _allow_field("reason")
+            if ok:
+                reason = str(getattr(proposed, "reason", "") or reason)
+                adopted_fields.append("reason")
+            elif why != "unchanged":
+                rejected_fields["reason"] = why
+        if need_time:
+            ok, why = _allow_field("datetime")
+            if ok:
+                datetime_s = str(getattr(proposed, "datetime", "") or datetime_s)
+                adopted_fields.append("datetime")
+            elif why != "unchanged":
+                rejected_fields["datetime"] = why
+
+        merged = CandidateHypothesis(
+            component=component,
+            reason=reason,
+            datetime=datetime_s,
+            evidence=list(getattr(proposed, "evidence", []) or getattr(deterministic, "evidence", []) or []),
+            score=float(max(float(det_score), float(prop_score) if adopted_fields else float(det_score))),
+            source="llm_field_adoption" if adopted_fields else str(getattr(deterministic, "source", "") or "deterministic"),
+        )
+        details = {
+            "adopted_fields": adopted_fields,
+            "rejected_fields": rejected_fields,
+            "llm_confidence": float(conf),
+            "score_drop": float(score_drop),
+            "challenger_sufficient": bool(challenger_sufficient),
+            "challenger_evidence_strength": int(challenger_strength),
+            "conflict_dimensions": sorted(conflict_dims),
+        }
+        return merged, details
+
+    @staticmethod
     def _uncertainty_gate(*, candidates: List[CandidateHypothesis], context: Mapping[str, Any]) -> Dict[str, Any]:
         top1 = candidates[0] if candidates else None
         top2 = candidates[1] if len(candidates) > 1 else None
@@ -81,6 +186,45 @@ class CounterfactualController:
                 )
             )
         out.sort(key=lambda x: float(getattr(x, "score", 0.0) or 0.0), reverse=True)
+        challenger_keys = [x for x in list((context or {}).get("llm_challenger_candidate_keys") or []) if isinstance(x, Mapping)]
+        if out and challenger_keys:
+            top1 = out[0]
+
+            def matches_key(cand: CandidateHypothesis, key: Mapping[str, Any]) -> bool:
+                kc = str(key.get("component", "") or "").strip()
+                kr = str(key.get("reason", "") or "").strip()
+                kd = str(key.get("datetime", "") or "").strip()
+                if kc and str(getattr(cand, "component", "") or "") != kc:
+                    return False
+                if kr and str(getattr(cand, "reason", "") or "") != kr:
+                    return False
+                if kd and str(getattr(cand, "datetime", "") or "") != kd:
+                    return False
+                return True
+
+            selected: List[CandidateHypothesis] = [top1]
+            for key in challenger_keys:
+                for cand in out[1:]:
+                    if cand in selected:
+                        continue
+                    if matches_key(cand, key):
+                        selected.append(cand)
+                        break
+
+            def sig(cand: CandidateHypothesis) -> tuple[str, str, str]:
+                return (
+                    str(getattr(cand, "component", "") or ""),
+                    str(getattr(cand, "reason", "") or ""),
+                    str(getattr(cand, "datetime", "") or ""),
+                )
+
+            seen = {sig(x) for x in selected}
+            for cand in out:
+                if sig(cand) in seen:
+                    continue
+                selected.append(cand)
+                seen.add(sig(cand))
+            out = selected
         if out:
             return out
         top_k = int((context or {}).get("llm_verify_top_k", 3) or 3)
@@ -221,16 +365,30 @@ class CounterfactualController:
                             except Exception:
                                 adapter_ok = True
                                 adapter_veto_reason = ""
-                        if changed and ((not adapter_ok) or conf < min_conf or (det_score - prop_score) > max_drop):
+                        if changed:
+                            merged, field_details = self._field_level_adopt_candidate(
+                                deterministic=top,
+                                proposed=proposed,
+                                llm_details=llm_details,
+                                context=dict(context or {}),
+                                adapter_ok=bool(adapter_ok),
+                                min_conf=float(min_conf),
+                                max_drop=float(max_drop),
+                                det_score=float(det_score),
+                                prop_score=float(prop_score),
+                                need_comp=bool(need_comp),
+                                need_reason=bool(need_reason),
+                                need_time=bool(need_time),
+                            )
                             trajectory.append(
                                 {
                                     "step": 2,
-                                    "action": "llm_veto",
+                                    "action": "llm_field_adoption",
                                     "elapsed_seconds": 0.0,
                                     "output": {
+                                        **field_details,
                                         "min_confidence": float(min_conf),
                                         "max_score_drop_vs_det_top1": float(max_drop),
-                                        "llm_confidence": float(conf),
                                         "det_score": float(det_score),
                                         "llm_selected_score": float(prop_score),
                                         "adapter_consistency_ok": bool(adapter_ok),
@@ -238,8 +396,22 @@ class CounterfactualController:
                                     },
                                 }
                             )
-                        else:
-                            top = proposed
+                            if list(field_details.get("adopted_fields") or []):
+                                top = merged
+                            else:
+                                trajectory.append(
+                                    {
+                                        "step": 2,
+                                        "action": "llm_veto",
+                                        "elapsed_seconds": 0.0,
+                                        "output": {
+                                            **field_details,
+                                            "reason": "no_fields_adopted",
+                                            "adapter_consistency_ok": bool(adapter_ok),
+                                            "adapter_veto_reason": str(adapter_veto_reason or ""),
+                                        },
+                                    }
+                                )
                 except Exception as exc:
                     elapsed = float(time.perf_counter() - step_t0)
                     trajectory.append(

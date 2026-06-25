@@ -162,6 +162,10 @@ def _timing_step(
         "candidate_component_family_count",
         "candidate_time_cluster_count",
         "llm_max_prompt_candidates",
+        "llm_verify_count",
+        "llm_changed_count",
+        "llm_veto_count",
+        "llm_adopted_count",
         "needs_component",
         "needs_reason",
         "needs_time",
@@ -611,7 +615,7 @@ class FieldSolverStrategy:
             pred = _prediction_from_tuples(selected, task_id=int(spec.task_id), k=int(k_fail), adapter=adapter)
             pred = canonicalize_prediction(pred)
 
-            llm_called, input_tokens, _reasons = _collect_agent_stats(agent_traj)
+            llm_called, input_tokens, _reasons, llm_stats = _collect_agent_stats(agent_traj)
             total_seconds = float(time.perf_counter() - t_total)
             trajectory: List[Any] = []
             trajectory.extend(list(agent_traj or []))
@@ -628,6 +632,7 @@ class FieldSolverStrategy:
                     postprocess_seconds=0.0,
                     llm_input_tokens=int(input_tokens),
                     llm_called=bool(llm_called),
+                    candidate_pool_diagnostics=dict(llm_stats or {}),
                 )
             )
             prompt_items = list(prompt or []) if isinstance(prompt, list) else ([prompt] if str(prompt or "").strip() else [])
