@@ -1401,36 +1401,58 @@ class IndexedEvidenceAgentRunner:
             context["llm_change_min_confidence"] = float(getattr(args, "llm_change_min_confidence", 0.85) or 0.85)
             context["llm_max_score_drop_vs_det_top1"] = float(getattr(args, "llm_max_score_drop_vs_det_top1", 0.05) or 0.05)
 
-        # Inject structured per-reason evidence so the counterfactual agent can
-        # compare metric-level support across reason types instead of relying on
-        # BASIL scores alone.  This is the same evidence that the light-agent
-        # path uses via _format_reason_evidence in light_agent.py.
+        # Inject lightweight per-reason evidence from the BASIL index result.
+        # In indexed mode this must not call dataset solve_reason() fallbacks:
+        # those may re-scan raw telemetry and dominate latency.  Every dataset
+        # adapter can expose reason scores/metric hints through
+        # augment_index_reasons(); otherwise we fall back to component
+        # top_metrics already stored in the BASIL evidence result.
         if bool(need_reason):
             try:
-                from rca.execution.field_solvers import _reason_candidates_from_evidence
-                from rca.execution.light_agent import _format_reason_evidence
-                from rca.adapter.utils.reason_candidates import predict_reason_universal
-
-                dataset_name = str(getattr(result, "dataset", "") or "")
-                if adapter is not None:
-                    raw = adapter.solve_reason(
-                        spec=None,
-                        instruction=str(instruction or ""),
-                        scoring_points=str(scoring_points or ""),
-                        args=args,
-                        need_reason=True,
-                    )
-                    raw_ev = raw[3] if (raw is not None and len(raw) >= 4) else None
-                else:
-                    raw_ev = None
-                if raw_ev is None:
-                    _, raw_ev = predict_reason_universal(
-                        dataset=dataset_name,
-                        instruction=str(instruction or ""),
-                        scoring_points=str(scoring_points or ""),
-                    )
-                if isinstance(raw_ev, dict):
-                    context["reason_evidence"] = _format_reason_evidence(raw_ev)
+                reason_metrics: List[str] = []
+                for key, value in dict(adapter_context_overrides or {}).items():
+                    key_l = str(key).lower()
+                    if "reason" not in key_l and "metric" not in key_l:
+                        continue
+                    if isinstance(value, Mapping):
+                        for vv in value.values():
+                            if isinstance(vv, (list, tuple, set)):
+                                reason_metrics.extend(str(x) for x in vv if str(x).strip())
+                            elif isinstance(vv, str) and vv.strip():
+                                reason_metrics.append(str(vv))
+                    elif isinstance(value, (list, tuple, set)):
+                        reason_metrics.extend(str(x) for x in value if str(x).strip())
+                    elif isinstance(value, str) and value.strip():
+                        reason_metrics.append(str(value))
+                if not reason_metrics:
+                    for values in dict(top_metrics or {}).values():
+                        reason_metrics.extend(str(x) for x in list(values or []) if str(x).strip())
+                reason_metrics = list(dict.fromkeys(reason_metrics))
+                if adapter_reason_scores:
+                    per_reason: Dict[str, Any] = {}
+                    for reason, score in sorted(adapter_reason_scores.items(), key=lambda kv: float(kv[1] or 0.0), reverse=True):
+                        keywords: List[str] = []
+                        if adapter is not None:
+                            try:
+                                keywords = [str(x).lower() for x in list(adapter.reason_metric_keywords(str(reason)) or []) if str(x).strip()]
+                            except Exception:
+                                keywords = []
+                        matched = [
+                            m
+                            for m in reason_metrics
+                            if not keywords or any(k in str(m).lower() for k in keywords)
+                        ][:5]
+                        per_reason[str(reason)] = {
+                            "score": round(float(score or 0.0), 3),
+                            "top_metrics": matched,
+                            "breach_count": len(matched),
+                            "distinct_metrics": len(set(matched)),
+                            "source": "basil_index_top_metrics",
+                        }
+                    context["reason_evidence"] = {
+                        "per_reason_evidence": per_reason,
+                        "source": "basil_index_lightweight_no_raw_scan",
+                    }
             except Exception:
                 pass
         elif adapter is not None:
