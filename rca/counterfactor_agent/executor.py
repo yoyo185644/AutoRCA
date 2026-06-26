@@ -89,14 +89,14 @@ def _compact_candidate_evidence(ev: Dict[str, Any], *, candidate_id: int) -> Dic
         "datetime": str(ev.get("datetime", "") or ""),
         "score": round(_safe_float(ev.get("score", 0.0)), 4),
         "score_gap_vs_next": round(_safe_float(ev.get("score_gap_vs_next", 0.0)), 4),
-        "evidence_for": [str(x) for x in list(ev.get("evidence_for") or [])[:4]],
-        "evidence_against": [str(x) for x in list(ev.get("evidence_against") or [])[:3]],
-        "key_metric_events": _top_metric_events(list(ev.get("metric_timeline") or []), limit=5),
-        "key_trace_events": _top_trace_events(list(ev.get("trace_timeline") or []), limit=3),
+        "evidence_for": [str(x) for x in list(ev.get("evidence_for") or [])[:2]],
+        "evidence_against": [str(x) for x in list(ev.get("evidence_against") or [])[:2]],
+        "key_metric_events": _top_metric_events(list(ev.get("metric_timeline") or []), limit=3),
+        "key_trace_events": _top_trace_events(list(ev.get("trace_timeline") or []), limit=1),
         "causal_position": {
             "first_anomaly_among_candidates": bool(causal.get("first_anomaly_among_candidates", False)),
-            "upstream_of": [str(x) for x in list(causal.get("upstream_of") or [])[:4]],
-            "impacted_by": [str(x) for x in list(causal.get("impacted_by") or [])[:4]],
+            "upstream_of": [str(x) for x in list(causal.get("upstream_of") or [])[:2]],
+            "impacted_by": [str(x) for x in list(causal.get("impacted_by") or [])[:2]],
         },
     }
 
@@ -171,7 +171,7 @@ class CounterfactualExecutor:
         top_k: int = 3,
     ) -> Dict[str, Any]:
         context = context or {}
-        max_prompt_candidates = min(8, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
+        max_prompt_candidates = min(3, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
         top = list(candidates or [])[: max_prompt_candidates]
         if not top:
             raise ValueError("No candidates for LLM verification.")
@@ -209,7 +209,7 @@ class CounterfactualExecutor:
             compact_ev = _compact_candidate_evidence(ev, candidate_id=i)
             compact_ev["datetime"] = str(getattr(cand, "datetime", "") or compact_ev.get("datetime", "") or "")
             if list(getattr(cand, "evidence", []) or []):
-                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:4]]
+                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:2]]
             candidate_payload.append(compact_ev)
 
         uncertainty = dict(context.get("uncertainty_gate", {}) or {})
@@ -218,59 +218,42 @@ class CounterfactualExecutor:
         max_drop = _safe_float(context.get("llm_max_score_drop_vs_det_top1", 0.05), 0.05)
 
         system_prompt = """
-You are an RCA evidence judge. Your job is bounded reranking, not open-ended RCA.
+You are an RCA evidence judge. Do bounded reranking only.
+Do not invent components, reasons, timestamps, or evidence.
 
-You are called only when BASIL finds an evidence-supported conflict between deterministic top-1 and at least one challenger.
-Your job is to resolve that conflict using the provided evidence, not to re-score all candidates mechanically.
+Keep candidate #1 unless a challenger has clearly stronger real evidence.
+A challenger may replace #1 only when it has stronger component-local evidence,
+reason-compatible metrics/logs/traces, better before-after time evidence, or better
+propagation explanation. Reject challengers supported mainly by global/downstream symptoms,
+weak early onset, unsupported reason labels, or marginal score differences.
 
-Rules:
-1. Choose exactly one candidate id from the provided list. Do not invent a new component, reason, or datetime.
-2. Candidate #1 is the deterministic BASIL top-1, but it is only a prior, not a final answer.
-3. Focus on the conflict dimensions reported by BASIL, such as component_family, reason, time_cluster, trace_vs_metric, or metric_vs_trace.
-4. Prefer candidates with direct component-specific metric evidence: value vs baseline, high ratio, first_breach, and reason-compatible metrics.
-5. Penalize candidates that look downstream/symptomatic: strong trace/global symptom but weak component-specific metric support.
-6. Do not choose a common reason such as CPU fault unless metric names and values explicitly support CPU.
-7. Change away from #1 only when the challenger has stronger direct evidence on the conflict dimension.
-
-Output strictly in JSON:
-{
-  "selected_id": 1,
-  "confidence": 0.0,
-  "change_from_top1": false,
-  "rationale": "one sentence",
-  "conflict_resolution": "how you resolved the top1-vs-challenger evidence conflict",
-  "decisive_evidence": "specific value/baseline/ratio/first_breach/trace evidence that decided the choice",
-  "rejected_candidates": [
-    {"id": 2, "reason": "short evidence-based rejection"}
-  ]
-}
+Output JSON only:
+{"selected_id":1,"confidence":0.0,"change_from_top1":false,
+"rationale":"one sentence","decisive_evidence":"one concrete evidence item",
+"rejected_candidates":[{"id":2,"reason":"short reason"}]}
 """
 
-        user_prompt = f"""
-Dataset: {dataset_name}
-Task focus: {task_focus}
-RCA query:
-{instruction}
-
-Uncertainty gate summary:
-{json.dumps(uncertainty, ensure_ascii=False)}
-
-Evidence conflict to resolve:
-{json.dumps(evidence_conflict, ensure_ascii=False, indent=2)}
-
-Adoption policy:
-- If selected_id is not 1, confidence should be >= {min_conf:.2f}.
-- If selected candidate score is lower than candidate #1 by more than {max_drop:.3f}, keep candidate #1.
-
-Reason compatibility rules:
-{json.dumps(_reason_rules(dataset_name), ensure_ascii=False, indent=2)}
-
-Candidate evidence table:
-{json.dumps(candidate_payload, ensure_ascii=False, indent=2)}
-
-Choose the most likely root-cause candidate tuple from the candidate list only.
-Resolve the reported evidence conflict. Prefer direct component-specific metric evidence over global symptoms. Use concrete value/baseline/ratio fields, first_breach markers, and trace p95 evidence rather than scores alone.
-"""
+        concise_conflict = {
+            "reasons": ensure_list(uncertainty.get("reasons"))[:3],
+            "score_gap": uncertainty.get("score_gap"),
+            "conflict_dimensions": ensure_list(evidence_conflict.get("conflict_dimensions"))[:4],
+            "top1_profile": evidence_conflict.get("top1_profile", {}),
+            "challenger_profile": evidence_conflict.get("challenger_profile", {}),
+        }
+        incident_summary = {
+            "dataset": str(dataset_name or ""),
+            "task_focus": str(task_focus or "")[:240],
+            "query": str(instruction or "")[:420],
+            "adoption": {
+                "min_confidence_to_replace_top1": round(float(min_conf), 3),
+                "max_score_drop_to_replace_top1": round(float(max_drop), 4),
+            },
+            "conflict": concise_conflict,
+            "reason_rules": _reason_rules(dataset_name)[:2],
+            "deterministic_top": candidate_payload[0] if candidate_payload else {},
+            "challengers": candidate_payload[1:],
+        }
+        user_prompt = json.dumps(incident_summary, ensure_ascii=False, separators=(",", ":"))
 
         raw = self._chat(system_prompt, user_prompt)
         data = safe_json_loads(
