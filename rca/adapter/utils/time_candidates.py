@@ -637,50 +637,23 @@ def select_time_candidate(
     if not normalized:
         return str(fallback or ""), {}
 
-    comp = str(component or "").strip()
-    if comp:
-        comp_items = [c for c in normalized if str(c.component or "").strip() == comp and "component_metric" in str(c.source or "")]
-        stable_comp = [c for c in comp_items if bool((c.evidence or {}).get("stable")) and ("onset" in str(c.source) or "first_breach" in str(c.source))]
-        if stable_comp:
-            stable_comp = sorted(
-                stable_comp,
-                key=lambda c: (_dt_to_epoch_s(c.datetime) or 10**18, -float(c.score or 0.0)),
-            )
-            best = stable_comp[0]
-            best_s = _dt_to_epoch_s(best.datetime)
-            trace_pref = ["trace_first_breach", "trace_onset", "trace_stable_onset"]
-            trace_best = None
-            trace_best_s = None
-            for src in trace_pref:
-                items = [c for c in normalized if src in str(c.source or "")]
-                if not items:
-                    continue
-                items = sorted(items, key=lambda c: (_dt_to_epoch_s(c.datetime) or 10**18, -float(c.score or 0.0)))
-                trace_best = items[0]
-                trace_best_s = _dt_to_epoch_s(trace_best.datetime)
-                break
-            if best_s is not None and trace_best_s is not None and int(best_s) - int(trace_best_s) >= 180:
-                return trace_best.datetime, {
-                    "policy": "trace_overrides_late_component_metric",
-                    "selected": trace_best.to_dict(),
-                    "candidate_count": len(normalized),
-                    "component_metric": best.to_dict(),
-                }
-            return best.datetime, {"policy": "stable_component_metric", "selected": best.to_dict(), "candidate_count": len(normalized)}
-
-        trace_pref = ["trace_first_breach", "trace_onset", "trace_stable_onset"]
-        for src in trace_pref:
-            items = [c for c in normalized if src in str(c.source or "")]
-            if items:
-                items = sorted(items, key=lambda c: (_dt_to_epoch_s(c.datetime) or 10**18, -float(c.score or 0.0)))
-                best = items[0]
-                return best.datetime, {"policy": f"trace_prefer:{src}", "selected": best.to_dict(), "candidate_count": len(normalized)}
-
     times_s = [(c, _dt_to_epoch_s(c.datetime)) for c in normalized]
     scored: List[Tuple[float, TimeCandidate, Dict[str, Any]]] = []
     for cand, cand_s in times_s:
-        score = float(cand.score)
-        details = {"base_score": float(cand.score), "source": cand.source}
+        explain_score, explain_details = _time_explainability_score(
+            cand,
+            normalized,
+            component=str(component or ""),
+            reason=str(reason or ""),
+        )
+        score = 0.45 * float(cand.score) + 0.55 * float(explain_score)
+        details = {
+            "policy": "causal_change_point_explainability",
+            "base_score": float(cand.score),
+            "source": cand.source,
+            "explainability_score": float(explain_score),
+            "explainability": dict(explain_details),
+        }
         if component and (not str(cand.component or "").strip()) and "reason_metric" in str(cand.source or ""):
             score -= 0.22
             details["non_component_reason_metric_penalty"] = -0.22
