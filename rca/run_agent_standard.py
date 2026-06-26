@@ -279,7 +279,6 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
             continue
 
         instruction = str(r.get("instruction") or "")
-        scoring_points = str(r.get("scoring_points") or "")
 
         sample_t0 = time.perf_counter()
         solve_t0 = time.perf_counter()
@@ -291,7 +290,6 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
             dataset=dataset,
             idx=row_id,
             instruction=instruction,
-            scoring_points=scoring_points,
             task_focus=_task_focus(task_id),
             logger=logger,
             archive_df=None,
@@ -306,6 +304,7 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         timing = _extract_timing_breakdown(traj)
 
         eval_t0 = time.perf_counter()
+        scoring_points = str(r.get("scoring_points") or "")
         passed, failed, score = evaluate(pred, scoring_points)
         evaluate_seconds = float(time.perf_counter() - eval_t0)
         sample_seconds = float(time.perf_counter() - sample_t0)

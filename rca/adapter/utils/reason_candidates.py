@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import pandas as pd
 
 from rca.common.io import resolve_date_dir
-from rca.adapter.utils.query_parsing import extract_reason_candidates
 from rca.adapter.utils.component_candidates import parse_time_window_generic
 
 
@@ -146,7 +145,7 @@ def _keyword_hits(metrics: Sequence[str]) -> Dict[str, int]:
 def predict_reason_universal(
     dataset: str,
     instruction: str,
-    scoring_points: str,
+    adapter: Any = None,
 ) -> Tuple[str, Dict[str, Any]]:
     date_dir, start, end = parse_time_window_generic(instruction)
     date_dir = resolve_date_dir(dataset, date_dir)
@@ -158,7 +157,18 @@ def predict_reason_universal(
     top_metrics = _top_anomalous_metrics(metric_dir, start_s, end_s, top_k=30)
     hits = _keyword_hits(top_metrics)
     spread = _trace_spread_stats(trace_path, start_s, end_s)
-    cands = extract_reason_candidates(scoring_points)
+    cands: List[str] = []
+    if adapter is not None:
+        reason_taxonomy_fn = getattr(adapter, "basil_reason_taxonomy", None)
+        if callable(reason_taxonomy_fn):
+            try:
+                cands = [str(x) for x in reason_taxonomy_fn() if str(x).strip()]
+            except Exception:
+                cands = []
+        if not cands:
+            taxonomy = getattr(adapter, "config", {}).get("reason_taxonomy", {})
+            if isinstance(taxonomy, dict):
+                cands = [str(x) for x in taxonomy.keys() if str(x).strip()]
     evidence = {
         "dataset": dataset,
         "date_dir": date_dir,

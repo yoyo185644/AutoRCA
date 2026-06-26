@@ -79,7 +79,6 @@ class MarketAdapter(DatasetAdapter):
         *,
         spec: Any,
         instruction: str,
-        scoring_points: str,
         args: Any,
         need_reason: bool,
         **kwargs: Any,
@@ -212,14 +211,12 @@ class MarketAdapter(DatasetAdapter):
                 return str(label)
         return reason
 
-    def extract_reason_hints(self, *, scoring_points: str) -> List[str]:
-        hints: List[str] = []
+    def basil_reason_taxonomy(self) -> List[str]:
         taxonomy = self._reason_taxonomy()
-        text = str(scoring_points or "")
-        for label in taxonomy:
-            if norm_token(label) and norm_token(label) in norm_token(text):
-                hints.append(str(label))
-        return hints
+        return [str(x) for x in taxonomy.keys() if str(x).strip()]
+
+    def extract_reason_hints(self) -> List[str]:
+        return self.basil_reason_taxonomy()
 
     def coerce_closed_set_lists(self) -> bool:
         return True
@@ -288,28 +285,8 @@ class MarketAdapter(DatasetAdapter):
     def get_time_candidate_top_k(self, *, task_id: int, default_top_k: int) -> int:
         return max(int(default_top_k), 12)
 
-    def extract_component_level(self, *, scoring_points: str) -> str:
-        text = str(scoring_points or "")
-        levels: List[str] = []
-        for m in re.finditer(r"component:\s*([^\n\r]+)", text):
-            comp = self.parse_component_id(m.group(1).strip())
-            lv = _market_component_level(comp)
-            if lv and lv not in levels:
-                levels.append(lv)
-        for m in re.finditer(r"component\s+is\s+([^\n\r]+)", text, flags=re.IGNORECASE):
-            comp = self.parse_component_id(m.group(1).strip().strip(".。"))
-            lv = _market_component_level(comp)
-            if lv and lv not in levels:
-                levels.append(lv)
-        for m in re.finditer(r"level:\s*([a-zA-Z_-]+)", text):
-            lv = str(m.group(1) or "").strip().lower()
-            if lv == "container":
-                lv = "pod"
-            if lv and lv not in levels:
-                levels.append(lv)
-        if len(levels) > 1:
-            return "mixed"
-        return levels[0] if levels else ""
+    def extract_component_level(self) -> str:
+        return ""
 
     def basil_query_config_overrides(
         self,

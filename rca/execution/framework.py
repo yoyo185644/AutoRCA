@@ -12,7 +12,6 @@ class TaskSpec:
     dataset: str
     task_id: int
     instruction: str
-    scoring_points: str
     task_focus: str
     difficulty: Difficulty
 

@@ -94,6 +94,9 @@ class BankAdapter(DatasetAdapter):
             return "high memory usage"
         return c
 
+    def basil_reason_taxonomy(self) -> List[str]:
+        return list(_ALLOWED_REASONS)
+
     def component_semantic_type(self, component: str) -> str:
         c = self.parse_component_id(str(component or "")).lower()
         if c.startswith("mysql"):
@@ -241,7 +244,7 @@ class BankAdapter(DatasetAdapter):
         out["bank_time_count"] = int(len(time_set))
         return out
 
-    def extract_component_level(self, *, scoring_points: str) -> str:
+    def extract_component_level(self) -> str:
         return "pod"
 
     def canonicalize_component(self, *, component: str, component_level: str) -> str:

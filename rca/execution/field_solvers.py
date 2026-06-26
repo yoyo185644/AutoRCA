@@ -12,7 +12,6 @@ import pandas as pd
 from rca.execution.light_agent import choose_from_candidates
 from rca.execution.telemetry_solver import (
     estimate_k_occurrence_datetimes_from_trace,
-    extract_reasons_from_scoring_points,
 )
 from rca.adapter.utils.reason_candidates import predict_reason_universal
 from rca.adapter.utils.component_candidates import build_component_candidates
@@ -346,26 +345,21 @@ def infer_reason_with_evidence(instruction: str) -> Tuple[str, Dict[str, Any]]:
     return best_reason, evidence
 
 
-def solve_time(*, dataset: str, instruction: str, scoring_points: str, need_time: bool) -> Tuple[str, Optional[int], Any]:
+def solve_time(*, dataset: str, instruction: str, need_time: bool) -> Tuple[str, Optional[int], Any]:
     if not need_time:
         return "", None, None
-
-    # Extract reason hints from scoring_points to enable reason-aware metric routing
-    # (Direction 3: db_close → metric_service on_off; network → metric_node; etc.)
-    from rca.adapter.utils.query_parsing import extract_reason_candidates
-    reasons = extract_reason_candidates(scoring_points)
 
     try:
         # Direction 1+2+3: multi-signal fusion — trace onset/peak + reason-aware metric onset/peak
         candidates = estimate_occurrence_datetime_candidates(
             dataset=dataset,
             instruction=instruction,
-            reasons=reasons or [],
+            reasons=[],
             top_k=16,
         )
         # Direction 4: ±1min neighbors are already added inside _reason_metric_time_candidates
         # select_time_candidate applies consensus bonus + reason/component alignment scoring
-        dt, _ = select_time_candidate(candidates, reason=reasons[0] if reasons else "")
+        dt, _ = select_time_candidate(candidates, reason="")
         if not str(dt or "").strip():
             raise ValueError("empty dt")
     except Exception:
@@ -379,22 +373,19 @@ def solve_time(*, dataset: str, instruction: str, scoring_points: str, need_time
     return str(dt or ""), center_time_s, candidates if "candidates" in dir() else None
 
 
-def _reason_candidates_from_evidence(evidence: Dict[str, Any], scoring_points: str) -> List[str]:
+def _reason_candidates_from_evidence(evidence: Dict[str, Any]) -> List[str]:
     """Extract reason candidates from evidence regardless of format.
 
     Rich format (Telecom): evidence has a 'scores' dict keyed by reason label.
     Flat format (Market/Bank): evidence has a 'candidate_reasons' list.
-    Falls back to parsing scoring_points directly.
     """
-    from rca.adapter.utils.query_parsing import extract_reason_candidates
-
     scores = evidence.get("scores")
     if isinstance(scores, dict) and scores:
         return [str(k) for k in scores.keys() if str(k).strip()]
     cands = evidence.get("candidate_reasons")
     if isinstance(cands, list) and cands:
         return [str(c) for c in cands if str(c).strip()]
-    return extract_reason_candidates(scoring_points)
+    return []
 
 
 def solve_reason(
@@ -402,7 +393,6 @@ def solve_reason(
     spec: Any,
     dataset: str,
     instruction: str,
-    scoring_points: str,
     args: Any,
     need_reason: bool,
 ) -> Tuple[str, str, bool, Any]:
@@ -417,7 +407,6 @@ def solve_reason(
         ar = adapter.solve_reason(
             spec=spec,
             instruction=instruction,
-            scoring_points=scoring_points,
             args=args,
             need_reason=need_reason,
         )
@@ -428,7 +417,7 @@ def solve_reason(
         det_reason, ev2 = predict_reason_universal(
             dataset=dataset,
             instruction=instruction,
-            scoring_points=scoring_points,
+            adapter=adapter,
         )
 
     # --- Step 2: unified LLM rerank (same for all datasets) ---
@@ -437,7 +426,7 @@ def solve_reason(
         and not bool(getattr(args, "deterministic_only", False))
         and isinstance(ev2, dict)
     ):
-        candidates = _reason_candidates_from_evidence(ev2, scoring_points)
+        candidates = _reason_candidates_from_evidence(ev2)
         if candidates:
             dec = choose_from_candidates(
                 task_id=2,
@@ -580,9 +569,9 @@ def solve_component(
 
 def assemble_prediction(
     *,
+    spec: Any,
     dataset: str,
     instruction: str,
-    scoring_points: str,
     args: Any,
     need_time: bool,
     need_comp: bool,
@@ -629,7 +618,7 @@ def assemble_prediction(
                 center_time_s=ct_s,
                 use_basil=basil_enabled(args),
                 basil_config=basil_config_from_args(args, top_k, required_fields=getattr(spec, "required_fields", None), task_id=getattr(spec, "task_id", None)),
-                basil_reasons=extract_reasons_from_scoring_points(scoring_points) if need_reason else [],
+                basil_reasons=[x for x in [det_reason, det_reason_other] if str(x or "").strip()] if need_reason else [],
             )
             comp_i = ev3_i.top1
             if any(x.get("root cause component") == comp_i for x in roots):

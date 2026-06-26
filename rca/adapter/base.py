@@ -70,7 +70,6 @@ class DatasetAdapter:
         self,
         *,
         instruction: str,
-        scoring_points: str,
         need_time: bool,
         k_fail: int,
         **kwargs: Any,
@@ -81,7 +80,6 @@ class DatasetAdapter:
         self,
         *,
         instruction: str,
-        scoring_points: str,
         need_reason: bool,
         **kwargs: Any,
     ) -> Optional[ReasonSolveResult]:
@@ -92,7 +90,6 @@ class DatasetAdapter:
         *,
         spec: Any,
         instruction: str,
-        scoring_points: str,
         need_comp: bool,
         need_time: bool,
         need_reason: bool,
@@ -110,7 +107,6 @@ class DatasetAdapter:
         *,
         spec: Any,
         instruction: str,
-        scoring_points: str,
         need_time: bool,
         need_comp: bool,
         need_reason: bool,
@@ -188,7 +184,7 @@ class DatasetAdapter:
     ) -> str:
         return str(raw_reason).strip()
 
-    def extract_reason_hints(self, *, scoring_points: str) -> List[str]:
+    def extract_reason_hints(self) -> List[str]:
         return []
 
     def coerce_closed_set_lists(self) -> bool:
@@ -268,7 +264,7 @@ class DatasetAdapter:
     def supports_multi_root_joint_selection(self) -> bool:
         return False
 
-    def extract_component_level(self, *, scoring_points: str) -> str:
+    def extract_component_level(self) -> str:
         return ""
 
     def canonicalize_component(self, *, component: str, component_level: str) -> str:
@@ -423,100 +419,33 @@ class DatasetAdapter:
         clip: float = 4.0,
     ) -> Dict[str, float]:
         """
-        Derive component-type prior weights from dataset telemetry and labels.
+        Return per-type prior weights for candidate reranking.
 
-        lift(type) = P(root-cause is this type) / P(type exists in metric data)
-
-        Returns a dict mapping semantic type → multiplier (normalised to mean=1.0).
-        Falls back to an empty dict (all priors = 1.0) on any I/O error.
+        To prevent test-set leakage, the base implementation does not derive
+        priors from `query.csv` labels. Provide explicit priors via dataset
+        config key `component_type_priors` (mapping semantic type -> weight).
         """
-        from collections import Counter
-
-        import pandas as pd
-
-        # ── Step 1: RC type frequencies from scoring_points in query.csv ────
-        query_path = f"dataset/{self.dataset}/query.csv"
-        rc_counter: Counter[str] = Counter()
-        try:
-            df_q = pd.read_csv(query_path)
-            for sp in df_q.get("scoring_points", pd.Series(dtype=str)).dropna():
-                for m in self._COMP_RE.finditer(str(sp)):
-                    raw = m.group(1).strip(" .")
-                    ctype = self.component_semantic_type(self.parse_component_id(raw))
-                    if ctype:
-                        rc_counter[ctype] += 1
-        except Exception:
+        _ = (smoothing, min_rc_count, max_telemetry_files, clip)
+        cfg = self.config.get("component_type_priors", {})
+        if not isinstance(cfg, dict) or not cfg:
             return {}
-
-        if not rc_counter or sum(rc_counter.values()) < min_rc_count:
-            return {}
-
-        # ── Step 2: Base-rate from telemetry component column ────────────────
-        paths = dict(self.config.get("paths", {}) or {})
-        telemetry_root = str(
-            paths.get("telemetry_root", f"dataset/{self.dataset}/telemetry")
-        )
-        data_counter: Counter[str] = Counter()
-        file_count = 0
-        col_lower = {c.lower(): c for c in self._TELEMETRY_COMP_COLS}
-
-        if os.path.isdir(telemetry_root):
-            for dirpath, _dirs, names in os.walk(telemetry_root):
-                for name in sorted(names):
-                    if not name.lower().endswith((".csv", ".tsv")):
-                        continue
-                    if file_count >= max_telemetry_files:
-                        break
-                    path = os.path.join(dirpath, name)
-                    try:
-                        sep = "\t" if name.endswith(".tsv") else ","
-                        hdr = pd.read_csv(path, nrows=0, sep=sep)
-                        matched = [
-                            str(c)
-                            for c in hdr.columns
-                            if str(c).lower() in col_lower
-                        ]
-                        if not matched:
-                            continue
-                        df_t = pd.read_csv(
-                            path, usecols=[matched[0]], nrows=50_000, sep=sep
-                        )
-                        for val in df_t[matched[0]].dropna().unique():
-                            ctype = self.component_semantic_type(
-                                self.parse_component_id(str(val))
-                            )
-                            if ctype:
-                                data_counter[ctype] += 1
-                        file_count += 1
-                    except Exception:
-                        continue
-                if file_count >= max_telemetry_files:
-                    break
-
-        # ── Step 3: Compute lift and normalise ───────────────────────────────
-        all_types = set(rc_counter.keys()) | set(data_counter.keys())
-        n = len(all_types) or 1
-        total_rc = sum(rc_counter.values())
-        total_data = sum(data_counter.values()) or 1
-
         priors: Dict[str, float] = {}
-        for ctype in all_types:
-            rc_cnt = rc_counter.get(ctype, 0)
-            if rc_cnt < min_rc_count:
+        for k, v in cfg.items():
+            key = str(k or "").strip()
+            if not key:
                 continue
-            data_cnt = max(data_counter.get(ctype, 0), 1)
-            p_rc = (rc_cnt + smoothing) / (total_rc + smoothing * n)
-            p_data = (data_cnt + smoothing) / (total_data + smoothing * n)
-            lift = float(max(1.0 / clip, min(clip, p_rc / p_data)))
-            priors[ctype] = lift
-
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if fv <= 0:
+                continue
+            priors[key] = fv
         if not priors:
             return {}
-
-        # Normalise so mean = 1.0 (preserves relative weights, unbiased overall)
         mean_v = sum(priors.values()) / len(priors)
         if mean_v > 0:
-            priors = {k: v / mean_v for k, v in priors.items()}
+            priors = {k: float(v) / mean_v for k, v in priors.items()}
         return priors
 
     def _component_prior(self, comp: str) -> float:
@@ -836,7 +765,6 @@ class DatasetAdapter:
         reasons: Sequence[str],
         result: Any,
         instruction: str,
-        scoring_points: str,
         task_id: int,
         args: Any,
         need_reason: bool,
@@ -849,7 +777,6 @@ class DatasetAdapter:
         time_candidates: Sequence[Dict[str, Any]],
         result: Any,
         instruction: str,
-        scoring_points: str,
         task_id: int,
         args: Any,
         need_time: bool,
@@ -865,8 +792,17 @@ class DatasetAdapter:
         if need_time:
             try:
                 from rca.adapter.utils.time_candidates import estimate_occurrence_datetime_candidates
-                from rca.adapter.utils.query_parsing import extract_reason_candidates
-                reasons = extract_reason_candidates(str(scoring_points or ""))
+                reasons: List[str] = []
+                reason_taxonomy_fn = getattr(self, "basil_reason_taxonomy", None)
+                if callable(reason_taxonomy_fn):
+                    try:
+                        reasons = [str(x) for x in reason_taxonomy_fn() if str(x).strip()]
+                    except Exception:
+                        reasons = []
+                if not reasons:
+                    taxonomy = self.config.get("reason_taxonomy", {})
+                    if isinstance(taxonomy, dict):
+                        reasons = [str(x) for x in taxonomy.keys() if str(x).strip()]
                 generated = estimate_occurrence_datetime_candidates(
                     dataset=str(getattr(self, "dataset", "") or ""),
                     instruction=str(instruction or ""),

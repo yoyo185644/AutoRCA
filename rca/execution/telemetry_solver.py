@@ -37,6 +37,57 @@ def required_root_count(scoring_points: str) -> int:
     return int(k) if k > 0 else 1
 
 
+def estimate_root_count_from_trace(*, dataset: str, instruction: str, max_k: int = 3) -> int:
+    try:
+        date_dir, start, end = parse_time_window_generic(instruction)
+        date_dir = resolve_date_dir(dataset, date_dir)
+    except Exception:
+        return 1
+    trace_path = os.path.join("dataset", dataset, "telemetry", date_dir, "trace", "trace_span.csv")
+    if not os.path.exists(trace_path):
+        return 1
+    try:
+        columns = set(_read_csv_with_python_fallback(trace_path, nrows=0).columns)
+        ts_col = "startTime" if "startTime" in columns else ("timestamp" if "timestamp" in columns else None)
+        dur_col = "elapsedTime" if "elapsedTime" in columns else ("duration" if "duration" in columns else None)
+        if ts_col is None or dur_col is None:
+            return 1
+        df = _read_csv_with_python_fallback(trace_path, low_memory=False, usecols=[ts_col, dur_col])
+        if df.empty:
+            return 1
+        ts_unit = "ms" if df[ts_col].dropna().astype(str).str.len().max() >= 13 else "s"
+        df = df[[ts_col, dur_col]].copy()
+        df["timestamp"] = pd.to_datetime(df[ts_col], unit=ts_unit, utc=True).dt.tz_convert("Asia/Shanghai")
+        df["dur"] = pd.to_numeric(df[dur_col], errors="coerce")
+        df = df.dropna(subset=["timestamp", "dur"])
+        df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
+        if df.empty:
+            return 1
+        df["minute"] = df["timestamp"].dt.floor("min")
+        p95 = df.groupby("minute")["dur"].quantile(0.95).sort_index()
+        if p95.empty:
+            return 1
+        baseline = float(p95.median())
+        if baseline <= 0.0:
+            baseline = float(p95.mean()) if float(p95.mean()) > 0.0 else 1.0
+        mad = float((p95 - p95.median()).abs().median())
+        denom = mad if mad > 1e-9 else float(p95.std() or 1.0)
+        z = (p95 - p95.median()) / float(denom)
+        peaks = [ts for ts, v in z.items() if float(v) >= 3.5 and float(p95.loc[ts]) >= baseline * 1.2]
+        if not peaks:
+            return 1
+        peaks = sorted(peaks)
+        clusters = 0
+        last = None
+        for ts in peaks:
+            if last is None or abs((pd.Timestamp(ts) - pd.Timestamp(last)).total_seconds()) >= 300:
+                clusters += 1
+                last = ts
+        return max(1, min(int(max_k), int(clusters)))
+    except Exception:
+        return 1
+
+
 def canonicalize_component(component: str) -> str:
     c = str(component or "").strip()
     m = re.match(r"^node-\\d+\\.(.+)$", c)
