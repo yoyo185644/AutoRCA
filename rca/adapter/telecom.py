@@ -17,7 +17,6 @@ _TELECOM_REASON_TAXONOMY: Tuple[str, ...] = (
     "db connection limit",
     "network delay",
     "network loss",
-    "high memory usage",
 )
 
 
@@ -257,8 +256,10 @@ class TelecomAdapter(DatasetAdapter):
             "db connection limit": ["conn", "connection", "login", "session", "tps", "sql", "query", "lock"],
             "network delay": ["delay", "latency", "rtt", "ping", "tnsping"],
             "network loss": ["loss", "drop", "retrans", "timeout", "reset", "packet"],
-            "high memory usage": ["mem", "memory", "rss", "heap", "gc"],
         }.get(reason, [])
+
+    def reason_compatible_component_types(self, reason: str) -> List[str]:
+        return list(self._reason_compatible_types(self.parse_root_cause_label(str(reason or ""))))
 
     def llm_reason_rules(self) -> List[str]:
         return [
@@ -267,6 +268,69 @@ class TelecomAdapter(DatasetAdapter):
             "network delay or network loss: prefer os/node components only when metrics contain packet/loss/drop/retrans/latency/delay.",
             "Do not switch to a common reason unless component type and metric evidence both support it.",
         ]
+
+    def _postprocess_reranked(self, candidates: List[Any]) -> List[Any]:
+        ordered = list(candidates or [])
+        if len(ordered) < 2:
+            return ordered
+        top = ordered[0]
+        top_comp = str(getattr(top, "component", "") or "")
+        top_reason = self.parse_root_cause_label(str(getattr(top, "reason", "") or ""))
+        if self._component_type(top_comp) != "db" or top_reason != "db connection limit":
+            return ordered
+        top_metrics = [str(x).lower() for x in list(getattr(top, "evidence", []) or [])]
+        metric_blob = " ".join(top_metrics)
+        if not any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo")):
+            return ordered
+        if any(tok in metric_blob for tok in ("proc_user", "proc user", "proc_user_used")):
+            return ordered
+        top_score = self._safe_float(getattr(top, "score", 0.0))
+        for idx, cand in enumerate(ordered[1:8], start=1):
+            comp = str(getattr(cand, "component", "") or "")
+            reason = self.parse_root_cause_label(str(getattr(cand, "reason", "") or ""))
+            if comp != top_comp or reason != "db close":
+                continue
+            cand_score = self._safe_float(getattr(cand, "score", 0.0))
+            if cand_score >= top_score - 0.35:
+                ordered.pop(idx)
+                ordered.insert(0, cand)
+                break
+        return ordered
+
+    def postprocess_output_tuples(
+        self,
+        tuples: Sequence[Dict[str, Any]],
+        *,
+        context: Dict[str, Any],
+        need_comp: bool,
+        need_reason: bool,
+        need_time: bool,
+    ) -> List[Dict[str, Any]]:
+        ordered = [dict(x) for x in list(tuples or []) if isinstance(x, Mapping)]
+        if len(ordered) < 2:
+            return ordered
+        top = ordered[0]
+        top_comp = str(top.get("component", "") or "")
+        top_reason = self.parse_root_cause_label(str(top.get("reason", "") or ""))
+        if self._component_type(top_comp) != "db" or top_reason != "db connection limit":
+            return ordered
+        metrics = [str(x).lower() for x in list(top.get("supporting_metrics", []) or [])]
+        metric_blob = " ".join(metrics)
+        if not any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo")):
+            return ordered
+        if any(tok in metric_blob for tok in ("proc_user", "proc user", "proc_user_used")):
+            return ordered
+        top_score = self._safe_float(top.get("score", 0.0))
+        for idx, item in enumerate(ordered[1:8], start=1):
+            comp = str(item.get("component", "") or "")
+            reason = self.parse_root_cause_label(str(item.get("reason", "") or ""))
+            if comp != top_comp or reason != "db close":
+                continue
+            if self._safe_float(item.get("score", 0.0)) >= top_score - 0.35:
+                ordered.pop(idx)
+                ordered.insert(0, item)
+                break
+        return ordered
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -288,8 +352,313 @@ class TelecomAdapter(DatasetAdapter):
             "db connection limit": float(hits(["conn", "connection", "login", "session", "tps", "sql", "query", "lock"])),
             "network delay": float(hits(["delay", "latency", "rtt", "ping", "tnsping"])),
             "network loss": float(hits(["loss", "drop", "retrans", "timeout", "reset", "packet"])),
-            "high memory usage": float(hits(["mem", "memory", "rss", "heap", "gc"])),
         }
+
+    @staticmethod
+    def _surface_metric_reason_scores(metrics: Sequence[str]) -> Dict[str, float]:
+        """Reason evidence from metric names without assuming a root component.
+
+        This is deliberately separate from component/reason compatibility.  It
+        serves reason-only and reason+time tasks, where the answer surface has
+        no component and using component-conditioned scores can overfit to the
+        currently top-ranked component.
+        """
+
+        scores = {r: 0.0 for r in _TELECOM_REASON_TAXONOMY}
+        seen = {str(x or "").lower() for x in metrics or [] if str(x or "").strip()}
+        for metric in seen:
+            if any(tok in metric for tok in ("cpu", "proc", "util")):
+                scores["CPU fault"] += 1.0
+            if any(tok in metric for tok in ("load", "iowait")):
+                scores["CPU fault"] += 0.45
+
+            if any(tok in metric for tok in ("close", "closed", "abort", "disconnect")):
+                scores["db close"] += 1.0
+            if any(tok in metric for tok in ("conn", "connection", "login", "session", "sess", "tps", "sql", "query", "exec", "lock")):
+                scores["db connection limit"] += 1.0
+            if "dbtime" in metric or "db_time" in metric:
+                scores["db connection limit"] += 0.45
+
+            if any(tok in metric for tok in ("delay", "latency", "rtt", "ping", "tnsping")):
+                scores["network delay"] += 1.0
+            if "queue" in metric:
+                scores["network delay"] += 0.45
+                scores["network loss"] += 0.20
+            if any(tok in metric for tok in ("loss", "drop", "retrans", "timeout", "reset", "packet")):
+                scores["network loss"] += 1.0
+            if any(tok in metric for tok in ("network", "recv", "send", "incoming", "outgoing", "traffic")):
+                scores["network loss"] += 0.35
+                scores["network delay"] += 0.20
+        return scores
+
+    def _surface_reason_scores(
+        self,
+        *,
+        top_metrics: Mapping[str, Sequence[str]],
+        comp_scores: Mapping[str, float],
+    ) -> Dict[str, float]:
+        ranked_all = [
+            (str(c), self._safe_float(score))
+            for c, score in sorted(
+                dict(comp_scores or {}).items(),
+                key=lambda kv: self._safe_float(kv[1]),
+                reverse=True,
+            )
+        ]
+        by_type: Dict[str, List[Tuple[str, float]]] = {}
+        for comp, score in ranked_all:
+            by_type.setdefault(self._component_type(comp), []).append((comp, score))
+
+        selected: Dict[str, Tuple[float, int]] = {}
+        for rank, (comp, score) in enumerate(ranked_all[:8], start=1):
+            selected[comp] = (score, rank)
+        rank_offset = 9
+        for comps in by_type.values():
+            for local_rank, (comp, score) in enumerate(comps[:4], start=0):
+                selected.setdefault(comp, (score, rank_offset + local_rank))
+            rank_offset += 4
+
+        max_comp = max([abs(self._safe_float(v)) for _c, v in ranked_all] + [1.0])
+        accum: Dict[str, float] = {r: 0.0 for r in _TELECOM_REASON_TAXONOMY}
+        support: Dict[str, float] = {r: 0.0 for r in _TELECOM_REASON_TAXONOMY}
+        for comp, (score, rank) in selected.items():
+            metrics = [str(x) for x in list((top_metrics or {}).get(comp, []) or [])]
+            if not metrics:
+                continue
+            local = self._surface_metric_reason_scores(metrics)
+            comp_weight = max(0.10, self._safe_float(score) / max(max_comp, 1e-9))
+            rank_weight = 1.0 / (1.0 + 0.12 * float(rank - 1))
+            for reason, value in local.items():
+                if value <= 0:
+                    continue
+                norm_value = min(1.0, float(value) / 3.0)
+                accum[reason] += norm_value * comp_weight * rank_weight
+                support[reason] = max(support[reason], norm_value)
+
+        raw_scores = {
+            reason: 0.60 * accum.get(reason, 0.0) + 0.40 * support.get(reason, 0.0)
+            for reason in _TELECOM_REASON_TAXONOMY
+        }
+        max_score = max([abs(v) for v in raw_scores.values()] + [0.0])
+        if max_score <= 1e-12:
+            return {r: 0.0 for r in _TELECOM_REASON_TAXONOMY}
+        return {r: float(max(0.0, v / max_score)) for r, v in raw_scores.items()}
+
+    def _component_reason_metric_score(
+        self,
+        *,
+        component: str,
+        reason: str,
+        metrics: Sequence[str],
+    ) -> float:
+        """Reason evidence for one component, calibrated by component type.
+
+        This prevents a single generic CPU/DB token from dominating all
+        reasons.  Evidence is strongest when metric tokens and component type
+        both agree with the reason taxonomy.
+        """
+        r = self.parse_root_cause_label(str(reason or ""))
+        if r not in _TELECOM_REASON_TAXONOMY:
+            return 0.0
+        ctype = self._component_type(str(component or ""))
+        expected = self._reason_compatible_types(r)
+        raw = self._metric_reason_scores(metrics)
+        max_hits = {
+            "CPU fault": 5.0,
+            "db close": 4.0,
+            "db connection limit": 8.0,
+            "network delay": 5.0,
+            "network loss": 6.0,
+        }.get(r, 4.0)
+        score = self._safe_float(raw.get(r, 0.0)) / max(max_hits, 1.0)
+
+        if expected:
+            if ctype in expected:
+                score *= 1.25
+            else:
+                # Keep cross-type evidence possible, but weak: e.g. OS CPU
+                # signals are often symptoms for container CPU faults.
+                score *= 0.35
+
+        # Reason-level competition inside close pairs.
+        if r == "CPU fault":
+            competitor = max(
+                self._safe_float(raw.get("network delay", 0.0)),
+                self._safe_float(raw.get("network loss", 0.0)),
+                self._safe_float(raw.get("db connection limit", 0.0)),
+                self._safe_float(raw.get("db close", 0.0)),
+            )
+            if competitor >= self._safe_float(raw.get("CPU fault", 0.0)):
+                score *= 0.65
+        elif r == "db close":
+            if self._safe_float(raw.get("db close", 0.0)) <= 0 and self._safe_float(raw.get("db connection limit", 0.0)) > 0:
+                score *= 0.35
+        elif r == "db connection limit":
+            if self._safe_float(raw.get("db connection limit", 0.0)) <= 0 and self._safe_float(raw.get("db close", 0.0)) > 0:
+                score *= 0.45
+        elif r == "network delay":
+            if self._safe_float(raw.get("network delay", 0.0)) <= 0 and self._safe_float(raw.get("network loss", 0.0)) > 0:
+                score *= 0.45
+        elif r == "network loss":
+            if self._safe_float(raw.get("network loss", 0.0)) <= 0 and self._safe_float(raw.get("network delay", 0.0)) > 0:
+                score *= 0.45
+
+        return float(max(0.0, min(1.0, score)))
+
+    def _component_reason_rank_factor(
+        self,
+        *,
+        component: str,
+        reason: str,
+        metrics: Sequence[str],
+    ) -> float:
+        """Safe score multiplier for an already-built component/reason tuple."""
+
+        r = self.parse_root_cause_label(str(reason or ""))
+        if not r:
+            return 1.0
+        if r not in _TELECOM_REASON_TAXONOMY:
+            return 0.50
+        ctype = self._component_type(str(component or ""))
+        compat = self._reason_compatible_types(r)
+        support = self._component_reason_metric_score(component=component, reason=r, metrics=metrics)
+        consistency = self._type_consistency_impl(str(component or ""), r, metrics)
+        metric_blob = " ".join(str(x).lower() for x in metrics or [])
+
+        if r == "db connection limit":
+            has_login_signal = any(tok in metric_blob for tok in ("login", "conn", "connection"))
+            has_db_sync_signal = any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo"))
+            if has_db_sync_signal and not has_login_signal:
+                return 0.72
+        if r == "db close":
+            has_login_signal = any(tok in metric_blob for tok in ("login", "conn", "connection"))
+            has_db_sync_signal = any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo"))
+            if has_db_sync_signal and not has_login_signal:
+                return 1.18
+
+        if compat and ctype in compat:
+            if support > 0:
+                return 1.0 + min(0.18, 0.12 * support)
+            return 0.92
+        if support >= 0.25 or consistency > 0:
+            return 0.82
+        return 0.55
+
+    def _latent_reason_component_bonus(
+        self,
+        *,
+        component: str,
+        metrics: Sequence[str],
+        reason_scores: Mapping[str, float],
+    ) -> Tuple[float, str]:
+        """Best hidden reason support for tasks that do not output reason."""
+
+        best_reason = ""
+        best = 0.0
+        max_reason = max([abs(self._safe_float(v)) for v in dict(reason_scores or {}).values()] + [1.0])
+        for reason in _TELECOM_REASON_TAXONOMY:
+            support = self._component_reason_metric_score(component=component, reason=reason, metrics=metrics)
+            if support <= 0:
+                continue
+            prior = self._safe_float((reason_scores or {}).get(reason, 0.0)) / max(max_reason, 1e-9)
+            compat = 1.0 if self._component_type(component) in self._reason_compatible_types(reason) else 0.45
+            value = (0.70 * support + 0.30 * prior) * compat
+            if value > best:
+                best = float(value)
+                best_reason = reason
+        return float(min(1.0, best)), best_reason
+
+    def _calibrated_reason_scores(
+        self,
+        *,
+        top_metrics: Mapping[str, Sequence[str]],
+        comp_scores: Mapping[str, float],
+        tuple_reason_scores: Optional[Mapping[str, float]] = None,
+    ) -> Dict[str, float]:
+        max_comp = max([abs(self._safe_float(v)) for v in dict(comp_scores or {}).values()] + [1.0])
+        accum: Dict[str, float] = {r: 0.0 for r in _TELECOM_REASON_TAXONOMY}
+        support: Dict[str, float] = {r: 0.0 for r in _TELECOM_REASON_TAXONOMY}
+
+        ranked_all = [
+            (str(c), self._safe_float(score))
+            for c, score in sorted(
+                dict(comp_scores or {}).items(),
+                key=lambda kv: self._safe_float(kv[1]),
+                reverse=True,
+            )
+        ]
+        by_type: Dict[str, List[Tuple[str, float]]] = {}
+        for comp, score in ranked_all:
+            by_type.setdefault(self._component_type(comp), []).append((comp, score))
+
+        # Reason evidence should not be dominated by whichever component type
+        # has the largest raw anomaly scale.  Build a type-balanced evidence
+        # pool: global top components plus top representatives from every
+        # semantic channel.  This is the same principle as typed-channel
+        # candidate recall, applied to reason scoring.
+        selected: Dict[str, Tuple[float, int]] = {}
+        for rank, (comp, score) in enumerate(ranked_all[:8], start=1):
+            selected[comp] = (score, rank)
+        rank_offset = 9
+        for comps in by_type.values():
+            for local_rank, (comp, score) in enumerate(comps[:5], start=0):
+                selected.setdefault(comp, (score, rank_offset + local_rank))
+            rank_offset += 5
+
+        for comp, (comp_score, rank) in selected.items():
+            metrics = [str(x) for x in list((top_metrics or {}).get(comp, []) or [])]
+            if not metrics:
+                continue
+            comp_weight = max(0.05, self._safe_float(comp_score) / max(max_comp, 1e-9))
+            rank_weight = 1.0 / (1.0 + 0.15 * float(rank - 1))
+            for reason in _TELECOM_REASON_TAXONOMY:
+                s = self._component_reason_metric_score(component=comp, reason=reason, metrics=metrics)
+                if s <= 0:
+                    continue
+                expected = self._reason_compatible_types(reason)
+                if expected and self._component_type(comp) in expected:
+                    # Strong local evidence in the expected semantic channel
+                    # should survive even if that component is not globally top.
+                    s = min(1.0, s * 1.15)
+                    rank_weight = max(rank_weight, 0.55)
+                value = s * comp_weight * rank_weight
+                accum[reason] += value
+                support[reason] = max(support[reason], s)
+
+        tuple_scores = dict(tuple_reason_scores or {})
+        if tuple_scores:
+            max_tuple = max([abs(self._safe_float(v)) for v in tuple_scores.values()] + [1.0])
+            for raw_reason, value in tuple_scores.items():
+                reason = self.parse_root_cause_label(str(raw_reason or ""))
+                if reason in accum:
+                    accum[reason] += 0.25 * self._safe_float(value) / max(max_tuple, 1e-9)
+
+        # Blend aggregate support and best local support. Aggregate captures
+        # multi-source consistency; best support preserves sharp local evidence.
+        raw_scores = {
+            reason: 0.70 * accum.get(reason, 0.0) + 0.30 * support.get(reason, 0.0)
+            for reason in _TELECOM_REASON_TAXONOMY
+        }
+        # Competitive calibration among broad reason families.  A family wins
+        # only when its compatible channel has evidence, not merely because its
+        # tokens appear in a high-scoring symptom component.
+        family_best = {
+            "container": raw_scores.get("CPU fault", 0.0),
+            "db": max(raw_scores.get("db close", 0.0), raw_scores.get("db connection limit", 0.0)),
+            "node": max(raw_scores.get("network delay", 0.0), raw_scores.get("network loss", 0.0)),
+        }
+        for reason in list(raw_scores.keys()):
+            rtype = self._reason_type(reason)
+            if not rtype:
+                continue
+            own = family_best.get(rtype, 0.0)
+            competing = max([v for k, v in family_best.items() if k != rtype] + [0.0])
+            if competing > 0 and own < 0.75 * competing:
+                raw_scores[reason] *= 0.70
+        max_score = max([abs(v) for v in raw_scores.values()] + [0.0])
+        if max_score <= 1e-12:
+            return {r: 0.0 for r in _TELECOM_REASON_TAXONOMY}
+        return {r: float(max(0.0, v / max_score)) for r, v in raw_scores.items()}
 
     def _allow_light_agent(self, *, spec: Any, need_comp: bool) -> bool:
         task_id = int(getattr(spec, "task_id", 0) or 0)
@@ -491,25 +860,28 @@ class TelecomAdapter(DatasetAdapter):
         if not comp_scores:
             comp_scores = dict(getattr(result, "combined_scores", {}) or {})
         metric_names: List[str] = []
-        max_comp = max([abs(self._safe_float(v)) for v in comp_scores.values()] + [0.0])
         ranked_components = [
             str(c)
             for c, _score in sorted(
                 comp_scores.items(),
                 key=lambda kv: self._safe_float(kv[1]),
                 reverse=True,
-            )[:8]
+            )[:12]
         ]
         for comp in ranked_components:
-            values = [str(x) for x in list(top_metrics.get(comp, []) or [])]
-            metric_names.extend(values)
-            weight = self._safe_float(comp_scores.get(comp, 0.0)) / max(max_comp, 1e-9)
-            for reason, score in self._metric_reason_scores(values).items():
-                if score > 0:
-                    evidence_scores[reason] = max(
-                        evidence_scores.get(reason, 0.0),
-                        float(score) * max(0.05, weight),
-                    )
+            metric_names.extend([str(x) for x in list(top_metrics.get(comp, []) or [])])
+
+        calibrated = self._calibrated_reason_scores(
+            top_metrics=top_metrics,
+            comp_scores=comp_scores,
+            tuple_reason_scores=evidence_scores,
+        )
+        surface_scores = self._surface_reason_scores(
+            top_metrics=top_metrics,
+            comp_scores=comp_scores,
+        )
+        for reason, score in calibrated.items():
+            evidence_scores[reason] = max(self._safe_float(evidence_scores.get(reason, 0.0)), self._safe_float(score))
 
         # Keep the closed taxonomy available, but let metric evidence decide order.
         for raw in list(reasons or []) + list(_TELECOM_REASON_TAXONOMY):
@@ -531,7 +903,11 @@ class TelecomAdapter(DatasetAdapter):
                 reverse=True,
             )
         ]
-        return ordered, norm_scores, {"telecom_reason_scores": norm_scores, "telecom_reason_metrics": metric_names[:30]}
+        return ordered, norm_scores, {
+            "telecom_reason_scores": norm_scores,
+            "telecom_reason_surface_scores": surface_scores,
+            "telecom_reason_metrics": metric_names[:30],
+        }
 
     def augment_index_time_candidates(
         self,
@@ -632,6 +1008,30 @@ class TelecomAdapter(DatasetAdapter):
         if not need_comp:
             if need_reason:
                 reason_scores = dict((context or {}).get("reason_scores", {}) or {})
+                surface_scores = dict((context or {}).get("telecom_reason_surface_scores", {}) or {})
+                default_dt = str((context or {}).get("time_choice", "") or "")
+                if need_time and not default_dt:
+                    for item in list((context or {}).get("time_candidates", []) or []):
+                        if not isinstance(item, Mapping):
+                            continue
+                        dt0 = str(item.get("datetime", "") or "").strip()
+                        if dt0:
+                            default_dt = dt0
+                            break
+                latent_time_type = ""
+                if need_time:
+                    for item in list((context or {}).get("time_candidates", []) or []):
+                        if not isinstance(item, Mapping):
+                            continue
+                        dt0 = str(item.get("datetime", "") or "").strip()
+                        if default_dt and dt0 != default_dt:
+                            continue
+                        comp0 = str(item.get("component", "") or "").strip()
+                        if not comp0:
+                            continue
+                        latent_time_type = self._component_type(comp0)
+                        if latent_time_type and score < 0.90:
+                            break
                 hypothesis_scores: Dict[str, float] = {}
                 for rank, item in enumerate([dict(x) for x in list(selected or []) if isinstance(x, Mapping)], start=1):
                     reason = self.parse_root_cause_label(str(item.get("reason", "") or ""))
@@ -641,7 +1041,8 @@ class TelecomAdapter(DatasetAdapter):
                 if reason_scores or hypothesis_scores:
                     max_reason = max([abs(self._safe_float(v)) for v in reason_scores.values()] + [1.0])
                     max_hyp = max([abs(self._safe_float(v)) for v in hypothesis_scores.values()] + [1.0])
-                    all_reasons = list(dict.fromkeys(list(hypothesis_scores.keys()) + list(reason_scores.keys()) + list(_TELECOM_REASON_TAXONOMY)))
+                    max_surface = max([abs(self._safe_float(v)) for v in surface_scores.values()] + [1.0])
+                    all_reasons = list(dict.fromkeys(list(hypothesis_scores.keys()) + list(reason_scores.keys()) + list(surface_scores.keys()) + list(_TELECOM_REASON_TAXONOMY)))
                     out: List[Dict[str, Any]] = []
                     for reason in all_reasons:
                         r = self.parse_root_cause_label(str(reason))
@@ -649,16 +1050,30 @@ class TelecomAdapter(DatasetAdapter):
                             continue
                         hyp_norm = self._safe_float(hypothesis_scores.get(r, 0.0)) / max(max_hyp, 1e-9)
                         ev_norm = self._safe_float(reason_scores.get(r, 0.0)) / max(max_reason, 1e-9)
-                        score = 0.60 * hyp_norm + 0.40 * ev_norm
+                        surface_norm = self._safe_float(surface_scores.get(r, 0.0)) / max(max_surface, 1e-9)
+                        # For reason-only / reason-time tasks, component
+                        # tuples are latent support, not the answer surface.
+                        # Combine component-calibrated evidence with a
+                        # component-free metric surface vote so the answer is
+                        # not forced by the currently top-ranked component.
+                        score = 0.10 * hyp_norm + 0.45 * ev_norm + 0.45 * surface_norm
+                        if latent_time_type:
+                            compat = self._reason_compatible_types(r)
+                            if compat:
+                                if latent_time_type in compat:
+                                    score += 0.65
+                                else:
+                                    score *= 0.55
                         out.append(
                             {
                                 "component": "",
                                 "reason": r,
-                                "datetime": str((context or {}).get("time_choice", "") or "") if need_time else "",
+                                "datetime": default_dt if need_time else "",
                                 "score": float(score),
                                 "source": "telecom_reason_evidence",
                                 "evidence": [
                                     f"reason_score={ev_norm:.3f}",
+                                    f"surface_score={surface_norm:.3f}",
                                     f"hypothesis_score={hyp_norm:.3f}",
                                 ],
                             }
@@ -746,6 +1161,13 @@ class TelecomAdapter(DatasetAdapter):
             key = (comp, reason, dt)
             candidate = dict(item)
             candidate["reason"] = reason
+            if comp and reason:
+                metrics = [str(x) for x in list(candidate.get("supporting_metrics", []) or top_metrics.get(comp, []) or [])]
+                candidate["score"] = self._safe_float(candidate.get("score", 0.0)) * self._component_reason_rank_factor(
+                    component=comp,
+                    reason=reason,
+                    metrics=metrics,
+                )
             old = merged.get(key)
             if old is None or self._safe_float(candidate.get("score")) > self._safe_float(old.get("score")):
                 merged[key] = candidate
@@ -760,25 +1182,34 @@ class TelecomAdapter(DatasetAdapter):
             comp_norm = self._safe_float(comp_scores.get(comp, 0.0)) / max(max_comp, 1e-9)
             rank_prior = 1.0 / float(rank)
             metrics = [str(x) for x in list(top_metrics.get(comp, []) or [])]
-            metric_reason = self._metric_reason_scores(metrics)
+            latent_bonus, latent_reason = self._latent_reason_component_bonus(
+                component=comp,
+                metrics=metrics,
+                reason_scores=reason_scores,
+            )
 
             for reason in raw_reasons[:reason_budget]:
                 compat = self._reason_compatible_types(reason)
                 ctype = self._component_type(comp)
+                component_reason_support = self._component_reason_metric_score(
+                    component=comp,
+                    reason=reason,
+                    metrics=metrics,
+                )
                 if compat and ctype not in compat:
                     # Keep strong metric-backed alternatives, but do not let
                     # generic symptom components flood the tuple pool.
-                    if metric_reason.get(reason, 0.0) <= 0:
+                    if component_reason_support <= 0.05:
                         continue
                 reason_norm = self._safe_float(reason_scores.get(reason, 0.0)) / max(max_reason, 1e-9)
                 consistency = self._type_consistency_impl(comp, reason, metrics)
-                metric_bonus = min(0.25, 0.08 * self._safe_float(metric_reason.get(reason, 0.0)))
                 score = (
                     0.45 * comp_norm
                     + (0.25 * reason_norm if need_reason else 0.0)
                     + 0.15 * rank_prior
                     + max(0.0, consistency)
-                    + metric_bonus
+                    + 0.25 * component_reason_support
+                    + (0.22 * latent_bonus if need_comp and need_time and not need_reason else 0.0)
                 )
                 if compat and ctype in compat:
                     score += 0.12
@@ -792,6 +1223,7 @@ class TelecomAdapter(DatasetAdapter):
                         "score": float(min(max_existing * 1.05, score)),
                         "source": "telecom_reason_conditioned_expand",
                         "supporting_metrics": metrics[:6],
+                        "latent_reason": latent_reason,
                     }
                 )
 

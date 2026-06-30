@@ -349,6 +349,10 @@ def solve_time(*, dataset: str, instruction: str, need_time: bool) -> Tuple[str,
     if not need_time:
         return "", None, None
 
+    # scoring_points contains evaluation labels; time inference must not use it.
+    # Reason-aware routing is supplied by indexed evidence / adapter taxonomy.
+    reasons: List[str] = []
+
     try:
         # Direction 1+2+3: multi-signal fusion — trace onset/peak + reason-aware metric onset/peak
         candidates = estimate_occurrence_datetime_candidates(
@@ -378,6 +382,7 @@ def _reason_candidates_from_evidence(evidence: Dict[str, Any]) -> List[str]:
 
     Rich format (Telecom): evidence has a 'scores' dict keyed by reason label.
     Flat format (Market/Bank): evidence has a 'candidate_reasons' list.
+    Falls back to an empty list; scoring_points contains evaluation labels.
     """
     scores = evidence.get("scores")
     if isinstance(scores, dict) and scores:
@@ -407,6 +412,7 @@ def solve_reason(
         ar = adapter.solve_reason(
             spec=spec,
             instruction=instruction,
+            scoring_points="",
             args=args,
             need_reason=need_reason,
         )
@@ -417,7 +423,7 @@ def solve_reason(
         det_reason, ev2 = predict_reason_universal(
             dataset=dataset,
             instruction=instruction,
-            adapter=adapter,
+            scoring_points="",
         )
 
     # --- Step 2: unified LLM rerank (same for all datasets) ---
@@ -618,7 +624,7 @@ def assemble_prediction(
                 center_time_s=ct_s,
                 use_basil=basil_enabled(args),
                 basil_config=basil_config_from_args(args, top_k, required_fields=getattr(spec, "required_fields", None), task_id=getattr(spec, "task_id", None)),
-                basil_reasons=[x for x in [det_reason, det_reason_other] if str(x or "").strip()] if need_reason else [],
+                basil_reasons=[det_reason] if (need_reason and str(det_reason or "").strip()) else [],
             )
             comp_i = ev3_i.top1
             if any(x.get("root cause component") == comp_i for x in roots):

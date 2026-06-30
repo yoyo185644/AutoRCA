@@ -161,6 +161,10 @@ class MarketAdapter(DatasetAdapter):
             return ["restart", "exit", "kill", "process", "termination"]
         return []
 
+    def reason_compatible_component_types(self, reason: str) -> List[str]:
+        rtype = self.reason_semantic_type(str(reason or ""))
+        return [rtype] if rtype else []
+
     def llm_reason_rules(self) -> List[str]:
         return [
             "Node reasons should align with node components and node-level metrics.",
