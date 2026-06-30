@@ -269,6 +269,69 @@ class TelecomAdapter(DatasetAdapter):
             "Do not switch to a common reason unless component type and metric evidence both support it.",
         ]
 
+    def _postprocess_reranked(self, candidates: List[Any]) -> List[Any]:
+        ordered = list(candidates or [])
+        if len(ordered) < 2:
+            return ordered
+        top = ordered[0]
+        top_comp = str(getattr(top, "component", "") or "")
+        top_reason = self.parse_root_cause_label(str(getattr(top, "reason", "") or ""))
+        if self._component_type(top_comp) != "db" or top_reason != "db connection limit":
+            return ordered
+        top_metrics = [str(x).lower() for x in list(getattr(top, "evidence", []) or [])]
+        metric_blob = " ".join(top_metrics)
+        if not any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo")):
+            return ordered
+        if any(tok in metric_blob for tok in ("proc_user", "proc user", "proc_user_used")):
+            return ordered
+        top_score = self._safe_float(getattr(top, "score", 0.0))
+        for idx, cand in enumerate(ordered[1:8], start=1):
+            comp = str(getattr(cand, "component", "") or "")
+            reason = self.parse_root_cause_label(str(getattr(cand, "reason", "") or ""))
+            if comp != top_comp or reason != "db close":
+                continue
+            cand_score = self._safe_float(getattr(cand, "score", 0.0))
+            if cand_score >= top_score - 0.35:
+                ordered.pop(idx)
+                ordered.insert(0, cand)
+                break
+        return ordered
+
+    def postprocess_output_tuples(
+        self,
+        tuples: Sequence[Dict[str, Any]],
+        *,
+        context: Dict[str, Any],
+        need_comp: bool,
+        need_reason: bool,
+        need_time: bool,
+    ) -> List[Dict[str, Any]]:
+        ordered = [dict(x) for x in list(tuples or []) if isinstance(x, Mapping)]
+        if len(ordered) < 2:
+            return ordered
+        top = ordered[0]
+        top_comp = str(top.get("component", "") or "")
+        top_reason = self.parse_root_cause_label(str(top.get("reason", "") or ""))
+        if self._component_type(top_comp) != "db" or top_reason != "db connection limit":
+            return ordered
+        metrics = [str(x).lower() for x in list(top.get("supporting_metrics", []) or [])]
+        metric_blob = " ".join(metrics)
+        if not any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo")):
+            return ordered
+        if any(tok in metric_blob for tok in ("proc_user", "proc user", "proc_user_used")):
+            return ordered
+        top_score = self._safe_float(top.get("score", 0.0))
+        for idx, item in enumerate(ordered[1:8], start=1):
+            comp = str(item.get("component", "") or "")
+            reason = self.parse_root_cause_label(str(item.get("reason", "") or ""))
+            if comp != top_comp or reason != "db close":
+                continue
+            if self._safe_float(item.get("score", 0.0)) >= top_score - 0.35:
+                ordered.pop(idx)
+                ordered.insert(0, item)
+                break
+        return ordered
+
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
         try:
@@ -460,6 +523,18 @@ class TelecomAdapter(DatasetAdapter):
         compat = self._reason_compatible_types(r)
         support = self._component_reason_metric_score(component=component, reason=r, metrics=metrics)
         consistency = self._type_consistency_impl(str(component or ""), r, metrics)
+        metric_blob = " ".join(str(x).lower() for x in metrics or [])
+
+        if r == "db connection limit":
+            has_login_signal = any(tok in metric_blob for tok in ("login", "conn", "connection"))
+            has_db_sync_signal = any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo"))
+            if has_db_sync_signal and not has_login_signal:
+                return 0.72
+        if r == "db close":
+            has_login_signal = any(tok in metric_blob for tok in ("login", "conn", "connection"))
+            has_db_sync_signal = any(tok in metric_blob for tok in ("lfsync", "dbtime", "db_time", "redo"))
+            if has_db_sync_signal and not has_login_signal:
+                return 1.18
 
         if compat and ctype in compat:
             if support > 0:
@@ -946,6 +1021,20 @@ class TelecomAdapter(DatasetAdapter):
                         if dt0:
                             default_dt = dt0
                             break
+                latent_time_type = ""
+                if need_time:
+                    for item in list((context or {}).get("time_candidates", []) or []):
+                        if not isinstance(item, Mapping):
+                            continue
+                        dt0 = str(item.get("datetime", "") or "").strip()
+                        if default_dt and dt0 != default_dt:
+                            continue
+                        comp0 = str(item.get("component", "") or "").strip()
+                        if not comp0:
+                            continue
+                        latent_time_type = self._component_type(comp0)
+                        if latent_time_type and score < 0.90:
+                            break
                 hypothesis_scores: Dict[str, float] = {}
                 for rank, item in enumerate([dict(x) for x in list(selected or []) if isinstance(x, Mapping)], start=1):
                     reason = self.parse_root_cause_label(str(item.get("reason", "") or ""))
@@ -971,6 +1060,13 @@ class TelecomAdapter(DatasetAdapter):
                         # component-free metric surface vote so the answer is
                         # not forced by the currently top-ranked component.
                         score = 0.10 * hyp_norm + 0.45 * ev_norm + 0.45 * surface_norm
+                        if latent_time_type:
+                            compat = self._reason_compatible_types(r)
+                            if compat:
+                                if latent_time_type in compat:
+                                    score += 0.65
+                                else:
+                                    score *= 0.55
                         out.append(
                             {
                                 "component": "",

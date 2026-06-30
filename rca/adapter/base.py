@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from rca.common.text import norm_token
+
 
 @dataclass(frozen=True)
 class TimeSolveResult:
@@ -530,6 +532,18 @@ class DatasetAdapter:
     def _postprocess_reranked(self, candidates: List[Any]) -> List[Any]:
         """Optional post-processing after sorting (e.g. diversity filtering)."""
         return candidates
+
+    def postprocess_output_tuples(
+        self,
+        tuples: Sequence[Dict[str, Any]],
+        *,
+        context: Dict[str, Any],
+        need_comp: bool,
+        need_reason: bool,
+        need_time: bool,
+    ) -> List[Dict[str, Any]]:
+        """Optional final tuple-level post-processing after datetime binding."""
+        return [dict(x) for x in list(tuples or []) if isinstance(x, Mapping)]
 
     # ------------------------------------------------------------------
     # Candidate-pool supplement: metric anomaly scan (universal recall fix)
@@ -1333,6 +1347,81 @@ class DatasetAdapter:
             "Do not override deterministic top-1 unless the alternative has stronger direct evidence.",
         ]
 
+    def _surface_reason_scores(
+        self,
+        *,
+        top_metrics: Mapping[str, Sequence[str]],
+        comp_scores: Mapping[str, float],
+    ) -> Dict[str, float]:
+        """Telemetry-only reason evidence from indexed component metrics.
+
+        This is intentionally independent of ``scoring_points`` and historical
+        labels.  It asks a simple dataset-agnostic question: which taxonomy
+        reason is best supported by the metrics already surfaced by the index?
+        Dataset adapters provide only taxonomy, canonicalization, component
+        type and metric-keyword hooks.
+        """
+        taxonomy = [
+            self.parse_root_cause_label(str(x))
+            for x in list(self.basil_reason_taxonomy() or [])
+            if str(x).strip()
+        ]
+        taxonomy = [x for x in dict.fromkeys(taxonomy) if x]
+        if not taxonomy:
+            return {}
+
+        ranked_components = [
+            str(c)
+            for c, _score in sorted(
+                dict(comp_scores or {}).items(),
+                key=lambda kv: self._safe_float(kv[1]),
+                reverse=True,
+            )
+            if str(c or "").strip()
+        ]
+        if not ranked_components:
+            ranked_components = [
+                str(c)
+                for c in dict(top_metrics or {}).keys()
+                if str(c or "").strip()
+            ]
+
+        max_comp = max([abs(self._safe_float(v)) for v in dict(comp_scores or {}).values()] + [1.0])
+        scores: Dict[str, float] = {r: 0.0 for r in taxonomy}
+        for rank, comp in enumerate(ranked_components[:16], start=1):
+            metrics = [str(x).lower() for x in list(dict(top_metrics or {}).get(comp, []) or []) if str(x).strip()]
+            if not metrics:
+                continue
+            joined = " ".join(metrics)
+            comp_norm = self._safe_float(dict(comp_scores or {}).get(comp, 0.0)) / max(max_comp, 1e-9)
+            rank_weight = 1.0 / (1.0 + 0.25 * float(rank - 1))
+            component_weight = max(0.20, comp_norm) * rank_weight
+            ctype = str(self.component_semantic_type(comp) or "")
+            for reason in taxonomy:
+                keywords = [
+                    str(k).lower()
+                    for k in list(self.reason_metric_keywords(reason) or [])
+                    if str(k).strip()
+                ]
+                if keywords:
+                    matched = {k for k in keywords if k in joined}
+                    support = float(len(matched)) / float(max(1, min(4, len(set(keywords)))))
+                else:
+                    r_tokens = [x for x in re.split(r"\s+", norm_token(reason)) if len(x) >= 3]
+                    matched = {t for t in r_tokens if t in joined}
+                    support = float(len(matched)) / float(max(1, min(3, len(set(r_tokens)))))
+                if support <= 0.0:
+                    continue
+                expected = set(self.reason_compatible_component_types(reason) or [])
+                if expected and ctype:
+                    support *= 1.18 if ctype in expected else 0.72
+                scores[reason] = max(scores.get(reason, 0.0), component_weight * min(1.0, support))
+
+        max_score = max([abs(v) for v in scores.values()] + [0.0])
+        if max_score <= 1e-12:
+            return scores
+        return {k: max(0.0, float(v) / max_score) for k, v in scores.items()}
+
     def validate_llm_candidate_adoption(
         self,
         *,
@@ -1369,7 +1458,66 @@ class DatasetAdapter:
         args: Any,
         need_reason: bool,
     ) -> Tuple[List[str], Dict[str, float], Dict[str, Any]]:
-        return list(reasons or []), {}, {}
+        if not need_reason:
+            return list(reasons or []), {}, {}
+
+        taxonomy = [
+            self.parse_root_cause_label(str(x))
+            for x in list(self.basil_reason_taxonomy() or [])
+            if str(x).strip()
+        ]
+        taxonomy = [x for x in dict.fromkeys(taxonomy) if x]
+        if not taxonomy:
+            return list(reasons or []), {}, {}
+
+        tuple_scores: Dict[str, float] = {}
+        for item in [dict(x) for x in list(getattr(result, "tuples", []) or []) if isinstance(x, Mapping)]:
+            reason = self.parse_root_cause_label(str(item.get("reason", "") or ""))
+            if reason in taxonomy:
+                tuple_scores[reason] = max(tuple_scores.get(reason, 0.0), self._safe_float(item.get("score", 0.0)))
+
+        comp_ev = getattr(result, "component_evidence", None)
+        top_metrics = dict(getattr(comp_ev, "top_metrics", {}) or {})
+        comp_scores = dict(getattr(comp_ev, "combined_scores", {}) or {})
+        if not top_metrics:
+            top_metrics = dict(getattr(result, "top_metrics", {}) or {})
+        if not comp_scores:
+            comp_scores = dict(getattr(result, "combined_scores", {}) or {})
+
+        surface_scores = self._surface_reason_scores(top_metrics=top_metrics, comp_scores=comp_scores)
+        merged_scores: Dict[str, float] = {r: 0.0 for r in taxonomy}
+        for reason in taxonomy:
+            merged_scores[reason] = max(
+                self._safe_float(tuple_scores.get(reason, 0.0)),
+                self._safe_float(surface_scores.get(reason, 0.0)),
+            )
+
+        for raw in list(reasons or []):
+            reason = self.parse_root_cause_label(str(raw))
+            if reason in taxonomy:
+                merged_scores.setdefault(reason, 0.0)
+
+        max_score = max([abs(v) for v in merged_scores.values()] + [0.0])
+        if max_score > 1e-12:
+            norm_scores = {k: max(0.0, float(v) / max_score) for k, v in merged_scores.items()}
+        else:
+            norm_scores = {k: 0.0 for k in taxonomy}
+
+        ordered = [
+            r
+            for r, _score in sorted(
+                norm_scores.items(),
+                key=lambda kv: float(kv[1]),
+                reverse=True,
+            )
+        ]
+        reason_metrics: List[str] = []
+        for comp, _score in sorted(dict(comp_scores or {}).items(), key=lambda kv: self._safe_float(kv[1]), reverse=True)[:12]:
+            reason_metrics.extend([str(x) for x in list(dict(top_metrics or {}).get(comp, []) or []) if str(x).strip()])
+        return ordered, norm_scores, {
+            "reason_surface_scores": surface_scores,
+            "reason_metrics": list(dict.fromkeys(reason_metrics))[:30],
+        }
 
     def augment_index_time_candidates(
         self,

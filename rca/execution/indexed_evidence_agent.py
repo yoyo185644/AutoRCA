@@ -1430,17 +1430,16 @@ class IndexedEvidenceAgentRunner:
         if adapter is None:
             return list(selected or [])
         need_time, need_comp, need_reason = _need_flags(int(task_id))
-        if (
-            adapter.__class__.__name__ == "TelecomAdapter"
-            and bool(need_reason)
-            and not bool(need_comp)
-        ):
-            # Telecom reason-only / reason+time tasks are already folded into
-            # component-free reason candidates by the adapter.  Running the
-            # generic component supplement/rerank here reintroduces component
-            # tuples and lets latent component ordering dominate the answer
-            # surface, which is exactly what these tasks do not evaluate.
-            return list(selected or [])
+        if bool(need_reason) and not bool(need_comp):
+            rows = [dict(x) for x in list(selected or []) if isinstance(x, Mapping)]
+            if rows and all(not str(x.get("component", "") or "").strip() for x in rows) and any(
+                str(x.get("reason", "") or "").strip() for x in rows
+            ):
+                # Reason-only / reason+time tasks evaluate the reason surface,
+                # not latent component identity.  If the adapter or generic
+                # reason scorer has already folded evidence into component-free
+                # reason candidates, do not reintroduce component tuples here.
+                return rows
 
         # ── Supplement pool: metric-scan + closed-set (universal recall fix) ──
         if bool(need_comp) or bool(need_reason):
@@ -1588,6 +1587,16 @@ class IndexedEvidenceAgentRunner:
                     "rootness_features": rootness_features,
                 }
             )
+        try:
+            out = adapter.postprocess_output_tuples(
+                out,
+                context=dict(context or {}),
+                need_comp=bool(need_comp),
+                need_reason=bool(need_reason),
+                need_time=bool(need_time),
+            )
+        except Exception:
+            pass
         return out or list(selected or [])
 
     def run(
@@ -1670,6 +1679,72 @@ class IndexedEvidenceAgentRunner:
                     key=lambda x: float(x.get("score", 0.0) or 0.0),
                     reverse=True,
                 )[: max(int(pool_k), len(merged_time_items))]
+        if bool(need_reason) and not bool(need_comp):
+            reason_scores = dict((context or {}).get("reason_scores") or {})
+            allowed_reasons = [
+                str(x).strip()
+                for x in list((context or {}).get("allowed_reasons") or [])
+                if str(x).strip()
+            ]
+            if reason_scores or allowed_reasons:
+                default_dt = str((context or {}).get("time_choice", "") or "").strip()
+                latent_time_type = ""
+                if bool(need_time) and not default_dt:
+                    for item in list((context or {}).get("time_candidates") or []):
+                        if not isinstance(item, Mapping):
+                            continue
+                        dt0 = str(item.get("datetime", "") or "").strip()
+                        if dt0:
+                            default_dt = dt0
+                            break
+                if bool(need_time) and adapter is not None:
+                    for item in list((context or {}).get("time_candidates") or []):
+                        if not isinstance(item, Mapping):
+                            continue
+                        dt0 = str(item.get("datetime", "") or "").strip()
+                        if default_dt and dt0 != default_dt:
+                            continue
+                        comp0 = str(item.get("component", "") or "").strip()
+                        if not comp0:
+                            continue
+                        try:
+                            latent_time_type = str(adapter.component_semantic_type(comp0) or "")
+                        except Exception:
+                            latent_time_type = ""
+                        if latent_time_type:
+                            break
+                max_reason_score = max([abs(float(v or 0.0)) for v in reason_scores.values()] + [1.0])
+                ordered_reasons = list(dict.fromkeys(list(allowed_reasons) + list(reason_scores.keys())))
+                reason_pool: List[Dict[str, Any]] = []
+                for rank, reason in enumerate(ordered_reasons, start=1):
+                    score = float(reason_scores.get(reason, 0.0) or 0.0) / max(max_reason_score, 1e-9)
+                    if reason not in reason_scores:
+                        score = max(score, 0.05 / float(rank))
+                    if latent_time_type and adapter is not None and score < 0.90:
+                        try:
+                            compatible = set(adapter.reason_compatible_component_types(str(reason)) or [])
+                        except Exception:
+                            compatible = set()
+                        if compatible:
+                            if latent_time_type in compatible:
+                                score += 0.65
+                            else:
+                                score *= 0.55
+                    reason_pool.append(
+                        {
+                            "component": "",
+                            "reason": reason,
+                            "datetime": default_dt if bool(need_time) else "",
+                            "score": float(score),
+                            "source": "indexed_reason_surface",
+                        }
+                    )
+                if reason_pool:
+                    deterministic_pool = sorted(
+                        reason_pool,
+                        key=lambda x: float(x.get("score", 0.0) or 0.0),
+                        reverse=True,
+                    )[: max(int(pool_k), len(reason_pool))]
         if adapter is not None:
             try:
                 expanded_pool = adapter.expand_index_candidate_tuples(
