@@ -12,7 +12,6 @@ import pandas as pd
 from rca.execution.light_agent import choose_from_candidates
 from rca.execution.telemetry_solver import (
     estimate_k_occurrence_datetimes_from_trace,
-    extract_reasons_from_scoring_points,
 )
 from rca.adapter.utils.reason_candidates import predict_reason_universal
 from rca.adapter.utils.component_candidates import build_component_candidates
@@ -350,10 +349,9 @@ def solve_time(*, dataset: str, instruction: str, scoring_points: str, need_time
     if not need_time:
         return "", None, None
 
-    # Extract reason hints from scoring_points to enable reason-aware metric routing
-    # (Direction 3: db_close → metric_service on_off; network → metric_node; etc.)
-    from rca.adapter.utils.query_parsing import extract_reason_candidates
-    reasons = extract_reason_candidates(scoring_points)
+    # scoring_points contains evaluation labels; time inference must not use it.
+    # Reason-aware routing is supplied by indexed evidence / adapter taxonomy.
+    reasons: List[str] = []
 
     try:
         # Direction 1+2+3: multi-signal fusion — trace onset/peak + reason-aware metric onset/peak
@@ -384,17 +382,15 @@ def _reason_candidates_from_evidence(evidence: Dict[str, Any], scoring_points: s
 
     Rich format (Telecom): evidence has a 'scores' dict keyed by reason label.
     Flat format (Market/Bank): evidence has a 'candidate_reasons' list.
-    Falls back to parsing scoring_points directly.
+    Falls back to an empty list; scoring_points contains evaluation labels.
     """
-    from rca.adapter.utils.query_parsing import extract_reason_candidates
-
     scores = evidence.get("scores")
     if isinstance(scores, dict) and scores:
         return [str(k) for k in scores.keys() if str(k).strip()]
     cands = evidence.get("candidate_reasons")
     if isinstance(cands, list) and cands:
         return [str(c) for c in cands if str(c).strip()]
-    return extract_reason_candidates(scoring_points)
+    return []
 
 
 def solve_reason(
@@ -417,7 +413,7 @@ def solve_reason(
         ar = adapter.solve_reason(
             spec=spec,
             instruction=instruction,
-            scoring_points=scoring_points,
+            scoring_points="",
             args=args,
             need_reason=need_reason,
         )
@@ -428,7 +424,7 @@ def solve_reason(
         det_reason, ev2 = predict_reason_universal(
             dataset=dataset,
             instruction=instruction,
-            scoring_points=scoring_points,
+            scoring_points="",
         )
 
     # --- Step 2: unified LLM rerank (same for all datasets) ---
@@ -629,7 +625,7 @@ def assemble_prediction(
                 center_time_s=ct_s,
                 use_basil=basil_enabled(args),
                 basil_config=basil_config_from_args(args, top_k, required_fields=getattr(spec, "required_fields", None), task_id=getattr(spec, "task_id", None)),
-                basil_reasons=extract_reasons_from_scoring_points(scoring_points) if need_reason else [],
+                basil_reasons=[det_reason] if (need_reason and str(det_reason or "").strip()) else [],
             )
             comp_i = ev3_i.top1
             if any(x.get("root cause component") == comp_i for x in roots):

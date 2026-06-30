@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
-from rca.common.tasks import task_need_flags
+from rca.common.tasks import required_root_count_from_instruction, task_need_flags
 from rca.adapter.registry import get_dataset_adapter
 from rca.execution.field_solvers import assemble_prediction, solve_component, solve_reason, solve_time
 from rca.execution.framework import ExecutionResult, Strategy, TaskContext, TaskRuntime, TaskSpec, UnifiedTaskRunner
@@ -14,7 +13,7 @@ from rca.execution.indexed_evidence_agent import IndexedEvidenceAgentRunner
 from rca.execution.indexed_evidence_agent import _collect_agent_stats, _load_counterfactual_prompts, _safe_prediction_to_tuples, _safe_prediction_to_tuples_constrained
 from rca.index.config import apply_adaptive_profile_config, apply_dataset_basil_config, basil_config_from_args, basil_enabled
 from rca.index.query import basil_query_config_from_mapping, query_basil_components
-from rca.execution.telemetry_solver import canonicalize_prediction, extract_reasons_from_scoring_points, required_root_count
+from rca.execution.telemetry_solver import canonicalize_prediction
 from rca.execution.telemetry_solver import estimate_k_occurrence_datetimes_from_trace
 from rca.adapter.utils.time_candidates import estimate_occurrence_datetime_candidates
 from rca.adapter.utils.component_candidates import build_component_candidates, parse_time_window_generic
@@ -195,7 +194,7 @@ class BasilIndexStrategy:
         logger = ctx.runtime.logger
         t_total = time.perf_counter()
         top_k = int(getattr(args, "task3_top_k", 12) or 12)
-        k_fail = max(1, int(required_root_count(spec.scoring_points)))
+        k_fail = max(1, int(required_root_count_from_instruction(spec.instruction)))
         cfg_map = basil_config_from_args(args, top_k, required_fields=_task_fields(spec.task_id), task_id=spec.task_id)
         cfg_map = apply_adaptive_profile_config(cfg_map, dataset=spec.dataset, args=args)
         top_k = int(cfg_map.get("top_k", top_k) or top_k)
@@ -204,7 +203,7 @@ class BasilIndexStrategy:
         component_level = ""
         if adapter:
             try:
-                component_level = str(adapter.extract_component_level(scoring_points=spec.scoring_points) or "")
+                component_level = ""
                 cfg_map.update(
                     adapter.basil_query_config_overrides(
                         task_id=int(spec.task_id),
@@ -298,7 +297,7 @@ class FieldSolverStrategy:
         args = ctx.runtime.args
         t_total = time.perf_counter()
         need_time, need_comp, need_reason = task_need_flags(int(spec.task_id))
-        k_fail = max(1, int(required_root_count(spec.scoring_points)))
+        k_fail = max(1, int(required_root_count_from_instruction(spec.instruction)))
         extras = ctx.runtime.extras.get("agent_standard") if isinstance(ctx.runtime.extras, dict) else None
         light_agent_tasks = set(getattr(extras, "light_agent_tasks", set()) or set())
 
@@ -327,37 +326,15 @@ class FieldSolverStrategy:
 
             adapter = adapter_for_non_basil
             component_level = ""
-            if adapter is not None:
-                try:
-                    component_level = str(adapter.extract_component_level(scoring_points=str(spec.scoring_points or "")) or "")
-                except Exception:
-                    component_level = ""
 
             hint_components: List[str] = []
             hint_reasons: List[str] = []
-            text = str(spec.scoring_points or "")
-            for m in re.finditer(r"predicted root cause component is\s+([^\n\r]+)", text, flags=re.IGNORECASE):
-                raw = str(m.group(1) or "").strip().strip(".。")
-                if not raw:
-                    continue
-                if adapter is not None:
-                    try:
-                        raw = str(adapter.parse_component_id(raw) or raw).strip()
-                    except Exception:
-                        raw = str(raw).strip()
-                if raw and raw not in hint_components:
-                    hint_components.append(raw)
-            for m in re.finditer(r"predicted root cause reason is\s+([^\n\r]+)", text, flags=re.IGNORECASE):
-                raw = str(m.group(1) or "").strip().strip(".。")
-                if not raw:
-                    continue
-                if adapter is not None:
-                    try:
-                        raw = str(adapter.parse_root_cause_label(raw) or raw).strip()
-                    except Exception:
-                        raw = str(raw).strip()
-                if raw and raw not in hint_reasons:
-                    hint_reasons.append(raw)
+            taxonomy_reasons: List[str] = []
+            if adapter is not None:
+                try:
+                    taxonomy_reasons = [str(x) for x in list(adapter.basil_reason_taxonomy() or []) if str(x).strip()]
+                except Exception:
+                    taxonomy_reasons = []
 
             time_candidates: List[Dict[str, Any]] = []
             if bool(need_time):
@@ -366,7 +343,7 @@ class FieldSolverStrategy:
                     _fused_cands = estimate_occurrence_datetime_candidates(
                         dataset=spec.dataset,
                         instruction=spec.instruction,
-                        reasons=list(hint_reasons) or [],
+                        reasons=list(taxonomy_reasons) or [],
                         top_k=max(16, int(getattr(args, "time_candidate_top_k", 8) or 8) * 2),
                     )
                     for cand in _fused_cands[: max(1, int(getattr(args, "time_candidate_top_k", 8) or 8))]:
@@ -398,10 +375,7 @@ class FieldSolverStrategy:
             comp_scores: Dict[str, float] = {}
             comp_candidates: List[str] = []
             top_metrics: Dict[str, Any] = {}
-            if bool(need_comp) and hint_components:
-                comp_candidates = list(hint_components)
-                comp_scores = {str(c): float(1.0 - 0.05 * i) for i, c in enumerate(comp_candidates)}
-            elif bool(need_comp):
+            if bool(need_comp):
                 try:
                     ev3_fresh = build_component_candidates(
                         dataset=spec.dataset,
@@ -434,17 +408,7 @@ class FieldSolverStrategy:
                         cc.append(str(c))
                 comp_candidates = [x for x in dict.fromkeys(cc) if x]
 
-            if bool(need_reason) and hint_reasons:
-                reasons = list(hint_reasons)
-            else:
-                if is_market and adapter is not None:
-                    try:
-                        rh = list(adapter.extract_reason_hints(scoring_points=str(spec.scoring_points or "")) or [])
-                    except Exception:
-                        rh = []
-                    reasons = [str(x) for x in rh if str(x).strip()] or [str(x) for x in extract_reasons_from_scoring_points(str(spec.scoring_points or "")) if str(x).strip()]
-                else:
-                    reasons = [str(x) for x in extract_reasons_from_scoring_points(str(spec.scoring_points or "")) if str(x).strip()]
+            reasons = list(taxonomy_reasons) if bool(need_reason) else []
             if adapter is not None and reasons:
                 rr = []
                 for r in reasons:
@@ -510,8 +474,6 @@ class FieldSolverStrategy:
                 "metric_scores": dict(comp_scores),
                 "matched_metrics": dict(top_metrics),
                 "component_level": str(component_level or ""),
-                "scoring_point_components": list(hint_components),
-                "scoring_point_reasons": list(hint_reasons),
                 "enable_uncertainty_llm": True,
                 "enable_time_llm": bool(getattr(args, "time_llm", False)),
                 "deterministic_only": False,
@@ -541,7 +503,7 @@ class FieldSolverStrategy:
                     raw = adapter.solve_reason(
                         spec=None,
                         instruction=str(spec.instruction or ""),
-                        scoring_points=str(spec.scoring_points or ""),
+                        scoring_points="",
                         args=args,
                         need_reason=True,
                     )
@@ -550,7 +512,7 @@ class FieldSolverStrategy:
                         _, raw_ev = predict_reason_universal(
                             dataset=str(spec.dataset or ""),
                             instruction=str(spec.instruction or ""),
-                            scoring_points=str(spec.scoring_points or ""),
+                            scoring_points="",
                         )
                     if isinstance(raw_ev, dict):
                         context["reason_evidence"] = _format_reason_evidence(raw_ev)

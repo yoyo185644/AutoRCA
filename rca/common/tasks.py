@@ -39,7 +39,7 @@ def required_root_count_from_instruction(instruction: str) -> int:
         "ten": 10,
     }
     for word, value in word_numbers.items():
-        if re.search(rf"\b{word}\s+failures?\b", text):
+        if re.search(rf"\b{word}(?:\s+\w+){{0,2}}\s+failures?\b", text):
             return int(value)
     for pattern in [
         r"\b(\d+)\s+failures?\b",

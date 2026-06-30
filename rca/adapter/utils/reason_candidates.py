@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import pandas as pd
 
 from rca.common.io import resolve_date_dir
-from rca.adapter.utils.query_parsing import extract_reason_candidates
 from rca.adapter.utils.component_candidates import parse_time_window_generic
 
 
@@ -158,7 +157,40 @@ def predict_reason_universal(
     top_metrics = _top_anomalous_metrics(metric_dir, start_s, end_s, top_k=30)
     hits = _keyword_hits(top_metrics)
     spread = _trace_spread_stats(trace_path, start_s, end_s)
-    cands = extract_reason_candidates(scoring_points)
+    cands: List[str] = []
+    try:
+        from rca.adapter.registry import get_dataset_adapter
+
+        adapter = get_dataset_adapter(dataset)
+        if adapter is not None:
+            cands = [str(x) for x in list(adapter.basil_reason_taxonomy() or []) if str(x).strip()]
+    except Exception:
+        cands = []
+    if cands:
+        hit_blob = " ".join([str(m).lower() for m in list(top_metrics or [])])
+
+        def reason_score(reason: str) -> float:
+            text = str(reason or "").lower()
+            score = 0.0
+            if "cpu" in text:
+                score += float(hits.get("cpu", 0))
+            if "mem" in text:
+                score += float(hits.get("memory", 0))
+            if "disk" in text or "i/o" in text or "io" in text:
+                score += float(hits.get("disk", 0))
+            if "loss" in text or "packet" in text:
+                score += float(hits.get("net_loss", 0))
+            if "delay" in text or "latency" in text:
+                score += float(hits.get("net_delay", 0))
+            if "db" in text or "connection" in text or "close" in text:
+                score += float(hits.get("db", 0))
+            # Weak exact-token support from metric names.
+            for token in re.findall(r"[a-z0-9]+", text):
+                if len(token) >= 3 and token in hit_blob:
+                    score += 0.25
+            return float(score)
+
+        cands = sorted(dict.fromkeys(cands), key=reason_score, reverse=True)
     evidence = {
         "dataset": dataset,
         "date_dir": date_dir,

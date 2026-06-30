@@ -322,18 +322,8 @@ class DatasetAdapter:
         reason_scores = dict((context or {}).get("reason_scores", {}) or {})
         top_metrics = dict((context or {}).get("top_metrics", {}) or {})
 
-        hint_components = [
-            self.parse_component_id(x)
-            for x in list((context or {}).get("scoring_point_components") or [])
-            if str(x).strip()
-        ]
-        hint_components = [x for x in dict.fromkeys(hint_components) if x]
-        hint_reasons = [
-            self.parse_root_cause_label(x)
-            for x in list((context or {}).get("scoring_point_reasons") or [])
-            if str(x).strip()
-        ]
-        hint_reasons = [x for x in dict.fromkeys(hint_reasons) if x]
+        hint_components: List[str] = []
+        hint_reasons: List[str] = []
         global_reasons = [
             self.parse_root_cause_label(x)
             for x in list((context or {}).get("allowed_reasons") or [])
@@ -344,6 +334,7 @@ class DatasetAdapter:
         max_base = max([abs(float(getattr(c, "score", 0.0) or 0.0)) for c in candidates] + [1e-9])
         max_comp = max([abs(float(v)) for v in comp_scores.values()] + [1e-9])
         max_reason = max([abs(float(v)) for v in reason_scores.values()] + [1e-9])
+        component_only = bool(need_comp) and not bool(need_reason) and not bool(need_time)
 
         scored: List[Tuple[float, Any]] = []
         for cand in list(candidates or []):
@@ -368,8 +359,74 @@ class DatasetAdapter:
             reason_norm = float(reason_scores.get(reason, 0.0)) / max_reason if reason else 0.0
             metrics = [str(x) for x in list(top_metrics.get(comp, []) or [])]
 
-            score = 0.50 * base_norm
-            if bool(need_comp):
+            rootness_features: Dict[str, float] = {}
+            if component_only:
+                local_ev = self.component_local_metric_evidence(component=comp, context=context)
+                local_metrics = [str(x) for x in list(local_ev.get("top_metrics", []) or []) if str(x).strip()]
+                if local_metrics and not metrics:
+                    metrics = local_metrics
+                metric_ev = self.metric_rank_evidence(component=comp, metrics=metrics)
+                latent_ev = self.latent_reason_metric_score(component=comp, metrics=metrics)
+                score = self.component_evidence_score(
+                    component=comp,
+                    base_score=float(getattr(cand, "score", 0.0) or 0.0),
+                    context=context,
+                    metric_score=max(
+                        float(metric_ev.get("metric_score", 0.0) or 0.0),
+                        float(latent_ev.get("score", 0.0) or 0.0),
+                        float(local_ev.get("metric_score", 0.0) or 0.0),
+                    ),
+                    ownership_score=max(
+                        float(metric_ev.get("ownership", 0.0) or 0.0),
+                        float(local_ev.get("ownership", 0.0) or 0.0),
+                    ),
+                    symptomness=max(
+                        float(metric_ev.get("symptomness", 0.0) or 0.0),
+                        float(local_ev.get("symptomness", 0.0) or 0.0),
+                    ),
+                    locality=float(local_ev.get("locality", 0.0) or 0.0),
+                    persistence=float(local_ev.get("persistence", 0.0) or 0.0),
+                    instance_owned_score=float(local_ev.get("instance_owned_score", 0.0) or 0.0),
+                    sibling_contrast=float(local_ev.get("sibling_contrast", 0.0) or 0.0),
+                )
+                rootness_features = self._component_rootness_features(
+                    component=comp,
+                    base_score=float(getattr(cand, "score", 0.0) or 0.0),
+                    context=context,
+                    metric_score=max(
+                        float(metric_ev.get("metric_score", 0.0) or 0.0),
+                        float(latent_ev.get("score", 0.0) or 0.0),
+                        float(local_ev.get("metric_score", 0.0) or 0.0),
+                    ),
+                    ownership_score=max(
+                        float(metric_ev.get("ownership", 0.0) or 0.0),
+                        float(local_ev.get("ownership", 0.0) or 0.0),
+                    ),
+                    symptomness=max(
+                        float(metric_ev.get("symptomness", 0.0) or 0.0),
+                        float(local_ev.get("symptomness", 0.0) or 0.0),
+                    ),
+                    locality=float(local_ev.get("locality", 0.0) or 0.0),
+                    persistence=float(local_ev.get("persistence", 0.0) or 0.0),
+                    instance_owned_score=float(local_ev.get("instance_owned_score", 0.0) or 0.0),
+                    sibling_contrast=float(local_ev.get("sibling_contrast", 0.0) or 0.0),
+                )
+                try:
+                    cand.source = str(getattr(cand, "source", "") or "adapter_rerank")
+                    if latent_ev.get("reason"):
+                        old_ev = [str(x) for x in list(getattr(cand, "evidence", []) or [])]
+                        old_ev.append(f"latent_reason={latent_ev.get('reason')}")
+                        if local_ev.get("metric_score", 0.0):
+                            old_ev.append(
+                                "local_change="
+                                f"{float(local_ev.get('metric_score', 0.0) or 0.0):.3f}"
+                            )
+                        cand.evidence = list(dict.fromkeys(old_ev))
+                except Exception:
+                    pass
+            else:
+                score = 0.50 * base_norm
+            if bool(need_comp) and not (bool(need_comp) and not bool(need_reason) and not bool(need_time)):
                 score += 0.25 * comp_norm
             if bool(need_reason):
                 score += 0.25 * reason_norm
@@ -385,6 +442,8 @@ class DatasetAdapter:
                 cand.component = comp
                 cand.reason = reason
                 cand.score = float(score)
+                if rootness_features:
+                    setattr(cand, "rootness_features", dict(rootness_features))
                 if metrics:
                     old_ev = [str(x) for x in list(getattr(cand, "evidence", []) or [])]
                     cand.evidence = list(dict.fromkeys(old_ev + metrics[:6]))
@@ -393,7 +452,8 @@ class DatasetAdapter:
             scored.append((float(score), cand))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return self._postprocess_reranked([c for _, c in scored])
+        ordered = [c for _, c in scored]
+        return self._postprocess_reranked(ordered)
 
     def _type_consistency(self, comp: str, reason: str, metrics: List[str]) -> float:
         """Additive bonus/penalty for component–reason type alignment.
@@ -423,101 +483,14 @@ class DatasetAdapter:
         clip: float = 4.0,
     ) -> Dict[str, float]:
         """
-        Derive component-type prior weights from dataset telemetry and labels.
+        Return neutral priors by default.
 
-        lift(type) = P(root-cause is this type) / P(type exists in metric data)
-
-        Returns a dict mapping semantic type → multiplier (normalised to mean=1.0).
-        Falls back to an empty dict (all priors = 1.0) on any I/O error.
+        Earlier experimental versions estimated priors from evaluation labels.
+        That leaks ground truth and is intentionally disabled. Dataset-specific
+        adapters may provide non-leaking priors from telemetry-only profiles,
+        but the shared path must stay neutral.
         """
-        from collections import Counter
-
-        import pandas as pd
-
-        # ── Step 1: RC type frequencies from scoring_points in query.csv ────
-        query_path = f"dataset/{self.dataset}/query.csv"
-        rc_counter: Counter[str] = Counter()
-        try:
-            df_q = pd.read_csv(query_path)
-            for sp in df_q.get("scoring_points", pd.Series(dtype=str)).dropna():
-                for m in self._COMP_RE.finditer(str(sp)):
-                    raw = m.group(1).strip(" .")
-                    ctype = self.component_semantic_type(self.parse_component_id(raw))
-                    if ctype:
-                        rc_counter[ctype] += 1
-        except Exception:
-            return {}
-
-        if not rc_counter or sum(rc_counter.values()) < min_rc_count:
-            return {}
-
-        # ── Step 2: Base-rate from telemetry component column ────────────────
-        paths = dict(self.config.get("paths", {}) or {})
-        telemetry_root = str(
-            paths.get("telemetry_root", f"dataset/{self.dataset}/telemetry")
-        )
-        data_counter: Counter[str] = Counter()
-        file_count = 0
-        col_lower = {c.lower(): c for c in self._TELEMETRY_COMP_COLS}
-
-        if os.path.isdir(telemetry_root):
-            for dirpath, _dirs, names in os.walk(telemetry_root):
-                for name in sorted(names):
-                    if not name.lower().endswith((".csv", ".tsv")):
-                        continue
-                    if file_count >= max_telemetry_files:
-                        break
-                    path = os.path.join(dirpath, name)
-                    try:
-                        sep = "\t" if name.endswith(".tsv") else ","
-                        hdr = pd.read_csv(path, nrows=0, sep=sep)
-                        matched = [
-                            str(c)
-                            for c in hdr.columns
-                            if str(c).lower() in col_lower
-                        ]
-                        if not matched:
-                            continue
-                        df_t = pd.read_csv(
-                            path, usecols=[matched[0]], nrows=50_000, sep=sep
-                        )
-                        for val in df_t[matched[0]].dropna().unique():
-                            ctype = self.component_semantic_type(
-                                self.parse_component_id(str(val))
-                            )
-                            if ctype:
-                                data_counter[ctype] += 1
-                        file_count += 1
-                    except Exception:
-                        continue
-                if file_count >= max_telemetry_files:
-                    break
-
-        # ── Step 3: Compute lift and normalise ───────────────────────────────
-        all_types = set(rc_counter.keys()) | set(data_counter.keys())
-        n = len(all_types) or 1
-        total_rc = sum(rc_counter.values())
-        total_data = sum(data_counter.values()) or 1
-
-        priors: Dict[str, float] = {}
-        for ctype in all_types:
-            rc_cnt = rc_counter.get(ctype, 0)
-            if rc_cnt < min_rc_count:
-                continue
-            data_cnt = max(data_counter.get(ctype, 0), 1)
-            p_rc = (rc_cnt + smoothing) / (total_rc + smoothing * n)
-            p_data = (data_cnt + smoothing) / (total_data + smoothing * n)
-            lift = float(max(1.0 / clip, min(clip, p_rc / p_data)))
-            priors[ctype] = lift
-
-        if not priors:
-            return {}
-
-        # Normalise so mean = 1.0 (preserves relative weights, unbiased overall)
-        mean_v = sum(priors.values()) / len(priors)
-        if mean_v > 0:
-            priors = {k: v / mean_v for k, v in priors.items()}
-        return priors
+        return {}
 
     def _component_prior(self, comp: str) -> float:
         """Multiplicative weight applied after scoring.
@@ -792,10 +765,565 @@ class DatasetAdapter:
     def component_semantic_type(self, component: str) -> str:
         return ""
 
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _clip01(value: Any) -> float:
+        try:
+            v = float(value)
+        except Exception:
+            return 0.0
+        if v < 0.0:
+            return 0.0
+        if v > 1.0:
+            return 1.0
+        return v
+
+    def component_evidence_score(
+        self,
+        *,
+        component: str,
+        base_score: float,
+        context: Mapping[str, Any],
+        metric_score: float = 0.0,
+        ownership_score: float = 0.0,
+        symptomness: float = 0.0,
+        locality: float = 0.0,
+        persistence: float = 0.0,
+        instance_owned_score: float = 0.0,
+        sibling_contrast: float = 0.0,
+    ) -> float:
+        """Shared component ranking score for indexed evidence candidates.
+
+        The formula is dataset-agnostic. Dataset adapters only define semantic
+        type and metric ownership; this helper handles global vs typed-channel
+        normalization, component-local metric strength, and symptom discount.
+        """
+        comp = self.parse_component_id(str(component or ""))
+        comp_scores = dict((context or {}).get("component_scores", {}) or {})
+        max_global = max([abs(self._safe_float(v)) for v in comp_scores.values()] + [abs(self._safe_float(base_score)), 1.0])
+        raw_norm = self._safe_float(comp_scores.get(comp, base_score)) / max_global
+        raw_norm = max(0.0, min(1.0, raw_norm))
+
+        by_channel: Dict[str, List[Tuple[str, float]]] = {}
+        for c, score in comp_scores.items():
+            ch = str(self.component_semantic_type(str(c)) or "other")
+            by_channel.setdefault(ch, []).append((str(c), self._safe_float(score)))
+        for values in by_channel.values():
+            values.sort(key=lambda kv: kv[1], reverse=True)
+
+        channel = str(self.component_semantic_type(comp) or "other")
+        channel_values = by_channel.get(channel, [])
+        max_channel = max([abs(v) for _, v in channel_values] + [abs(self._safe_float(base_score)), 1.0])
+        local_norm = self._safe_float(comp_scores.get(comp, base_score)) / max_channel
+        local_norm = max(0.0, min(1.0, local_norm))
+        rank_prior = 0.0
+        for idx, (c, _score) in enumerate(channel_values, start=1):
+            if c == comp:
+                rank_prior = 1.0 / float(idx)
+                break
+        propagation = self._component_propagation_features(component=comp, context=context)
+
+        try:
+            from rca.adapter.ranker.rootness import RootnessFeatures, RootnessRanker
+
+            return float(
+                RootnessRanker().score(
+                    RootnessFeatures.from_mapping(
+                        {
+                            "global_score": raw_norm,
+                            "channel_score": local_norm,
+                            "channel_rank_score": rank_prior,
+                            "local_change": self._safe_float(metric_score),
+                            "ownership": self._safe_float(ownership_score),
+                            "locality": self._safe_float(locality),
+                            "persistence": self._safe_float(persistence),
+                            "instance_owned_score": self._safe_float(instance_owned_score),
+                            "sibling_contrast": self._safe_float(sibling_contrast),
+                            "symptomness": self._safe_float(symptomness),
+                            **propagation,
+                        }
+                    )
+                )
+            )
+        except Exception:
+            score = (
+                0.50 * max(0.0, raw_norm)
+                + 0.35 * max(0.0, local_norm)
+                + 0.10 * max(0.0, rank_prior)
+                + 0.20 * max(0.0, self._safe_float(metric_score))
+                + 0.10 * max(0.0, self._safe_float(ownership_score))
+            )
+            sym = max(0.0, min(1.0, self._safe_float(symptomness)))
+            if sym > 0.0:
+                score *= max(0.55, 1.0 - 0.35 * sym)
+            score += 0.12 * max(0.0, propagation.get("causal_source_score", 0.0))
+            score += 0.08 * max(0.0, propagation.get("outgoing_propagation", 0.0))
+            incoming = max(0.0, propagation.get("incoming_symptomness", 0.0))
+            if incoming > 0.0:
+                score *= max(0.50, 1.0 - 0.40 * incoming)
+            return float(max(0.0, score))
+
+    def _edge_value(self, edge: Any, key: str, default: Any = None) -> Any:
+        if isinstance(edge, Mapping):
+            return edge.get(key, default)
+        return getattr(edge, key, default)
+
+    def _parse_context_time_s(self, value: Any, *, context: Mapping[str, Any]) -> int:
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        try:
+            import pandas as pd
+
+            tz = str(self.config.get("timezone", "Asia/Shanghai") or "Asia/Shanghai")
+            ts = pd.Timestamp(text)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(tz)
+            return int(ts.tz_convert("UTC").timestamp())
+        except Exception:
+            return 0
+
+    def _component_propagation_features(
+        self,
+        *,
+        component: str,
+        context: Mapping[str, Any],
+    ) -> Dict[str, float]:
+        """Trace-direction evidence shared by all dataset adapters.
+
+        Causal edges in the BASIL index use ``src -> dst`` to denote a
+        propagation candidate: the source component can explain later symptoms
+        at the destination.  A root-like component should have strong outgoing
+        edges whose destination anomalies occur later; a symptom-like component
+        often has strong incoming edges from earlier upstream anomalies.
+        """
+        comp = self.parse_component_id(str(component or ""))
+        if not comp:
+            return {"causal_source_score": 0.0, "outgoing_propagation": 0.0, "incoming_symptomness": 0.0}
+
+        causal_scores = dict((context or {}).get("causal_scores", {}) or {})
+        max_causal = max([abs(self._safe_float(v)) for v in causal_scores.values()] + [1.0])
+        causal_source = self._clip01(self._safe_float(causal_scores.get(comp, 0.0)) / max_causal)
+
+        first_times = dict((context or {}).get("component_first_times", {}) or {})
+        comp_t = self._parse_context_time_s(first_times.get(comp), context=context)
+
+        edges = list((context or {}).get("causal_edges", []) or [])
+        max_edge_score = 0.0
+        for edge in edges:
+            max_edge_score = max(
+                max_edge_score,
+                self._safe_float(self._edge_value(edge, "score", 0.0)),
+                self._safe_float(self._edge_value(edge, "transfer_max", 0.0)),
+                self._safe_float(self._edge_value(edge, "lift_max", 0.0)),
+            )
+        max_edge_score = max(max_edge_score, 1e-9)
+
+        outgoing = 0.0
+        incoming = 0.0
+        for edge in edges:
+            src = self.parse_component_id(str(self._edge_value(edge, "src", "") or ""))
+            dst = self.parse_component_id(str(self._edge_value(edge, "dst", "") or ""))
+            if not src or not dst:
+                continue
+            score = max(
+                self._safe_float(self._edge_value(edge, "score", 0.0)),
+                self._safe_float(self._edge_value(edge, "transfer_max", 0.0)),
+                self._safe_float(self._edge_value(edge, "lift_max", 0.0)),
+            )
+            score = self._clip01(score / max_edge_score)
+            if score <= 0.0:
+                continue
+
+            if src == comp:
+                dst_t = self._parse_context_time_s(first_times.get(dst), context=context)
+                if comp_t > 0 and dst_t > 0:
+                    temporal = 1.0 if comp_t <= dst_t else 0.25
+                else:
+                    temporal = 0.60
+                outgoing += score * temporal
+            if dst == comp:
+                src_t = self._parse_context_time_s(first_times.get(src), context=context)
+                if comp_t > 0 and src_t > 0:
+                    temporal = 1.0 if src_t <= comp_t else 0.25
+                else:
+                    temporal = 0.60
+                incoming += score * temporal
+
+        return {
+            "causal_source_score": self._clip01(causal_source),
+            "outgoing_propagation": self._clip01(outgoing),
+            "incoming_symptomness": self._clip01(incoming),
+        }
+
+    def _component_rootness_features(
+        self,
+        *,
+        component: str,
+        base_score: float,
+        context: Mapping[str, Any],
+        metric_score: float = 0.0,
+        ownership_score: float = 0.0,
+        symptomness: float = 0.0,
+        locality: float = 0.0,
+        persistence: float = 0.0,
+        instance_owned_score: float = 0.0,
+        sibling_contrast: float = 0.0,
+    ) -> Dict[str, float]:
+        comp = self.parse_component_id(str(component or ""))
+        comp_scores = dict((context or {}).get("component_scores", {}) or {})
+        max_global = max([abs(self._safe_float(v)) for v in comp_scores.values()] + [abs(self._safe_float(base_score)), 1.0])
+        raw_norm = max(0.0, min(1.0, self._safe_float(comp_scores.get(comp, base_score)) / max_global))
+
+        by_channel: Dict[str, List[Tuple[str, float]]] = {}
+        for c, score in comp_scores.items():
+            ch = str(self.component_semantic_type(str(c)) or "other")
+            by_channel.setdefault(ch, []).append((str(c), self._safe_float(score)))
+        for values in by_channel.values():
+            values.sort(key=lambda kv: kv[1], reverse=True)
+
+        channel = str(self.component_semantic_type(comp) or "other")
+        channel_values = by_channel.get(channel, [])
+        max_channel = max([abs(v) for _, v in channel_values] + [abs(self._safe_float(base_score)), 1.0])
+        local_norm = max(0.0, min(1.0, self._safe_float(comp_scores.get(comp, base_score)) / max_channel))
+        rank_prior = 0.0
+        for idx, (c, _score) in enumerate(channel_values, start=1):
+            if c == comp:
+                rank_prior = 1.0 / float(idx)
+                break
+        propagation = self._component_propagation_features(component=comp, context=context)
+        return {
+            "global_score": raw_norm,
+            "channel_score": local_norm,
+            "channel_rank_score": max(0.0, min(1.0, rank_prior)),
+            "local_change": max(0.0, min(1.0, self._safe_float(metric_score))),
+            "ownership": max(0.0, min(1.0, self._safe_float(ownership_score))),
+            "locality": max(0.0, min(1.0, self._safe_float(locality))),
+            "persistence": max(0.0, min(1.0, self._safe_float(persistence))),
+            "instance_owned_score": max(0.0, min(1.0, self._safe_float(instance_owned_score))),
+            "sibling_contrast": max(0.0, min(1.0, self._safe_float(sibling_contrast))),
+            "symptomness": max(0.0, min(1.0, self._safe_float(symptomness))),
+            **propagation,
+        }
+
+    def _pairwise_rerank_component_only(self, candidates: Sequence[Any]) -> List[Any]:
+        try:
+            from rca.adapter.ranker.rootness import RootnessRanker
+        except Exception:
+            return list(candidates or [])
+        rows: List[Dict[str, Any]] = []
+        by_id: Dict[int, Any] = {}
+        for idx, cand in enumerate(list(candidates or [])):
+            row = {
+                "idx": idx,
+                "score": float(getattr(cand, "score", 0.0) or 0.0),
+                "rootness_features": dict(getattr(cand, "rootness_features", {}) or {}),
+            }
+            rows.append(row)
+            by_id[idx] = cand
+        ranked = RootnessRanker().rerank_pairwise(rows)
+        return [by_id[int(row["idx"])] for row in ranked if int(row.get("idx", -1)) in by_id]
+
+    def component_local_metric_evidence(
+        self,
+        *,
+        component: str,
+        context: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Telemetry-only local change evidence for component ranking.
+
+        This shared scorer does not read query labels or historical records. It
+        asks a causal-change-point question for every component: were this
+        component's own metrics weak before the incident window, stronger in the
+        window, persistent, and relatively local to a small set of components?
+        Dataset adapters only provide canonical component names and metric
+        ownership via ``metric_rank_evidence``.
+        """
+        comp = self.parse_component_id(str(component or ""))
+        if not comp:
+            return {"metric_score": 0.0, "ownership": 0.0, "symptomness": 0.0, "top_metrics": []}
+        evidence = self._component_local_metric_evidence_map(context=context)
+        return dict(evidence.get(comp, {}) or {"metric_score": 0.0, "ownership": 0.0, "symptomness": 0.0, "top_metrics": []})
+
+    def _component_local_metric_evidence_map(self, *, context: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+        import math
+        import os
+
+        import pandas as pd
+
+        dataset = str((context or {}).get("dataset", "") or "") or self.dataset
+        date_dir = str((context or {}).get("date_dir", "") or "")
+        start_local = str((context or {}).get("query_start_local", "") or "")
+        end_local = str((context or {}).get("query_end_local", "") or "")
+        if not dataset or not date_dir or not start_local or not end_local:
+            return {}
+
+        cache_key = (dataset, date_dir, start_local, end_local)
+        cache = getattr(self, "_component_local_metric_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(self, "_component_local_metric_cache", cache)
+        if cache_key in cache:
+            return dict(cache[cache_key])
+
+        metric_dir = os.path.join("dataset", dataset, "telemetry", date_dir, "metric")
+        if not os.path.isdir(metric_dir):
+            cache[cache_key] = {}
+            return {}
+
+        try:
+            tz = str(self.config.get("timezone", "Asia/Shanghai") or "Asia/Shanghai")
+            start_s = int(pd.Timestamp(start_local, tz=tz).tz_convert("UTC").timestamp())
+            end_s = int(pd.Timestamp(end_local, tz=tz).tz_convert("UTC").timestamp())
+        except Exception:
+            cache[cache_key] = {}
+            return {}
+        if end_s < start_s:
+            start_s, end_s = end_s, start_s
+        window_s = max(60, int(end_s - start_s))
+        before_start_s = int(start_s - max(600, window_s))
+
+        try:
+            from rca.adapter.utils.component_candidates import _normalize_metric_file
+        except Exception:
+            cache[cache_key] = {}
+            return {}
+
+        comp_metric_sum: Dict[str, Dict[str, float]] = {}
+        comp_minute_sum: Dict[str, Dict[int, float]] = {}
+        comp_before_sum: Dict[str, float] = {}
+        metric_components: Dict[str, set[str]] = {}
+
+        paths = [
+            os.path.join(metric_dir, name)
+            for name in os.listdir(metric_dir)
+            if str(name).endswith(".csv")
+        ]
+        for path in paths:
+            try:
+                long = _normalize_metric_file(path)
+            except Exception:
+                continue
+            if long.empty:
+                continue
+            try:
+                p95 = (
+                    long.groupby(["component", "metric"], as_index=False)["value"]
+                    .quantile(0.95)
+                    .rename(columns={"value": "p95"})
+                )
+                use = long[
+                    (long["ts_s"] >= before_start_s)
+                    & (long["ts_s"] <= end_s)
+                ].copy()
+                if use.empty:
+                    continue
+                use = use.merge(p95, on=["component", "metric"], how="left").dropna(subset=["p95"]).copy()
+                denom = use["p95"].abs().where(use["p95"].abs() > 1e-6, 1.0)
+                use["breach_ratio"] = ((use["value"] - use["p95"]) / denom).clip(lower=0.0, upper=10.0)
+                use = use[use["breach_ratio"] > 0].copy()
+                if use.empty:
+                    continue
+                use["component"] = use["component"].map(lambda x: self.parse_component_id(str(x)))
+                use = use[use["component"].astype(str).str.len() > 0].copy()
+                if use.empty:
+                    continue
+                use["metric"] = use["metric"].astype(str)
+                use["minute"] = (use["ts_s"].astype(int) // 60) * 60
+            except Exception:
+                continue
+
+            win = use[(use["ts_s"] >= start_s) & (use["ts_s"] <= end_s)].copy()
+            before = use[(use["ts_s"] >= before_start_s) & (use["ts_s"] < start_s)].copy()
+
+            if not before.empty:
+                for comp, value in before.groupby("component")["breach_ratio"].sum().items():
+                    comp_before_sum[str(comp)] = comp_before_sum.get(str(comp), 0.0) + float(value)
+
+            if win.empty:
+                continue
+            by_cm = win.groupby(["component", "metric"], as_index=False)["breach_ratio"].sum()
+            for _, row in by_cm.iterrows():
+                comp = str(row["component"])
+                metric = str(row["metric"])
+                value = float(row["breach_ratio"])
+                comp_metric_sum.setdefault(comp, {})
+                comp_metric_sum[comp][metric] = comp_metric_sum[comp].get(metric, 0.0) + value
+                metric_components.setdefault(metric, set()).add(comp)
+
+            by_min = win.groupby(["component", "minute"], as_index=False)["breach_ratio"].sum()
+            for _, row in by_min.iterrows():
+                comp = str(row["component"])
+                minute = int(row["minute"])
+                value = float(row["breach_ratio"])
+                comp_minute_sum.setdefault(comp, {})
+                comp_minute_sum[comp][minute] = comp_minute_sum[comp].get(minute, 0.0) + value
+
+        if not comp_metric_sum:
+            cache[cache_key] = {}
+            return {}
+
+        comps = sorted(comp_metric_sum.keys())
+        n_comp = max(1, len(comps))
+        raw: Dict[str, Dict[str, Any]] = {}
+        max_peak = 1e-9
+        max_contrast = 1e-9
+        for comp in comps:
+            metric_scores = comp_metric_sum.get(comp, {})
+            top = sorted(metric_scores.items(), key=lambda kv: kv[1], reverse=True)[:8]
+            top_metrics = [str(m) for m, _ in top]
+            minute_values = list(comp_minute_sum.get(comp, {}).values())
+            peak = max(minute_values) if minute_values else 0.0
+            after_mean = float(sum(minute_values)) / float(max(1, len(minute_values)))
+            before_total = float(comp_before_sum.get(comp, 0.0) or 0.0)
+            before_minutes = max(1, window_s // 60)
+            before_mean = before_total / float(before_minutes)
+            contrast = max(0.0, after_mean - before_mean)
+            threshold = max(0.05, 0.25 * peak)
+            persistence = (
+                float(sum(1 for v in minute_values if v >= threshold)) / float(max(1, len(minute_values)))
+                if minute_values
+                else 0.0
+            )
+            locality_values = []
+            for metric in top_metrics:
+                df = len(metric_components.get(metric, set()))
+                if n_comp > 1:
+                    locality_values.append(math.log((1.0 + n_comp) / (1.0 + df)) / math.log(1.0 + n_comp))
+            locality = float(sum(locality_values)) / float(max(1, len(locality_values))) if locality_values else 0.0
+            rank_ev = self.metric_rank_evidence(component=comp, metrics=top_metrics)
+            raw[comp] = {
+                "peak": float(peak),
+                "contrast": float(contrast),
+                "persistence": float(max(0.0, min(1.0, persistence))),
+                "locality": float(max(0.0, min(1.0, locality))),
+                "ownership": float(rank_ev.get("ownership", 0.0) or 0.0),
+                "symptomness": float(rank_ev.get("symptomness", 0.0) or 0.0),
+                "top_metrics": top_metrics,
+            }
+            max_peak = max(max_peak, float(peak))
+            max_contrast = max(max_contrast, float(contrast))
+
+        preliminary: Dict[str, float] = {}
+        for comp, ev in raw.items():
+            peak_norm = float(ev["peak"]) / max_peak
+            contrast_norm = float(ev["contrast"]) / max_contrast
+            persistence = float(ev["persistence"])
+            locality = float(ev["locality"])
+            ownership = float(ev["ownership"])
+            symptomness = max(0.0, min(1.0, float(ev["symptomness"])))
+            metric_score = (
+                0.40 * contrast_norm
+                + 0.25 * peak_norm
+                + 0.20 * persistence
+                + 0.15 * locality
+            )
+            if ownership > 0:
+                metric_score = 0.75 * metric_score + 0.25 * ownership
+            if symptomness > 0:
+                metric_score *= max(0.60, 1.0 - 0.30 * symptomness)
+            preliminary[comp] = float(max(0.0, min(1.0, metric_score)))
+
+        by_sibling_type: Dict[str, List[float]] = {}
+        for comp, score in preliminary.items():
+            ctype = str(self.component_semantic_type(comp) or "other")
+            by_sibling_type.setdefault(ctype, []).append(float(score))
+        for values in by_sibling_type.values():
+            values.sort()
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for comp, ev in raw.items():
+            persistence = float(ev["persistence"])
+            locality = float(ev["locality"])
+            ownership = float(ev["ownership"])
+            symptomness = max(0.0, min(1.0, float(ev["symptomness"])))
+            metric_score = preliminary.get(comp, 0.0)
+            siblings = by_sibling_type.get(str(self.component_semantic_type(comp) or "other"), [])
+            if siblings:
+                mid = len(siblings) // 2
+                median = siblings[mid] if len(siblings) % 2 else 0.5 * (siblings[mid - 1] + siblings[mid])
+                max_sibling = max(siblings) if siblings else 1.0
+                denom = max(1e-9, float(max_sibling) - float(median))
+                sibling_contrast = max(0.0, (float(metric_score) - float(median)) / denom) if max_sibling > median else 0.0
+            else:
+                sibling_contrast = 0.0
+            instance_owned_score = max(0.0, min(1.0, ownership * (0.50 + 0.50 * float(metric_score)) * (1.0 - 0.50 * symptomness)))
+            out[comp] = {
+                "metric_score": float(max(0.0, min(1.0, metric_score))),
+                "ownership": ownership,
+                "symptomness": symptomness,
+                "top_metrics": list(ev.get("top_metrics", []) or []),
+                "contrast": float(ev["contrast"]),
+                "persistence": persistence,
+                "locality": locality,
+                "instance_owned_score": float(max(0.0, min(1.0, instance_owned_score))),
+                "sibling_contrast": float(max(0.0, min(1.0, sibling_contrast))),
+            }
+        cache[cache_key] = dict(out)
+        return out
+
+    def metric_rank_evidence(self, *, component: str, metrics: Sequence[str]) -> Dict[str, float]:
+        """Dataset hook for component-local metric ownership.
+
+        Returns values in [0, 1]:
+        - metric_score: strength of component-owned metric evidence
+        - ownership: fraction/quality of metrics owned by this component type
+        - symptomness: how much evidence looks like shared downstream symptoms
+        """
+        return {"metric_score": 0.0, "ownership": 0.0, "symptomness": 0.0}
+
+    def latent_reason_metric_score(self, *, component: str, metrics: Sequence[str]) -> Dict[str, Any]:
+        """Infer a non-output latent reason score from taxonomy and metrics.
+
+        This is used for component-only tasks: the final answer remains a
+        component, but component ranking can still benefit from reason-like
+        evidence without reading evaluation labels.
+        """
+        rows = [str(m or "").lower() for m in list(metrics or []) if str(m or "").strip()]
+        if not rows:
+            return {"score": 0.0, "reason": ""}
+        blob = " ".join(rows)
+        best_reason = ""
+        best_score = 0.0
+        for reason in list(self.basil_reason_taxonomy() or []):
+            label = self.parse_root_cause_label(str(reason or ""))
+            keywords = [str(x).lower() for x in list(self.reason_metric_keywords(label) or []) if str(x).strip()]
+            if not keywords:
+                continue
+            hits = sum(1 for tok in keywords if tok in blob)
+            score = float(hits) / float(max(1, min(4, len(keywords))))
+            expected = set(self.reason_compatible_component_types(label) or [])
+            ctype = str(self.component_semantic_type(component) or "")
+            if expected and ctype in expected:
+                score += 0.25
+            elif expected and ctype and ctype not in expected:
+                score *= 0.60
+            if score > best_score:
+                best_score = float(score)
+                best_reason = str(label)
+        return {"score": float(max(0.0, min(1.0, best_score))), "reason": best_reason}
+
     def reason_semantic_type(self, reason: str) -> str:
         return ""
 
     def reason_metric_keywords(self, reason: str) -> List[str]:
+        return []
+
+    def reason_compatible_component_types(self, reason: str) -> List[str]:
+        return []
+
+    def basil_reason_taxonomy(self) -> List[str]:
+        data = self.config.get("reason_taxonomy", {})
+        if isinstance(data, Mapping):
+            return [str(k) for k in data.keys() if str(k).strip()]
+        if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+            return [str(x) for x in data if str(x).strip()]
         return []
 
     def llm_reason_rules(self) -> List[str]:
@@ -865,8 +1393,7 @@ class DatasetAdapter:
         if need_time:
             try:
                 from rca.adapter.utils.time_candidates import estimate_occurrence_datetime_candidates
-                from rca.adapter.utils.query_parsing import extract_reason_candidates
-                reasons = extract_reason_candidates(str(scoring_points or ""))
+                reasons = list(self.basil_reason_taxonomy() or [])
                 generated = estimate_occurrence_datetime_candidates(
                     dataset=str(getattr(self, "dataset", "") or ""),
                     instruction=str(instruction or ""),

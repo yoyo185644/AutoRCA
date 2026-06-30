@@ -67,6 +67,9 @@ class BankAdapter(DatasetAdapter):
         self._paths = dict(config.get("paths", {}))
         self._timezone = str(config.get("timezone", "Asia/Shanghai"))
 
+    def basil_reason_taxonomy(self) -> List[str]:
+        return list(_ALLOWED_REASONS)
+
     def parse_component_id(self, raw: str) -> str:
         return self.canonicalize_component(component=str(raw or ""), component_level="pod")
 
@@ -134,6 +137,18 @@ class BankAdapter(DatasetAdapter):
             return ["packet", "loss", "drop", "network"]
         if "latency" in r:
             return ["latency", "delay", "network"]
+        return []
+
+    def reason_compatible_component_types(self, reason: str) -> List[str]:
+        r = _norm_token(self.parse_root_cause_label(str(reason or "")))
+        if "jvm" in r or "heap" in r:
+            return ["app"]
+        if "disk" in r:
+            return ["db", "web", "app"]
+        if "network" in r or "latency" in r or "packet" in r:
+            return ["gateway", "web", "app"]
+        if "cpu" in r or "memory" in r:
+            return ["app", "db", "cache", "web", "gateway"]
         return []
 
     def llm_reason_rules(self) -> List[str]:
@@ -245,7 +260,8 @@ class BankAdapter(DatasetAdapter):
         return "pod"
 
     def canonicalize_component(self, *, component: str, component_level: str) -> str:
-        return _canonicalize_from_map(str(component or ""), _COMPONENT_CANON)
+        c = _canonicalize_from_map(str(component or ""), _COMPONENT_CANON)
+        return c if c in _ALLOWED_COMPONENTS else ""
 
     def basil_query_config_overrides(
         self,
@@ -277,6 +293,51 @@ class BankAdapter(DatasetAdapter):
         blob = " ".join(str(x or "").lower() for x in top_metrics or [])
         hits = sum(1 for tok in tokens if tok and tok in blob)
         return min(1.0, float(hits) / float(max(1, min(3, len(tokens)))))
+
+    def metric_rank_evidence(self, *, component: str, metrics: Sequence[str]) -> Dict[str, float]:
+        ctype = self.component_semantic_type(str(component or ""))
+        rows = [str(m or "").lower() for m in list(metrics or []) if str(m or "").strip()]
+        if not rows:
+            return {"metric_score": 0.0, "ownership": 0.0, "symptomness": 0.0}
+
+        owned_tokens = {
+            "app": ("tomcat", "jvm", "heap", "thread", "request"),
+            "db": ("mysql", "innodb", "sql", "query", "threadsrunning", "trx", "handler"),
+            "cache": ("redis", "used_memory", "instantaneous", "mem_fragmentation"),
+            "web": ("apache", "httpd", "http", "request"),
+            "gateway": ("network", "net", "tcp", "ens160", "packet", "latency"),
+        }.get(ctype, ())
+        generic_tokens = (
+            "trace_duration",
+            "trace",
+            "oslinux",
+            "localdisk",
+            "cpu_cpu",
+            "filesystem",
+            "zabbix",
+            "ntp",
+        )
+
+        owned = 0
+        generic = 0
+        for metric in rows:
+            if any(tok in metric for tok in owned_tokens):
+                owned += 1
+            if any(tok in metric for tok in generic_tokens):
+                generic += 1
+        n = max(1, len(rows))
+        ownership = float(owned) / float(n)
+        metric_score = min(1.0, float(owned) / 3.0)
+        symptomness = 0.0
+        if generic:
+            symptomness = float(generic) / float(n)
+        if ownership > 0:
+            symptomness *= max(0.0, 1.0 - ownership)
+        return {
+            "metric_score": float(metric_score),
+            "ownership": float(ownership),
+            "symptomness": float(max(0.0, min(1.0, symptomness))),
+        }
 
     def expand_index_candidate_tuples(
         self,
@@ -324,24 +385,65 @@ class BankAdapter(DatasetAdapter):
             ctype = str(item.get("component_type", "") or self.component_semantic_type(comp))
             reason = str(item.get("reason", "") or "")
             metrics = list(item.get("supporting_metrics", []) or top_metrics.get(comp, []) or [])
-            score = self._safe_float(item.get("score", 0.0))
+            local_ev = self.component_local_metric_evidence(component=comp, context=context)
+            local_metrics = [str(x) for x in list(local_ev.get("top_metrics", []) or []) if str(x).strip()]
+            if local_metrics and not metrics:
+                metrics = local_metrics
+            rank_ev = self.metric_rank_evidence(component=comp, metrics=metrics)
             symptomness = max(0.0, min(1.0, self._safe_float(item.get("symptomness", 0.0))))
-            # Historical symptomness is an IDF-like discount. It is data-driven:
-            # gateways that repeatedly appear as impacted components across
-            # incidents should not always crowd out Tomcat/Redis/Mysql roots.
-            if ctype == "gateway" and symptomness > 0:
-                score *= max(0.35, 1.0 - symptomness)
+            if rank_ev.get("symptomness", 0.0):
+                symptomness = max(symptomness, self._safe_float(rank_ev.get("symptomness", 0.0)))
+            if local_ev.get("symptomness", 0.0):
+                symptomness = max(symptomness, self._safe_float(local_ev.get("symptomness", 0.0)))
+            score = self.component_evidence_score(
+                component=comp,
+                base_score=self._safe_float(item.get("score", 0.0)),
+                context=context,
+                metric_score=max(
+                    self._safe_float(rank_ev.get("metric_score", 0.0)),
+                    self._safe_float(local_ev.get("metric_score", 0.0)),
+                ),
+                ownership_score=max(
+                    self._safe_float(rank_ev.get("ownership", 0.0)),
+                    self._safe_float(local_ev.get("ownership", 0.0)),
+                ),
+                symptomness=symptomness,
+                locality=self._safe_float(local_ev.get("locality", 0.0)),
+                persistence=self._safe_float(local_ev.get("persistence", 0.0)),
+                instance_owned_score=self._safe_float(local_ev.get("instance_owned_score", 0.0)),
+                sibling_contrast=self._safe_float(local_ev.get("sibling_contrast", 0.0)),
+            )
+            rootness_features = self._component_rootness_features(
+                component=comp,
+                base_score=self._safe_float(item.get("score", 0.0)),
+                context=context,
+                metric_score=max(
+                    self._safe_float(rank_ev.get("metric_score", 0.0)),
+                    self._safe_float(local_ev.get("metric_score", 0.0)),
+                ),
+                ownership_score=max(
+                    self._safe_float(rank_ev.get("ownership", 0.0)),
+                    self._safe_float(local_ev.get("ownership", 0.0)),
+                ),
+                symptomness=symptomness,
+                locality=self._safe_float(local_ev.get("locality", 0.0)),
+                persistence=self._safe_float(local_ev.get("persistence", 0.0)),
+                instance_owned_score=self._safe_float(local_ev.get("instance_owned_score", 0.0)),
+                sibling_contrast=self._safe_float(local_ev.get("sibling_contrast", 0.0)),
+            )
             if reason:
                 score += 0.12 * self._reason_metric_support(component=comp, reason=reason, top_metrics=metrics)
             item = dict(item)
             item["score"] = float(score)
             item["component_type"] = ctype
+            item["metric_ownership"] = float(rank_ev.get("ownership", 0.0) or 0.0)
+            item["metric_ownership_details"] = dict(rank_ev)
+            item["rootness_features"] = dict(rootness_features)
             if metrics and not item.get("supporting_metrics"):
                 item["supporting_metrics"] = list(metrics)[:8]
             adjusted.append(item)
 
         adjusted.sort(key=lambda x: self._safe_float(x.get("score", 0.0)), reverse=True)
-
         limit = max(1, int(k))
         pool_limit = max(limit, 24)
         top_m_per_channel = 3
@@ -388,13 +490,7 @@ class BankAdapter(DatasetAdapter):
         need_comp: bool,
         need_reason: bool,
     ) -> float:
-        """Bank uses stronger hint bonuses than base default (1.40 comp / 1.10 reason)."""
-        bonus = 0.0
-        if need_comp and hint_components and comp in hint_components:
-            bonus += 1.40
-        if need_reason and hint_reasons and reason in hint_reasons:
-            bonus += 1.10
-        return bonus
+        return 0.0
 
     # select_time_candidate_override: uses base score-based implementation.
     # Bank's exact comp+reason match is expressed as score bonuses in _score_time_candidate.
@@ -409,8 +505,7 @@ class BankAdapter(DatasetAdapter):
             score += 0.5 if r0 == reason else -0.5
         return score
 
-    # _component_prior: base class computes data-driven lift(type) from query.csv
-    # + telemetry. Bank-specific component_semantic_type() ensures correct typing.
+    # _component_prior: inherited neutral prior.  No query/record label priors.
 
     def supplement_candidate_pool(
         self,

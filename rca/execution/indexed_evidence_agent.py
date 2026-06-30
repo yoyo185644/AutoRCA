@@ -10,9 +10,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from rca.counterfactor_agent.agent import CounterfactualRCAAgent
 from rca.common.text import service_base
-from rca.common.tasks import task_need_flags
+from rca.common.tasks import required_root_count_from_instruction, task_need_flags
 from rca.adapter.registry import get_dataset_adapter
-from rca.execution.telemetry_solver import required_root_count
 
 
 @dataclass(frozen=True)
@@ -30,7 +29,7 @@ class IndexedEvidenceDecision:
     prompt: List[Any] = field(default_factory=list)
 
 
-def _required_root_count(result: Any, scoring_points: str) -> int:
+def _required_root_count(result: Any, instruction: str) -> int:
     evidence = dict(getattr(result, "evidence", {}) or {})
     try:
         count = int(evidence.get("required_root_count") or 0)
@@ -38,7 +37,7 @@ def _required_root_count(result: Any, scoring_points: str) -> int:
         count = 0
     if count > 0:
         return int(count)
-    return max(1, int(required_root_count(scoring_points)))
+    return max(1, int(required_root_count_from_instruction(str(instruction or ""))))
 
 
 def _need_flags(task_id: int) -> tuple[bool, bool, bool]:
@@ -284,6 +283,7 @@ def _candidate_pool_diagnostics(
 
     preview: List[Dict[str, Any]] = []
     for item in rows[: max(0, int(preview_n))]:
+        rootness_features = dict(item.get("rootness_features", {}) or {}) if isinstance(item.get("rootness_features", {}), Mapping) else {}
         preview.append(
             {
                 "component": str(item.get("component", "") or ""),
@@ -293,6 +293,11 @@ def _candidate_pool_diagnostics(
                 "component_type": str(item.get("component_type", "") or item.get("channel", "") or ""),
                 "supporting_metrics": [str(x) for x in list(item.get("supporting_metrics", []) or [])[:6]],
                 "symptomness": float(item.get("symptomness", 0.0) or 0.0),
+                "instance_owned_score": float(rootness_features.get("instance_owned_score", 0.0) or 0.0),
+                "sibling_contrast": float(rootness_features.get("sibling_contrast", 0.0) or 0.0),
+                "causal_source_score": float(rootness_features.get("causal_source_score", 0.0) or 0.0),
+                "outgoing_propagation": float(rootness_features.get("outgoing_propagation", 0.0) or 0.0),
+                "incoming_symptomness": float(rootness_features.get("incoming_symptomness", 0.0) or 0.0),
                 "score": float(item.get("score", 0.0) or 0.0),
                 "source": str(item.get("source", "") or ""),
             }
@@ -1136,36 +1141,34 @@ class IndexedEvidenceAgentRunner:
         top_metrics = dict(getattr(comp_ev, "top_metrics", {}) or {})
         if not top_metrics:
             top_metrics = dict(getattr(result, "top_metrics", {}) or {})
+        causal_scores = dict(getattr(comp_ev, "causal_scores", {}) or {})
+        if not causal_scores:
+            causal_scores = dict(getattr(result, "causal_scores", {}) or {})
+        causal_edges = []
+        for edge in list(getattr(comp_ev, "causal_edges", []) or getattr(result, "causal_edges", []) or []):
+            if isinstance(edge, Mapping):
+                causal_edges.append(dict(edge))
+            else:
+                try:
+                    causal_edges.append(edge.to_dict())
+                except Exception:
+                    causal_edges.append(
+                        {
+                            "src": str(getattr(edge, "src", "") or ""),
+                            "dst": str(getattr(edge, "dst", "") or ""),
+                            "edge_type": str(getattr(edge, "edge_type", "") or ""),
+                            "score": float(getattr(edge, "score", 0.0) or 0.0),
+                            "support_count": int(getattr(edge, "support_count", 0) or 0),
+                        }
+                    )
         component_level = ""
         if adapter is not None:
             try:
-                component_level = str(adapter.extract_component_level(scoring_points=str(scoring_points or "")) or "")
+                # scoring_points contains evaluation labels.  Do not use it to
+                # infer dataset-specific candidate hints during inference.
+                component_level = ""
             except Exception:
                 component_level = ""
-        scoring_point_components: List[str] = []
-        scoring_point_reasons: List[str] = []
-        if adapter is not None:
-            text = str(scoring_points or "")
-            for m in re.finditer(r"predicted root cause component is\s+([^\n\r]+)", text, flags=re.IGNORECASE):
-                raw = str(m.group(1) or "").strip().strip(".。")
-                if not raw:
-                    continue
-                try:
-                    c = str(adapter.parse_component_id(raw) or raw).strip()
-                except Exception:
-                    c = raw
-                if c and c not in scoring_point_components:
-                    scoring_point_components.append(c)
-            for m in re.finditer(r"predicted root cause reason is\s+([^\n\r]+)", text, flags=re.IGNORECASE):
-                raw = str(m.group(1) or "").strip().strip(".。")
-                if not raw:
-                    continue
-                try:
-                    r = str(adapter.parse_root_cause_label(raw) or raw).strip()
-                except Exception:
-                    r = raw
-                if r and r not in scoring_point_reasons:
-                    scoring_point_reasons.append(r)
 
         adapter_context_overrides: Dict[str, Any] = {}
         adapter_reason_scores: Dict[str, float] = {}
@@ -1183,57 +1186,6 @@ class IndexedEvidenceAgentRunner:
             except Exception:
                 adapter_reason_scores = {}
                 adapter_context_overrides = {}
-
-        if is_market:
-            for c in list(scoring_point_components):
-                if c and c not in component_candidates:
-                    component_candidates.append(c)
-            for r in list(scoring_point_reasons):
-                if r and r not in reasons:
-                    reasons.append(r)
-
-            hint_keys: set[tuple[str, str]] = set()
-            for item in list(all_tuples or []):
-                if not isinstance(item, Mapping):
-                    continue
-                hint_keys.add((str(item.get("component", "") or ""), str(item.get("reason", "") or "")))
-            max_score = 0.0
-            for item in list(all_tuples or []):
-                if not isinstance(item, Mapping):
-                    continue
-                try:
-                    max_score = max(max_score, float(item.get("score", 0.0) or 0.0))
-                except Exception:
-                    pass
-
-            hint_components = list(scoring_point_components) if bool(need_comp) else [""]
-            hint_reasons = list(scoring_point_reasons) if bool(need_reason) else [""]
-            if hint_reasons:
-                extra = []
-                for comp in hint_components:
-                    c = str(comp or "").strip()
-                    if not c and bool(need_comp):
-                        continue
-                    for rr in hint_reasons:
-                        r = str(rr or "").strip()
-                        if bool(need_reason) and not r:
-                            continue
-                        key = (c, r)
-                        if key in hint_keys:
-                            continue
-                        hint_keys.add(key)
-                        extra.append(
-                            {
-                                "component": c,
-                                "reason": r,
-                                "datetime": "",
-                                "score": float(max_score + 1.0),
-                                "source": "scoring_point_hint",
-                                "evidence": {"from_scoring_points": True},
-                            }
-                        )
-                if extra:
-                    all_tuples = list(extra) + list(all_tuples or [])
 
         dataset_name = str(getattr(result, "dataset", "") or "")
         tuple_limit = 50 if (is_market and "cloudbed-2" in dataset_name) else 20
@@ -1354,7 +1306,7 @@ class IndexedEvidenceAgentRunner:
             "need_comp": bool(need_comp),
             "need_reason": bool(need_reason),
             "difficulty": _difficulty(int(task_id)),
-            "required_root_count": int(_required_root_count(result, scoring_points)),
+            "required_root_count": int(_required_root_count(result, instruction)),
             "allowed_components": list(component_candidates),
             "allowed_reasons": list(reasons),
             "candidate_tuples": tuple_candidates,
@@ -1365,12 +1317,13 @@ class IndexedEvidenceAgentRunner:
             "component_first_times": component_first_times,
             "component_peak_times": component_peak_times,
             "top_metrics": top_metrics,
+            "causal_scores": causal_scores,
+            "causal_edges": causal_edges,
             "basil_supporting_metrics": top_metrics,
             "metric_scores": comp_scores,
             "matched_metrics": top_metrics,
             "component_level": component_level,
-            "scoring_point_components": list(scoring_point_components),
-            "scoring_point_reasons": list(scoring_point_reasons),
+            "date_dir": str(getattr(result, "date_dir", "") or ""),
             **dict(adapter_context_overrides or {}),
             "query_start_local": str(getattr(result, "start_local", "") or ""),
             "query_end_local": str(getattr(result, "end_local", "") or ""),
@@ -1381,14 +1334,14 @@ class IndexedEvidenceAgentRunner:
             "llm_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
             "llm_time_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
             "llm_verify_top_k": (
-                max(8, int(_required_root_count(result, scoring_points)) * 4)
+                max(8, int(_required_root_count(result, instruction)) * 4)
                 if is_market
-                else max(3, int(_required_root_count(result, scoring_points)) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3))
+                else max(3, int(_required_root_count(result, instruction)) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3))
             ),
             "llm_max_prompt_candidates": (
                 min(8, max(len(reasons), int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)))
                 if bool(need_reason) and not bool(need_comp)
-                else min(8, max(5, int(_required_root_count(result, scoring_points)) * 4))
+                else min(8, max(5, int(_required_root_count(result, instruction)) * 4))
             ),
             "evidence_score_gap_threshold": float(getattr(args, "evidence_score_gap_threshold", 0.15) or 0.15),
             "evidence_top1_score_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
@@ -1477,6 +1430,17 @@ class IndexedEvidenceAgentRunner:
         if adapter is None:
             return list(selected or [])
         need_time, need_comp, need_reason = _need_flags(int(task_id))
+        if (
+            adapter.__class__.__name__ == "TelecomAdapter"
+            and bool(need_reason)
+            and not bool(need_comp)
+        ):
+            # Telecom reason-only / reason+time tasks are already folded into
+            # component-free reason candidates by the adapter.  Running the
+            # generic component supplement/rerank here reintroduces component
+            # tuples and lets latent component ordering dominate the answer
+            # surface, which is exactly what these tasks do not evaluate.
+            return list(selected or [])
 
         # ── Supplement pool: metric-scan + closed-set (universal recall fix) ──
         if bool(need_comp) or bool(need_reason):
@@ -1499,16 +1463,18 @@ class IndexedEvidenceAgentRunner:
             try:
                 from rca.counterfactor_agent.schemas import CandidateHypothesis
 
-                candidates.append(
-                    CandidateHypothesis(
-                        component=str(item.get("component", "") or ""),
-                        reason=str(item.get("reason", "") or ""),
-                        datetime=str(item.get("datetime", "") or ""),
-                        evidence=[str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x).strip()],
-                        score=float(item.get("score", 0.0) or 0.0),
-                        source=str(item.get("source", "") or "basil_deterministic"),
-                    )
+                cand = CandidateHypothesis(
+                    component=str(item.get("component", "") or ""),
+                    reason=str(item.get("reason", "") or ""),
+                    datetime=str(item.get("datetime", "") or ""),
+                    evidence=[str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x).strip()],
+                    score=float(item.get("score", 0.0) or 0.0),
+                    source=str(item.get("source", "") or "basil_deterministic"),
                 )
+                if isinstance(item.get("rootness_features", {}), Mapping):
+                    setattr(cand, "rootness_features", dict(item.get("rootness_features", {}) or {}))
+                setattr(cand, "symptomness", float(item.get("symptomness", 0.0) or 0.0))
+                candidates.append(cand)
             except Exception:
                 return list(selected or [])
         if not candidates:
@@ -1605,6 +1571,9 @@ class IndexedEvidenceAgentRunner:
                     comp_type = str(adapter.component_semantic_type(comp) or "")
                 except Exception:
                     comp_type = ""
+            rootness_features = dict(getattr(cand, "rootness_features", {}) or {})
+            if not rootness_features and isinstance(original.get("rootness_features", {}), Mapping):
+                rootness_features = dict(original.get("rootness_features", {}) or {})
             out.append(
                 {
                     "component": comp,
@@ -1615,7 +1584,8 @@ class IndexedEvidenceAgentRunner:
                     "supporting_metrics": evidence_items or [str(x) for x in list(original.get("supporting_metrics", []) or [])],
                     "component_type": comp_type,
                     "first_anomaly_time": str(original.get("first_anomaly_time", "") or ""),
-                    "symptomness": float(original.get("symptomness", 0.0) or 0.0),
+                    "symptomness": float(getattr(cand, "symptomness", original.get("symptomness", 0.0)) or 0.0),
+                    "rootness_features": rootness_features,
                 }
             )
         return out or list(selected or [])
@@ -1632,7 +1602,7 @@ class IndexedEvidenceAgentRunner:
         no_llm_fallback: bool,
         logger: Any = None,
     ) -> IndexedEvidenceDecision:
-        k = max(1, int(_required_root_count(result, scoring_points)))
+        k = max(1, int(_required_root_count(result, instruction)))
         need_time, need_comp, need_reason = _need_flags(int(task_id))
         context = self._build_context(
             result=result,
@@ -1656,23 +1626,6 @@ class IndexedEvidenceAgentRunner:
             except Exception:
                 pool_k = max(k, 5)
         ds_norm = str(dataset or "").strip().lower()
-        if ds_norm.startswith("market") and int(task_id) in (2, 3):
-            if int(task_id) == 2:
-                hint_reasons = [str(x).strip() for x in list((context or {}).get("scoring_point_reasons") or []) if str(x).strip()]
-                if hint_reasons:
-                    selected: List[Dict[str, Any]] = []
-                    for i in range(int(k)):
-                        r = hint_reasons[i] if i < len(hint_reasons) else hint_reasons[-1]
-                        selected.append({"component": "", "reason": r, "datetime": "", "score": 1.0, "source": "scoring_point_hint"})
-                    return IndexedEvidenceDecision(selected_tuples=selected)
-            if int(task_id) == 3:
-                hint_components = [str(x).strip() for x in list((context or {}).get("scoring_point_components") or []) if str(x).strip()]
-                if hint_components:
-                    selected = []
-                    for i in range(int(k)):
-                        c = hint_components[i] if i < len(hint_components) else hint_components[-1]
-                        selected.append({"component": c, "reason": "", "datetime": "", "score": 1.0, "source": "scoring_point_hint"})
-                    return IndexedEvidenceDecision(selected_tuples=selected)
         if ds_norm.startswith("market") and int(task_id) == 6:
             if "cloudbed-2" in ds_norm:
                 pool_k = max(pool_k, 40)
@@ -1737,18 +1690,11 @@ class IndexedEvidenceAgentRunner:
             selected=deterministic_pool,
             k=int(pool_k),
         )
-        if bool(need_comp) and not bool(need_reason) and not bool(need_time):
-            deterministic_pool = _root_likelihood_order(deterministic_pool)
         if ds_norm.startswith("market") and bool(need_reason):
-            hint_components = [str(x).strip() for x in list((context or {}).get("scoring_point_components") or []) if str(x).strip()]
-            hint_reasons = [str(x).strip() for x in list((context or {}).get("scoring_point_reasons") or []) if str(x).strip()]
             allowed_components = [str(x).strip() for x in list((context or {}).get("allowed_components") or []) if str(x).strip()]
             allowed_reasons = [str(x).strip() for x in list((context or {}).get("allowed_reasons") or []) if str(x).strip()]
 
             components: List[str] = []
-            for c in list(hint_components):
-                if c and c not in components:
-                    components.append(c)
             for item in list(deterministic_pool or []):
                 if not isinstance(item, Mapping):
                     continue
@@ -1762,9 +1708,6 @@ class IndexedEvidenceAgentRunner:
                 components = [""]
 
             reasons: List[str] = []
-            for r in list(hint_reasons):
-                if r and r not in reasons:
-                    reasons.append(r)
             reason_scores = dict((context or {}).get("reason_scores") or {})
             scored: List[tuple[float, str]] = []
             for r in list(allowed_reasons):
@@ -1817,10 +1760,6 @@ class IndexedEvidenceAgentRunner:
                         except Exception:
                             rs = 0.0
                     score = float(0.80 * cs + 0.20 * rs)
-                    if hint_components and c and c in hint_components:
-                        score += 0.90
-                    if hint_reasons and rr and rr in hint_reasons:
-                        score += 0.90
                     key = (str(c or "").strip(), rr)
                     prev = expanded.get(key)
                     if prev is None or float(prev.get("score", 0.0) or 0.0) < score:
