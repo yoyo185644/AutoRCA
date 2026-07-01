@@ -775,6 +775,15 @@ class DatasetAdapter:
     def component_semantic_type(self, component: str) -> str:
         return ""
 
+    def prefer_local_first_rootness(self) -> bool:
+        """Whether component ranking should prioritize owned local evidence.
+
+        The default keeps the historical BASIL ranking profile.  Adapters may
+        enable this when their telemetry has strong shared gateway/OS symptoms
+        and root evidence is better expressed by component-owned metrics.
+        """
+        return False
+
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
         try:
@@ -838,27 +847,60 @@ class DatasetAdapter:
                 rank_prior = 1.0 / float(idx)
                 break
         propagation = self._component_propagation_features(component=comp, context=context)
+        features = {
+            "global_score": raw_norm,
+            "channel_score": local_norm,
+            "channel_rank_score": rank_prior,
+            "local_change": self._safe_float(metric_score),
+            "ownership": self._safe_float(ownership_score),
+            "locality": self._safe_float(locality),
+            "persistence": self._safe_float(persistence),
+            "instance_owned_score": self._safe_float(instance_owned_score),
+            "sibling_contrast": self._safe_float(sibling_contrast),
+            "symptomness": self._safe_float(symptomness),
+            **propagation,
+        }
+
+        if self.prefer_local_first_rootness():
+            local_support = max(
+                self._clip01(features.get("ownership", 0.0)),
+                self._clip01(features.get("locality", 0.0)),
+                self._clip01(features.get("instance_owned_score", 0.0)),
+                self._clip01(features.get("sibling_contrast", 0.0)),
+                0.5 * self._clip01(features.get("local_change", 0.0)),
+            )
+            structural = (
+                0.22 * self._clip01(features.get("global_score", 0.0))
+                + 0.18 * self._clip01(features.get("channel_score", 0.0))
+                + 0.06 * self._clip01(features.get("channel_rank_score", 0.0))
+            )
+            local = (
+                0.16 * self._clip01(features.get("local_change", 0.0))
+                + 0.16 * self._clip01(features.get("ownership", 0.0))
+                + 0.10 * self._clip01(features.get("locality", 0.0))
+                + 0.05 * self._clip01(features.get("persistence", 0.0))
+                + 0.13 * self._clip01(features.get("instance_owned_score", 0.0))
+                + 0.10 * self._clip01(features.get("sibling_contrast", 0.0))
+            )
+            propagation_score = (
+                0.12 * self._clip01(features.get("causal_source_score", 0.0))
+                + 0.10 * self._clip01(features.get("outgoing_propagation", 0.0))
+            ) * (0.35 + 0.65 * local_support)
+            score = structural + local + propagation_score
+            symptom = max(
+                self._clip01(features.get("symptomness", 0.0)),
+                self._clip01(features.get("incoming_symptomness", 0.0)) * max(0.0, 1.0 - local_support),
+            )
+            if symptom > 0:
+                score *= max(0.25, 1.0 - 0.65 * symptom * max(0.0, 1.0 - local_support))
+            return float(max(0.0, score))
 
         try:
             from rca.adapter.ranker.rootness import RootnessFeatures, RootnessRanker
 
             return float(
                 RootnessRanker().score(
-                    RootnessFeatures.from_mapping(
-                        {
-                            "global_score": raw_norm,
-                            "channel_score": local_norm,
-                            "channel_rank_score": rank_prior,
-                            "local_change": self._safe_float(metric_score),
-                            "ownership": self._safe_float(ownership_score),
-                            "locality": self._safe_float(locality),
-                            "persistence": self._safe_float(persistence),
-                            "instance_owned_score": self._safe_float(instance_owned_score),
-                            "sibling_contrast": self._safe_float(sibling_contrast),
-                            "symptomness": self._safe_float(symptomness),
-                            **propagation,
-                        }
-                    )
+                    RootnessFeatures.from_mapping(features)
                 )
             )
         except Exception:

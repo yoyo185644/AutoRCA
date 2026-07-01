@@ -224,12 +224,51 @@ def _root_likelihood_order(items: Sequence[Mapping[str, Any]]) -> List[Dict[str,
 
     max_score = max([float(x.get("score", 0.0) or 0.0) for x in rows] + [1.0])
 
+    def _feature(item: Mapping[str, Any], name: str, default: float = 0.0) -> float:
+        features = item.get("rootness_features", {})
+        if isinstance(features, Mapping) and name in features:
+            try:
+                return float(features.get(name, default) or default)
+            except Exception:
+                return float(default)
+        try:
+            return float(item.get(name, default) or default)
+        except Exception:
+            return float(default)
+
     def effective_score(item: Mapping[str, Any]) -> float:
         raw = float(item.get("score", 0.0) or 0.0)
-        symptomness = max(0.0, min(1.0, float(item.get("symptomness", 0.0) or 0.0)))
-        # IDF-style history prior: keep current evidence primary, but reduce the
-        # effective score of components that repeatedly appear across incidents.
-        return raw * (1.0 - symptomness)
+        local_support = max(
+            0.0,
+            min(
+                1.0,
+                max(
+                    _feature(item, "instance_owned_score"),
+                    _feature(item, "ownership"),
+                    _feature(item, "locality"),
+                ),
+            ),
+        )
+        sibling_contrast = max(0.0, min(1.0, _feature(item, "sibling_contrast")))
+        symptomness = max(
+            0.0,
+            min(
+                1.0,
+                max(
+                    _feature(item, "symptomness"),
+                    _feature(item, "incoming_symptomness") * max(0.0, 1.0 - local_support),
+                ),
+            ),
+        )
+        # Keep current evidence primary, but prefer candidates whose anomaly is
+        # owned by the candidate instance/channel and discount broad downstream
+        # symptoms.  This is intentionally based on generic rootness features,
+        # not dataset labels or task-specific rules.
+        return (
+            raw * max(0.20, 1.0 - 0.65 * symptomness)
+            + 0.20 * local_support
+            + 0.08 * sibling_contrast
+        )
 
     def score_band(item: Mapping[str, Any]) -> int:
         # Bucket scores coarsely so tiny numeric differences do not dominate
@@ -239,9 +278,17 @@ def _root_likelihood_order(items: Sequence[Mapping[str, Any]]) -> List[Dict[str,
 
     def key(item: Dict[str, Any]) -> tuple:
         dt = str(item.get("datetime", "") or item.get("first_anomaly_time", "") or "")
-        symptomness = float(item.get("symptomness", 0.0) or 0.0)
+        symptomness = max(_feature(item, "symptomness"), _feature(item, "incoming_symptomness"))
+        local_support = max(
+            _feature(item, "instance_owned_score"),
+            _feature(item, "ownership"),
+            _feature(item, "locality"),
+        )
+        sibling_contrast = _feature(item, "sibling_contrast")
         return (
             -score_band(item),
+            -local_support,
+            -sibling_contrast,
             symptomness,
             channel_rank.get(id(item), 10**6),
             _candidate_epoch_hint(dt),
@@ -1297,8 +1344,9 @@ class IndexedEvidenceAgentRunner:
                 _sys.stderr.write(f"  {_tc.get('datetime','?'):22s}  score={float(_tc.get('score',0)):.3f}  src={_tc.get('source','?')}  comp={_tc.get('component','')}\n")
             _sys.stderr.flush()
 
-        k_req = int(_required_root_count(result=result, dataset=str(getattr(result, "dataset", "") or ""), instruction=str(instruction or "")))
+        k_req = int(_required_root_count(result=result, instruction=str(instruction or "")))
         context = {
+            "instruction": str(instruction or ""),
             "dataset": str(getattr(result, "dataset", "") or ""),
             "need_time": bool(need_time),
             "need_comp": bool(need_comp),
@@ -1437,6 +1485,12 @@ class IndexedEvidenceAgentRunner:
                 # not latent component identity.  If the adapter or generic
                 # reason scorer has already folded evidence into component-free
                 # reason candidates, do not reintroduce component tuples here.
+                try:
+                    quick = getattr(adapter, "postprocess_reason_only_index_rows", None)
+                    if callable(quick):
+                        return list(quick(rows=rows, context=dict(context or {})) or rows)
+                except Exception:
+                    pass
                 return rows
 
         # ── Supplement pool: metric-scan + closed-set (universal recall fix) ──
@@ -1585,6 +1639,8 @@ class IndexedEvidenceAgentRunner:
                     "rootness_features": rootness_features,
                 }
             )
+        if bool(need_comp) and not bool(need_reason) and not bool(need_time):
+            out = _root_likelihood_order(out)
         try:
             out = adapter.postprocess_output_tuples(
                 out,
@@ -1670,9 +1726,20 @@ class IndexedEvidenceAgentRunner:
                 if len(merged_time_items) >= int(pool_k):
                     break
             if (not bool(need_comp) and not bool(need_reason)) or len({str(x.get("datetime", "") or "") for x in deterministic_pool}) <= 1:
+                def _time_sort_score(item: Mapping[str, Any]) -> float:
+                    if adapter is not None:
+                        try:
+                            return float(adapter._score_time_candidate(dict(item), "", ""))  # noqa: SLF001 - adapter scoring hook
+                        except Exception:
+                            pass
+                    try:
+                        return float(item.get("score", 0.0) or 0.0)
+                    except Exception:
+                        return 0.0
+
                 deterministic_pool = sorted(
                     list(deterministic_pool or []) + merged_time_items,
-                    key=lambda x: float(x.get("score", 0.0) or 0.0),
+                    key=_time_sort_score,
                     reverse=True,
                 )[: max(int(pool_k), len(merged_time_items))]
         if bool(need_reason) and not bool(need_comp):
@@ -1761,6 +1828,21 @@ class IndexedEvidenceAgentRunner:
             selected=deterministic_pool,
             k=int(pool_k),
         )
+        if bool(need_time) and not bool(need_comp) and not bool(need_reason) and adapter is not None:
+            def _time_final_score(item: Mapping[str, Any]) -> float:
+                try:
+                    return float(adapter._score_time_candidate(dict(item), "", ""))  # noqa: SLF001 - adapter scoring hook
+                except Exception:
+                    try:
+                        return float(item.get("score", 0.0) or 0.0)
+                    except Exception:
+                        return 0.0
+
+            deterministic_pool = sorted(
+                [dict(x) for x in list(deterministic_pool or []) if isinstance(x, Mapping)],
+                key=_time_final_score,
+                reverse=True,
+            )
         if ds_norm.startswith("market") and bool(need_reason):
             allowed_components = [str(x).strip() for x in list((context or {}).get("allowed_components") or []) if str(x).strip()]
             allowed_reasons = [str(x).strip() for x in list((context or {}).get("allowed_reasons") or []) if str(x).strip()]

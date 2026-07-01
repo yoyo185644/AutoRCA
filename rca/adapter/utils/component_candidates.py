@@ -2,6 +2,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -121,7 +122,7 @@ def parse_time_window_generic(instruction: str, tz: str = "Asia/Shanghai") -> Tu
         start = pd.Timestamp(f"{date} {hm1}:00", tz=tz)
         end = pd.Timestamp(f"{date} {hm2}:00", tz=tz)
         if end < start:
-            start, end = end, start
+            end = end + pd.Timedelta(days=1)
         return f"{y:04d}_{mo:02d}_{d:02d}", start, end
 
     date_matches: List[Tuple[int, int, int]] = []
@@ -150,7 +151,7 @@ def parse_time_window_generic(instruction: str, tz: str = "Asia/Shanghai") -> Tu
         start = pd.Timestamp(f"{start_date} {hm1}:00", tz=tz)
         end = pd.Timestamp(f"{end_date} {hm2}:00", tz=tz)
         if end < start and (sy, smo, sd) == (ey, emo, ed):
-            start, end = end, start
+            end = end + pd.Timedelta(days=1)
         return f"{sy:04d}_{smo:02d}_{sd:02d}", start, end
 
     raise ValueError("Cannot parse time window from instruction.")
@@ -183,7 +184,7 @@ def _normalize_metric_file(path: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["ts_s", "component", "metric", "value"])
 
     comp_col = None
-    for c in ["cmdb_id", "cmdbId", "tc", "serviceName"]:
+    for c in ["cmdb_id", "cmdbId", "tc", "serviceName", "service"]:
         if c in cols:
             comp_col = c
             break
@@ -221,6 +222,11 @@ def _normalize_metric_file(path: str) -> pd.DataFrame:
     return melted[["ts_s", "component", "metric", "value"]]
 
 
+@lru_cache(maxsize=64)
+def _normalize_metric_file_cached(path: str) -> pd.DataFrame:
+    return _normalize_metric_file(path)
+
+
 def _metric_component_scores(
     metric_dir: str, start_s: int, end_s: int, top_k_metrics: int = 8
 ) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str], Dict[str, List[str]]]:
@@ -232,7 +238,7 @@ def _metric_component_scores(
 
     for p in paths:
         try:
-            long = _normalize_metric_file(p)
+            long = _normalize_metric_file_cached(p)
         except Exception:
             continue
         if long.empty:

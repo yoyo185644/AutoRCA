@@ -115,22 +115,17 @@ def _trace_time_candidates(dataset: str, instruction: str) -> Tuple[List[TimeCan
     if not os.path.exists(trace_path):
         dt = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
         return [TimeCandidate(dt, "window_start_fallback", 0.10)], None
-    columns = set(pd.read_csv(trace_path, nrows=0).columns)
+    columns = _read_csv_columns_cached(trace_path)
     dur_col = "elapsedTime" if "elapsedTime" in columns else ("duration" if "duration" in columns else None)
     ts_col = "startTime" if "startTime" in columns else ("timestamp" if "timestamp" in columns else None)
     if dur_col is None or ts_col is None:
         dt = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
         return [TimeCandidate(dt, "window_start_fallback", 0.10)], None
-    df = pd.read_csv(trace_path, usecols=[ts_col, dur_col], low_memory=False)
+    df = _read_trace_time_frame_cached(trace_path, ts_col, dur_col)
     if df.empty or dur_col is None or ts_col is None:
         dt = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
         return [TimeCandidate(dt, "window_start_fallback", 0.10)], None
 
-    df = df[[ts_col, dur_col]].copy()
-    ts_unit = "ms" if df[ts_col].dropna().astype(str).str.len().max() >= 13 else "s"
-    df["timestamp"] = pd.to_datetime(df[ts_col], unit=ts_unit, utc=True).dt.tz_convert("Asia/Shanghai")
-    df["dur"] = pd.to_numeric(df[dur_col], errors="coerce")
-    df = df.dropna(subset=["timestamp", "dur"])
     df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
     if df.empty:
         dt = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
@@ -261,6 +256,23 @@ _REASON_METRIC_FILES: Dict[str, List[str]] = {
 @lru_cache(maxsize=64)
 def _normalize_metric_file_cached(path: str) -> pd.DataFrame:
     return _normalize_metric_file(path)
+
+
+@lru_cache(maxsize=64)
+def _read_csv_columns_cached(path: str) -> set[str]:
+    return set(pd.read_csv(path, nrows=0).columns)
+
+
+@lru_cache(maxsize=16)
+def _read_trace_time_frame_cached(path: str, ts_col: str, dur_col: str) -> pd.DataFrame:
+    df = pd.read_csv(path, usecols=[ts_col, dur_col], low_memory=False)
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "dur"])
+    out = df[[ts_col, dur_col]].copy()
+    ts_unit = "ms" if out[ts_col].dropna().astype(str).str.len().max() >= 13 else "s"
+    out["timestamp"] = pd.to_datetime(out[ts_col], unit=ts_unit, utc=True).dt.tz_convert("Asia/Shanghai")
+    out["dur"] = pd.to_numeric(out[dur_col], errors="coerce")
+    return out[["timestamp", "dur"]].dropna(subset=["timestamp", "dur"])
 
 
 def _reason_metric_time_candidates(dataset: str, instruction: str, reasons: Sequence[str]) -> List[TimeCandidate]:
@@ -734,21 +746,16 @@ def estimate_occurrence_datetime_from_trace(dataset: str, instruction: str) -> T
     if not os.path.exists(trace_path):
         chosen = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
         return chosen, None
-    columns = set(pd.read_csv(trace_path, nrows=0).columns)
+    columns = _read_csv_columns_cached(trace_path)
     dur_col = "elapsedTime" if "elapsedTime" in columns else ("duration" if "duration" in columns else None)
     ts_col = "startTime" if "startTime" in columns else ("timestamp" if "timestamp" in columns else None)
     if dur_col is None or ts_col is None:
         chosen = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
         return chosen, None
-    df = pd.read_csv(trace_path, usecols=[ts_col, dur_col], low_memory=False)
+    df = _read_trace_time_frame_cached(trace_path, ts_col, dur_col)
     if df.empty:
         chosen = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
         return chosen, None
-    df = df[[ts_col, dur_col]].copy()
-    ts_unit = "ms" if df[ts_col].dropna().astype(str).str.len().max() >= 13 else "s"
-    df["timestamp"] = pd.to_datetime(df[ts_col], unit=ts_unit, utc=True).dt.tz_convert("Asia/Shanghai")
-    df["dur"] = pd.to_numeric(df[dur_col], errors="coerce")
-    df = df.dropna(subset=["timestamp", "dur"])
     df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)].copy()
     if df.empty:
         chosen = start.floor("min").strftime("%Y-%m-%d %H:%M:%S")
