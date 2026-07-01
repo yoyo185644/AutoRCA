@@ -81,8 +81,23 @@ def _prediction_from_tuples(
     adapter: Any = None,
 ) -> str:
     need_time, need_comp, need_reason = task_need_flags(int(task_id))
+    items_list = [dict(x) for x in list(items or []) if isinstance(x, Mapping)]
+    if adapter is not None and bool(need_comp) and bool(need_reason):
+        try:
+            if adapter.__class__.__name__ == "MarketAdapter":
+                adjusted = adapter.postprocess_output_tuples(
+                    items_list,
+                    context={},
+                    need_comp=True,
+                    need_reason=True,
+                    need_time=bool(need_time),
+                )
+                if isinstance(adjusted, list) and adjusted:
+                    items_list = [dict(x) for x in adjusted if isinstance(x, Mapping)]
+        except Exception:
+            pass
     obj: Dict[str, Dict[str, str]] = {}
-    for item in list(items or [])[: max(1, int(k))]:
+    for item in items_list[: max(1, int(k))]:
         root: Dict[str, str] = {}
         if need_time:
             dt = str((item or {}).get("datetime") or (item or {}).get("occurrence_datetime") or "").strip()

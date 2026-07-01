@@ -1348,6 +1348,7 @@ class IndexedEvidenceAgentRunner:
         context = {
             "instruction": str(instruction or ""),
             "dataset": str(getattr(result, "dataset", "") or ""),
+            "task_id": int(task_id),
             "need_time": bool(need_time),
             "need_comp": bool(need_comp),
             "need_reason": bool(need_reason),
@@ -1877,6 +1878,26 @@ class IndexedEvidenceAgentRunner:
                     reasons.append(r)
             if not reasons:
                 reasons = [""]
+            if adapter is not None and bool(need_reason):
+                try:
+                    taxonomy_reasons = [str(x).strip() for x in list(adapter.basil_reason_taxonomy() or []) if str(x).strip()]
+                except Exception:
+                    taxonomy_reasons = []
+                source_rows_for_reason = [dict(x) for x in list(deterministic_pool or []) if isinstance(x, Mapping)]
+                for item in source_rows_for_reason[: max(20, int(pool_k))]:
+                    c0 = str(item.get("component", "") or "").strip()
+                    metrics0 = [str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x or "").strip()]
+                    if not c0 or not metrics0:
+                        continue
+                    for r0 in taxonomy_reasons:
+                        if r0 in reasons:
+                            continue
+                        try:
+                            support = float(adapter._reason_metric_support_score(component=c0, reason=r0, metrics=metrics0))  # noqa: SLF001
+                        except Exception:
+                            support = 0.0
+                        if support >= 0.68:
+                            reasons.append(r0)
 
             comp_scores = dict((context or {}).get("component_scores") or {})
             max_comp = max([abs(float(v)) for v in comp_scores.values()] + [1.0]) if comp_scores else 1.0
@@ -1893,6 +1914,27 @@ class IndexedEvidenceAgentRunner:
             top_reason_n = max(8, int(getattr(args, "basil_candidate_reason_top_r", 8) or 8))
             if "cloudbed-2" in ds_norm:
                 top_reason_n = max(top_reason_n, 20)
+
+            local_reason_support: Dict[tuple[str, str], float] = {}
+            if adapter is not None:
+                source_rows = [dict(x) for x in list(deterministic_pool or []) if isinstance(x, Mapping)]
+                for item in source_rows:
+                    c0 = str(item.get("component", "") or "").strip()
+                    metrics0 = [str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x or "").strip()]
+                    if not c0 or not metrics0:
+                        continue
+                    for r0 in reasons[:top_reason_n]:
+                        rr0 = str(r0 or "").strip()
+                        if not rr0:
+                            continue
+                        try:
+                            support = float(adapter._reason_metric_support_score(component=c0, reason=rr0, metrics=metrics0))  # noqa: SLF001
+                        except Exception:
+                            support = 0.0
+                        if support <= 0.0:
+                            continue
+                        key0 = (c0, rr0)
+                        local_reason_support[key0] = max(float(local_reason_support.get(key0, 0.0)), float(support))
 
             expanded: Dict[tuple[str, str], Dict[str, Any]] = {}
             for c in (components[:top_comp_n] if (bool(need_comp) or bool(need_time)) else [""]):
@@ -1912,7 +1954,8 @@ class IndexedEvidenceAgentRunner:
                             rs = float(reason_scores.get(rr, 0.0) or 0.0)
                         except Exception:
                             rs = 0.0
-                    score = float(0.80 * cs + 0.20 * rs)
+                    local_support = float(local_reason_support.get((str(c or "").strip(), rr), 0.0))
+                    score = float(0.68 * cs + 0.16 * rs + 0.42 * local_support)
                     key = (str(c or "").strip(), rr)
                     prev = expanded.get(key)
                     if prev is None or float(prev.get("score", 0.0) or 0.0) < score:
@@ -1920,7 +1963,7 @@ class IndexedEvidenceAgentRunner:
                             "component": key[0],
                             "reason": key[1],
                             "datetime": "",
-                            "score": float(max_det_score + 1.0 + score),
+                            "score": float(score),
                             "source": "market_basil_expand",
                         }
 
@@ -1957,6 +2000,19 @@ class IndexedEvidenceAgentRunner:
                             deterministic = [dict(x) for x in selected if isinstance(x, Mapping)]
                     except Exception:
                         pass
+        if ds_norm.startswith("market") and adapter is not None and bool(need_comp) and bool(need_reason) and bool(need_time):
+            try:
+                adjusted = adapter.postprocess_output_tuples(
+                    deterministic,
+                    context=dict(context or {}),
+                    need_comp=True,
+                    need_reason=True,
+                    need_time=True,
+                )
+                if isinstance(adjusted, list) and adjusted:
+                    deterministic = [dict(x) for x in adjusted if isinstance(x, Mapping)]
+            except Exception:
+                pass
         pool_diagnostics = _candidate_pool_diagnostics(
             deterministic_pool,
             context=context,
