@@ -79,6 +79,7 @@ def _prediction_from_tuples(
     task_id: int,
     k: int,
     adapter: Any = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> str:
     need_time, need_comp, need_reason = task_need_flags(int(task_id))
     items_list = [dict(x) for x in list(items or []) if isinstance(x, Mapping)]
@@ -87,7 +88,7 @@ def _prediction_from_tuples(
             if adapter.__class__.__name__ == "MarketAdapter":
                 adjusted = adapter.postprocess_output_tuples(
                     items_list,
-                    context={},
+                    context=dict(context or {}),
                     need_comp=True,
                     need_reason=True,
                     need_time=bool(need_time),
@@ -126,6 +127,28 @@ def _prediction_from_tuples(
         if len(obj) >= max(1, int(k)):
             break
     return json.dumps(obj or {"1": {}}, ensure_ascii=False)
+
+
+def _tuples_from_prediction(prediction: str) -> List[Dict[str, Any]]:
+    try:
+        obj = json.loads(str(prediction or ""))
+    except Exception:
+        return []
+    if not isinstance(obj, Mapping):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for key in sorted(obj.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+        root = obj.get(key)
+        if not isinstance(root, Mapping):
+            continue
+        rows.append(
+            {
+                "component": str(root.get("root cause component", "") or ""),
+                "reason": str(root.get("root cause reason", "") or ""),
+                "datetime": str(root.get("root cause occurrence datetime", "") or ""),
+            }
+        )
+    return rows
 
 
 def _timing_step(
@@ -272,8 +295,27 @@ class BasilIndexStrategy:
         agent_seconds = float(time.perf_counter() - t_agent)
 
         t_post = time.perf_counter()
-        pred = _prediction_from_tuples(decision.selected_tuples, task_id=int(spec.task_id), k=k_fail, adapter=adapter)
+        pred_context = {
+            "candidate_tuples": list((decision.candidate_pool_diagnostics or {}).get("candidate_pool_preview") or [])
+        }
+        pred = _prediction_from_tuples(
+            decision.selected_tuples,
+            task_id=int(spec.task_id),
+            k=k_fail,
+            adapter=adapter,
+            context=pred_context,
+        )
         pred = canonicalize_prediction(pred)
+        if adapter is not None and adapter.__class__.__name__ == "MarketAdapter":
+            pred_rows = _tuples_from_prediction(pred)
+            if pred_rows:
+                pred = _prediction_from_tuples(
+                    pred_rows,
+                    task_id=int(spec.task_id),
+                    k=k_fail,
+                    adapter=adapter,
+                    context=pred_context,
+                )
         post_seconds = float(time.perf_counter() - t_post)
         total_seconds = float(time.perf_counter() - t_total)
 

@@ -1989,6 +1989,23 @@ class IndexedEvidenceAgentRunner:
         else:
             context["candidate_tuples"] = [dict(x) for x in list(deterministic_pool or [])[:50] if isinstance(x, Mapping)]
         deterministic = deterministic_pool[: max(1, int(k))]
+        if (
+            "cloudbed-2" in ds_norm
+            and bool(need_time)
+            and not bool(need_comp)
+            and not bool(need_reason)
+            and int(k) > 1
+        ):
+            def _parse_dt_for_order(item: Mapping[str, Any]) -> int:
+                text = str(item.get("datetime", "") or "").strip()
+                try:
+                    from datetime import datetime
+
+                    return int(datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp())
+                except Exception:
+                    return 10**18
+
+            deterministic = sorted([dict(x) for x in deterministic if isinstance(x, Mapping)], key=_parse_dt_for_order)
         if int(task_id) == 6 and int(k) > 1:
             adapter = get_dataset_adapter(str(getattr(result, "dataset", "") or ""))
             if adapter is not None:
