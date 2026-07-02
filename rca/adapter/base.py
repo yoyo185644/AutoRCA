@@ -1014,6 +1014,50 @@ class DatasetAdapter:
             "incoming_symptomness": self._clip01(incoming),
         }
 
+    def topology_context_for_component(
+        self,
+        *,
+        component: str,
+        context: Mapping[str, Any],
+        limit: int = 6,
+    ) -> Dict[str, Any]:
+        """Compact topology summary for bounded LLM reranking.
+
+        This method uses only indexed/runtime topology evidence.  It does not
+        inspect evaluation labels.  Dataset adapters may override it when they
+        have richer call-graph semantics.
+        """
+        comp = self.parse_component_id(str(component or ""))
+        if not comp:
+            return {}
+        edges = list((context or {}).get("causal_edges", []) or [])
+        upstream: List[str] = []
+        downstream: List[str] = []
+        for edge in edges:
+            src = self.parse_component_id(str(self._edge_value(edge, "src", "") or ""))
+            dst = self.parse_component_id(str(self._edge_value(edge, "dst", "") or ""))
+            if not src or not dst:
+                continue
+            if src == comp and dst not in downstream:
+                downstream.append(dst)
+            if dst == comp and src not in upstream:
+                upstream.append(src)
+        ctype = str(self.component_semantic_type(comp) or "")
+        is_shared_infra = ctype in {"node", "host", "gateway", "infra"}
+        return {
+            "component_role": ctype,
+            "upstream": upstream[: max(1, int(limit))],
+            "downstream": downstream[: max(1, int(limit))],
+            "fanout": int(len(downstream)),
+            "fanin": int(len(upstream)),
+            "is_shared_infra": bool(is_shared_infra),
+            "rootness_note": (
+                "shared infrastructure candidate; require strong local evidence before replacing a service/container"
+                if is_shared_infra
+                else "local service/container candidate; prefer when it has owned metrics and explains downstream symptoms"
+            ),
+        }
+
     def _component_rootness_features(
         self,
         *,

@@ -365,6 +365,474 @@ def _candidate_pool_diagnostics(
     }
 
 
+def _candidate_component_type(item: Mapping[str, Any], context: Mapping[str, Any]) -> str:
+    ctype = str(item.get("component_type", "") or item.get("channel", "") or "").strip()
+    if ctype:
+        return ctype
+    comp = str(item.get("component", "") or "").strip()
+    adapter = get_dataset_adapter(str((context or {}).get("dataset", "") or ""))
+    if adapter is not None and comp:
+        try:
+            return str(adapter.component_semantic_type(comp) or "")
+        except Exception:
+            return ""
+    return ""
+
+
+def _reason_family(reason: str) -> str:
+    text = str(reason or "").lower()
+    if any(tok in text for tok in ("network", "packet", "latency", "loss", "retrans", "corrupt")):
+        return "network"
+    if "cpu" in text:
+        return "cpu"
+    if "memory" in text or "mem" in text:
+        return "memory"
+    if any(tok in text for tok in ("read", "write", "disk", "i/o", "io", "space")):
+        return "io"
+    if any(tok in text for tok in ("process", "termination", "restart", "kill")):
+        return "process"
+    return text.strip()
+
+
+def _tuple_key(item: Mapping[str, Any]) -> Dict[str, str]:
+    return {
+        "component": str(item.get("component", "") or "").strip(),
+        "reason": str(item.get("reason", "") or "").strip(),
+        "datetime": str(item.get("datetime", "") or "").strip(),
+    }
+
+
+def _local_evidence_strength(item: Mapping[str, Any], context: Mapping[str, Any]) -> float:
+    features = dict(item.get("rootness_features", {}) or {}) if isinstance(item.get("rootness_features", {}), Mapping) else {}
+    metrics = [str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x or "").strip()]
+    comp = str(item.get("component", "") or "").strip()
+    if not metrics:
+        metrics = [str(x) for x in list((context or {}).get("top_metrics", {}).get(comp, []) or []) if str(x or "").strip()]
+    owned = max(
+        float(features.get("instance_owned_score", 0.0) or 0.0),
+        float(features.get("ownership", 0.0) or 0.0),
+        float(item.get("instance_owned_score", 0.0) or 0.0),
+    )
+    sibling = float(features.get("sibling_contrast", 0.0) or item.get("sibling_contrast", 0.0) or 0.0)
+    metric_bonus = min(1.0, len(metrics) / 6.0)
+    symptomness = max(
+        float(item.get("symptomness", 0.0) or 0.0),
+        float(features.get("incoming_symptomness", 0.0) or 0.0),
+    )
+    return float(owned + 0.35 * sibling + 0.25 * metric_bonus - 0.35 * symptomness)
+
+
+def _reason_metric_match_score(item: Mapping[str, Any], context: Mapping[str, Any]) -> float:
+    reason = str(item.get("reason", "") or "").strip().lower()
+    if not reason:
+        return 0.0
+    comp = str(item.get("component", "") or "").strip()
+    metrics = [str(x).lower() for x in list(item.get("supporting_metrics", []) or []) if str(x or "").strip()]
+    metrics.extend(str(x).lower() for x in list((context or {}).get("top_metrics", {}).get(comp, []) or []) if str(x or "").strip())
+    blob = " ".join(metrics + [str(item.get("source", "") or "").lower()])
+    if not blob:
+        return 0.0
+    if "cpu" in reason:
+        return 1.0 if "cpu" in blob or "load" in blob else 0.0
+    if any(tok in reason for tok in ("memory", "mem")):
+        return 1.0 if any(tok in blob for tok in ("mem", "memory", "rss", "heap", "gc")) else 0.0
+    if any(tok in reason for tok in ("network", "packet", "latency", "loss", "retrans")):
+        return 1.0 if any(tok in blob for tok in ("network", "packet", "tcp", "retrans", "latency", "loss")) else 0.0
+    if any(tok in reason for tok in ("read", "write", "disk", "io", "i/o")):
+        return 1.0 if any(tok in blob for tok in ("read", "write", "disk", "io", "i/o", "fs_")) else 0.0
+    return 0.3
+
+
+def _temporal_change_score(item: Mapping[str, Any], context: Mapping[str, Any], *, need_time: bool) -> float:
+    if not bool(need_time):
+        return 0.0
+    dt = str(item.get("datetime", "") or item.get("occurrence_datetime", "") or "").strip()
+    if not dt:
+        return 0.0
+    source = str(item.get("source", "") or "").lower()
+    score = 0.15
+    if any(tok in source for tok in ("change_point", "strongest", "first", "onset", "impact")):
+        score += 0.45
+    if "peak" in source:
+        score += 0.25
+    comp = str(item.get("component", "") or "").strip()
+    first_times = dict((context or {}).get("component_first_times", {}) or {})
+    peak_times = dict((context or {}).get("component_peak_times", {}) or {})
+    if comp and dt[:16] in {str(first_times.get(comp, ""))[:16], str(peak_times.get(comp, ""))[:16]}:
+        score += 0.25
+    return float(min(1.0, score))
+
+
+def _propagation_score(item: Mapping[str, Any]) -> float:
+    features = dict(item.get("rootness_features", {}) or {}) if isinstance(item.get("rootness_features", {}), Mapping) else {}
+    return float(
+        min(
+            1.0,
+            max(
+                float(features.get("causal_source_score", 0.0) or 0.0),
+                float(features.get("outgoing_propagation", 0.0) or 0.0),
+                float(item.get("causal_source_score", 0.0) or 0.0),
+                float(item.get("outgoing_propagation", 0.0) or 0.0),
+            ),
+        )
+    )
+
+
+def _symptom_risk_score(item: Mapping[str, Any], context: Mapping[str, Any]) -> float:
+    features = dict(item.get("rootness_features", {}) or {}) if isinstance(item.get("rootness_features", {}), Mapping) else {}
+    risk = max(
+        float(item.get("symptomness", 0.0) or 0.0),
+        float(features.get("incoming_symptomness", 0.0) or 0.0),
+    )
+    if _candidate_component_type(item, context) == "node":
+        risk = max(risk, 0.35)
+    source = str(item.get("source", "") or "").lower()
+    if "trace" in source and not item.get("supporting_metrics"):
+        risk = max(risk, 0.45)
+    return float(min(1.0, risk))
+
+
+def _intervention_profile(
+    item: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    need_time: bool,
+    need_comp: bool,
+    need_reason: bool,
+) -> Dict[str, Any]:
+    local = max(0.0, min(1.0, _local_evidence_strength(item, context)))
+    reason_match = _reason_metric_match_score(item, context) if bool(need_reason) else 0.0
+    temporal = _temporal_change_score(item, context, need_time=bool(need_time))
+    propagation = _propagation_score(item)
+    symptom = _symptom_risk_score(item, context)
+    has_required = True
+    if bool(need_comp) and not str(item.get("component", "") or "").strip():
+        has_required = False
+    if bool(need_reason) and not str(item.get("reason", "") or "").strip():
+        has_required = False
+    if bool(need_time) and not str(item.get("datetime", "") or "").strip():
+        has_required = False
+    score = 0.38 * local + 0.20 * reason_match + 0.20 * temporal + 0.14 * propagation - 0.24 * symptom
+    if not has_required:
+        score -= 0.40
+    return {
+        "component": str(item.get("component", "") or ""),
+        "reason": str(item.get("reason", "") or ""),
+        "datetime": str(item.get("datetime", "") or ""),
+        "component_type": _candidate_component_type(item, context),
+        "local_evidence": float(local),
+        "reason_metric_match": float(reason_match),
+        "temporal_change": float(temporal),
+        "propagation_fit": float(propagation),
+        "symptom_risk": float(symptom),
+        "intervention_score": float(score),
+        "has_required_fields": bool(has_required),
+    }
+
+
+def _intervention_challenger_plan(
+    candidates: Sequence[Mapping[str, Any]],
+    context: Mapping[str, Any],
+    *,
+    need_time: bool,
+    need_comp: bool,
+    need_reason: bool,
+    max_keys: int = 6,
+) -> Dict[str, Any]:
+    rows = [dict(x) for x in list(candidates or []) if isinstance(x, Mapping)]
+    if len(rows) < 2:
+        return {"keys": [], "profiles": [], "call_llm": False, "reason": "not_enough_candidates"}
+    top1 = rows[0]
+    top1_prof = _intervention_profile(top1, context, need_time=need_time, need_comp=need_comp, need_reason=need_reason)
+    try:
+        top1_score = float(top1.get("score", 0.0) or 0.0)
+    except Exception:
+        top1_score = 0.0
+    candidates_with_profiles = []
+    for item in rows[1: min(len(rows), 24)]:
+        prof = _intervention_profile(item, context, need_time=need_time, need_comp=need_comp, need_reason=need_reason)
+        if not bool(prof.get("has_required_fields")):
+            continue
+        gain = float(prof.get("intervention_score", 0.0)) - float(top1_prof.get("intervention_score", 0.0))
+        different = False
+        if need_comp and str(prof.get("component", "")) != str(top1_prof.get("component", "")):
+            different = True
+        if need_reason and str(prof.get("reason", "")) != str(top1_prof.get("reason", "")):
+            different = True
+        if need_time and _candidate_time_cluster(str(prof.get("datetime", ""))) != _candidate_time_cluster(str(top1_prof.get("datetime", ""))):
+            different = True
+        if not different:
+            continue
+        try:
+            item_score = float(item.get("score", 0.0) or 0.0)
+        except Exception:
+            item_score = 0.0
+        near_score = bool(item_score >= max(0.0, 0.72 * top1_score) or (top1_score - item_score) <= 0.18)
+        top1_symptom = bool(float(top1_prof.get("symptom_risk", 0.0) or 0.0) >= 0.35)
+        # The challenger must be actionable in at least one required field, not
+        # merely different.  This keeps the LLM for cases where there is a real
+        # intervention opportunity.
+        actionable = False
+        if need_comp:
+            actionable = actionable or (
+                str(prof.get("component", "")) != str(top1_prof.get("component", ""))
+                and float(prof.get("local_evidence", 0.0)) >= float(top1_prof.get("local_evidence", 0.0)) + 0.12
+                and float(prof.get("symptom_risk", 0.0)) <= float(top1_prof.get("symptom_risk", 0.0)) + 0.10
+            )
+            actionable = actionable or (
+                top1_symptom
+                and near_score
+                and str(prof.get("component_type", "")) != str(top1_prof.get("component_type", ""))
+                and float(prof.get("symptom_risk", 0.0)) <= float(top1_prof.get("symptom_risk", 0.0)) + 0.20
+            )
+        if need_reason:
+            actionable = actionable or (
+                str(prof.get("reason", "")) != str(top1_prof.get("reason", ""))
+                and float(prof.get("reason_metric_match", 0.0)) >= float(top1_prof.get("reason_metric_match", 0.0)) + 0.25
+            )
+            actionable = actionable or (
+                near_score
+                and str(prof.get("reason", "")) != str(top1_prof.get("reason", ""))
+                and _reason_family(str(prof.get("reason", ""))) != _reason_family(str(top1_prof.get("reason", "")))
+                and float(prof.get("reason_metric_match", 0.0)) >= float(top1_prof.get("reason_metric_match", 0.0))
+            )
+        if need_time:
+            actionable = actionable or (
+                _candidate_time_cluster(str(prof.get("datetime", ""))) != _candidate_time_cluster(str(top1_prof.get("datetime", "")))
+                and float(prof.get("temporal_change", 0.0)) >= float(top1_prof.get("temporal_change", 0.0)) + 0.20
+            )
+            actionable = actionable or (
+                near_score
+                and _candidate_time_cluster(str(prof.get("datetime", ""))) != _candidate_time_cluster(str(top1_prof.get("datetime", "")))
+                and float(prof.get("temporal_change", 0.0)) >= max(0.35, float(top1_prof.get("temporal_change", 0.0)) - 0.05)
+            )
+        if not actionable:
+            continue
+        prof = dict(prof)
+        prof["near_score_challenger"] = bool(near_score)
+        prof["top1_symptom_challenge"] = bool(top1_symptom)
+        candidates_with_profiles.append((gain, prof, item))
+
+    candidates_with_profiles.sort(
+        key=lambda x: (
+            float(x[0]),
+            float(x[1].get("local_evidence", 0.0)),
+            float(x[1].get("reason_metric_match", 0.0)),
+            float(x[1].get("temporal_change", 0.0)),
+        ),
+        reverse=True,
+    )
+    selected = []
+    selected_profiles = []
+    seen: set[tuple[str, str, str]] = set()
+    for gain, prof, item in candidates_with_profiles:
+        if gain < 0.10 and float(prof.get("intervention_score", 0.0)) < 0.40:
+            continue
+        sig = (str(item.get("component", "") or ""), str(item.get("reason", "") or ""), str(item.get("datetime", "") or ""))
+        if sig in seen:
+            continue
+        selected.append(_tuple_key(item))
+        prof2 = dict(prof)
+        prof2["gain_vs_top1"] = float(gain)
+        selected_profiles.append(prof2)
+        seen.add(sig)
+        if len(selected) >= max(1, int(max_keys) - 1):
+            break
+    call_llm = bool(selected)
+    keys = [_tuple_key(top1)] + selected if call_llm else []
+    return {
+        "keys": keys,
+        "profiles": [top1_prof] + selected_profiles if call_llm else [top1_prof],
+        "call_llm": bool(call_llm),
+        "reason": "actionable_intervention_challenger" if call_llm else "no_actionable_intervention_challenger",
+        "top1_profile": dict(top1_prof),
+    }
+
+
+def _attach_topology_context_to_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    adapter: Any,
+    context: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for raw in list(rows or []):
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        if not isinstance(item.get("topology_context", {}), Mapping):
+            item.pop("topology_context", None)
+        if not item.get("topology_context") and adapter is not None:
+            comp = str(item.get("component", "") or "").strip()
+            if comp:
+                try:
+                    topo = dict(adapter.topology_context_for_component(component=comp, context=context) or {})
+                except Exception:
+                    topo = {}
+                if topo:
+                    item["topology_context"] = topo
+        out.append(item)
+    return out
+
+
+def _coverage_aware_challenger_keys(
+    candidates: Sequence[Mapping[str, Any]],
+    context: Mapping[str, Any],
+    *,
+    need_time: bool,
+    need_comp: bool,
+    need_reason: bool,
+    max_keys: int = 6,
+) -> Dict[str, Any]:
+    """Select representative challengers from observed evidence dimensions.
+
+    This does not use labels.  It asks whether the current prompt candidates
+    cover component types, reason families, and time clusters that are present
+    in indexed evidence.  Missing dimensions produce retrieval/rerank keys for
+    the LLM prompt.
+    """
+    rows = [dict(x) for x in list(candidates or []) if isinstance(x, Mapping)]
+    if not rows:
+        return {"keys": [], "coverage": {"complete": False, "reason": "empty_pool"}}
+
+    adapter = get_dataset_adapter(str((context or {}).get("dataset", "") or ""))
+    observed_types: set[str] = set()
+    if need_comp:
+        for comp in list((context or {}).get("allowed_components") or []):
+            c = str(comp or "").strip()
+            if not c:
+                continue
+            if adapter is not None:
+                try:
+                    ct = str(adapter.component_semantic_type(c) or "")
+                except Exception:
+                    ct = ""
+            else:
+                ct = ""
+            if ct:
+                observed_types.add(ct)
+        for comp in list(((context or {}).get("top_metrics") or {}).keys()):
+            c = str(comp or "").strip()
+            if not c or adapter is None:
+                continue
+            try:
+                ct = str(adapter.component_semantic_type(c) or "")
+            except Exception:
+                ct = ""
+            if ct:
+                observed_types.add(ct)
+
+    observed_reason_families: set[str] = set()
+    if need_reason:
+        for reason in list((context or {}).get("allowed_reasons") or []):
+            fam = _reason_family(str(reason or ""))
+            if fam:
+                observed_reason_families.add(fam)
+        for reason, score in dict((context or {}).get("reason_scores") or {}).items():
+            try:
+                if float(score or 0.0) <= 0:
+                    continue
+            except Exception:
+                pass
+            fam = _reason_family(str(reason or ""))
+            if fam:
+                observed_reason_families.add(fam)
+
+    observed_time_clusters: set[str] = set()
+    if need_time:
+        for item in list((context or {}).get("time_candidates") or []):
+            if not isinstance(item, Mapping):
+                continue
+            cluster = _candidate_time_cluster(str(item.get("datetime", "") or ""))
+            if cluster:
+                observed_time_clusters.add(cluster)
+
+    prompt_window = rows[: min(len(rows), 8)]
+    candidate_types = {_candidate_component_type(x, context) for x in prompt_window if _candidate_component_type(x, context)}
+    candidate_reason_families = {_reason_family(str(x.get("reason", "") or "")) for x in prompt_window if str(x.get("reason", "") or "").strip()}
+    candidate_time_clusters = {_candidate_time_cluster(str(x.get("datetime", "") or "")) for x in prompt_window if str(x.get("datetime", "") or "").strip()}
+
+    missing_types = sorted(observed_types - candidate_types)
+    missing_reasons = sorted(observed_reason_families - candidate_reason_families)
+    missing_times = sorted(observed_time_clusters - candidate_time_clusters)
+
+    selected: List[Dict[str, str]] = []
+    selected_sigs: set[tuple[str, str, str]] = set()
+
+    def add(item: Mapping[str, Any]) -> None:
+        if len(selected) >= max(1, int(max_keys)):
+            return
+        key = _tuple_key(item)
+        sig = (key["component"], key["reason"], key["datetime"])
+        if sig in selected_sigs:
+            return
+        selected.append(key)
+        selected_sigs.add(sig)
+
+    if rows:
+        add(rows[0])
+
+    for mt in missing_types:
+        best = max(
+            (x for x in rows if _candidate_component_type(x, context) == mt),
+            key=lambda x: (_local_evidence_strength(x, context), float(x.get("score", 0.0) or 0.0)),
+            default=None,
+        )
+        if best is not None:
+            add(best)
+
+    for mr in missing_reasons:
+        best = max(
+            (x for x in rows if _reason_family(str(x.get("reason", "") or "")) == mr),
+            key=lambda x: (_local_evidence_strength(x, context), float(x.get("score", 0.0) or 0.0)),
+            default=None,
+        )
+        if best is not None:
+            add(best)
+
+    for mtc in missing_times[: max(0, int(max_keys) - len(selected))]:
+        best = max(
+            (x for x in rows if _candidate_time_cluster(str(x.get("datetime", "") or "")) == mtc),
+            key=lambda x: (_local_evidence_strength(x, context), float(x.get("score", 0.0) or 0.0)),
+            default=None,
+        )
+        if best is not None:
+            add(best)
+
+    # Always include the strongest local non-node challenger when top1 is a
+    # possible infrastructure symptom and a local service/container candidate
+    # exists.  This is the common case where deterministic rankers over-trust
+    # broad node evidence.
+    top_type = _candidate_component_type(rows[0], context) if rows else ""
+    if need_comp and top_type == "node":
+        best_local = max(
+            (x for x in rows if _candidate_component_type(x, context) in {"container", "service", "pod"}),
+            key=lambda x: (_local_evidence_strength(x, context), float(x.get("score", 0.0) or 0.0)),
+            default=None,
+        )
+        if best_local is not None:
+            add(best_local)
+
+    for item in rows:
+        if len(selected) >= max(1, int(max_keys)):
+            break
+        add(item)
+
+    coverage = {
+        "observed_component_types": sorted(observed_types),
+        "candidate_component_types": sorted(candidate_types),
+        "missing_component_types": missing_types,
+        "observed_reason_families": sorted(observed_reason_families),
+        "candidate_reason_families": sorted(candidate_reason_families),
+        "missing_reason_families": missing_reasons,
+        "observed_time_clusters": len(observed_time_clusters),
+        "candidate_time_clusters": len(candidate_time_clusters),
+        "missing_time_cluster_count": len(missing_times),
+        "complete": not (missing_types or missing_reasons or missing_times),
+    }
+    return {"keys": selected, "coverage": coverage}
+
+
 def _source_flags(item: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[str, bool]:
     comp = str(item.get("component", "") or "").strip()
     source_blob = " ".join(
@@ -1626,6 +2094,14 @@ class IndexedEvidenceAgentRunner:
             rootness_features = dict(getattr(cand, "rootness_features", {}) or {})
             if not rootness_features and isinstance(original.get("rootness_features", {}), Mapping):
                 rootness_features = dict(original.get("rootness_features", {}) or {})
+            topology_context = {}
+            if isinstance(original.get("topology_context", {}), Mapping):
+                topology_context = dict(original.get("topology_context", {}) or {})
+            elif adapter is not None and comp:
+                try:
+                    topology_context = dict(adapter.topology_context_for_component(component=comp, context=context) or {})
+                except Exception:
+                    topology_context = {}
             out.append(
                 {
                     "component": comp,
@@ -1638,6 +2114,7 @@ class IndexedEvidenceAgentRunner:
                     "first_anomaly_time": str(original.get("first_anomaly_time", "") or ""),
                     "symptomness": float(getattr(cand, "symptomness", original.get("symptomness", 0.0)) or 0.0),
                     "rootness_features": rootness_features,
+                    "topology_context": topology_context,
                 }
             )
         if bool(need_comp) and not bool(need_reason) and not bool(need_time):
@@ -1988,6 +2465,13 @@ class IndexedEvidenceAgentRunner:
             context["candidate_tuples"] = [dict(x) for x in list(deterministic_pool or [])[:50] if isinstance(x, Mapping)]
         else:
             context["candidate_tuples"] = [dict(x) for x in list(deterministic_pool or [])[:50] if isinstance(x, Mapping)]
+        deterministic_pool = _attach_topology_context_to_rows(
+            deterministic_pool,
+            adapter=adapter,
+            context=context,
+        )
+        context["candidate_tuples"] = [dict(x) for x in list(deterministic_pool or [])[:50] if isinstance(x, Mapping)]
+        context["candidate_tuples_ranked"] = True
         deterministic = deterministic_pool[: max(1, int(k))]
         if (
             "cloudbed-2" in ds_norm
@@ -2037,6 +2521,59 @@ class IndexedEvidenceAgentRunner:
             need_comp=bool(need_comp),
             need_reason=bool(need_reason),
         )
+        coverage_plan = _coverage_aware_challenger_keys(
+            deterministic_pool,
+            context,
+            need_time=bool(need_time),
+            need_comp=bool(need_comp),
+            need_reason=bool(need_reason),
+            max_keys=int((context or {}).get("llm_max_prompt_candidates", 6) or 6),
+        )
+        pool_diagnostics["coverage_aware_agent"] = dict(coverage_plan.get("coverage") or {})
+        context["coverage_aware_agent"] = dict(coverage_plan.get("coverage") or {})
+        intervention_plan = _intervention_challenger_plan(
+            deterministic_pool,
+            context,
+            need_time=bool(need_time),
+            need_comp=bool(need_comp),
+            need_reason=bool(need_reason),
+            max_keys=int((context or {}).get("llm_max_prompt_candidates", 6) or 6),
+        )
+        pool_diagnostics["intervention_agent"] = {
+            "call_llm": bool(intervention_plan.get("call_llm")),
+            "reason": str(intervention_plan.get("reason", "") or ""),
+            "profiles": list(intervention_plan.get("profiles") or [])[:6],
+        }
+        context["intervention_agent"] = dict(pool_diagnostics["intervention_agent"])
+        max_prompt_keys = int((context or {}).get("llm_max_prompt_candidates", 6) or 6)
+
+        def _key_sig(key: Mapping[str, Any]) -> tuple[str, str, str]:
+            return (
+                str(key.get("component", "") or ""),
+                str(key.get("reason", "") or ""),
+                str(key.get("datetime", "") or ""),
+            )
+
+        challenger_keys: List[Dict[str, Any]] = []
+        seen_key_sigs: set[tuple[str, str, str]] = set()
+        for source_keys in (
+            list(coverage_plan.get("keys") or []),
+            list(intervention_plan.get("keys") or []),
+        ):
+            for key in source_keys:
+                if not isinstance(key, Mapping):
+                    continue
+                sig = _key_sig(key)
+                if sig in seen_key_sigs:
+                    continue
+                challenger_keys.append(dict(key))
+                seen_key_sigs.add(sig)
+                if len(challenger_keys) >= max(1, int(max_prompt_keys)):
+                    break
+            if len(challenger_keys) >= max(1, int(max_prompt_keys)):
+                break
+        if challenger_keys:
+            context["llm_challenger_candidate_keys"] = challenger_keys
         consistency_gate = _evidence_consistency_gate(
             deterministic_pool,
             context,
@@ -2066,6 +2603,48 @@ class IndexedEvidenceAgentRunner:
 
         gate = _uncertainty_gate_for_tuples(deterministic_pool, context)
         gate["candidate_pool_diagnostics"] = dict(pool_diagnostics)
+        coverage_info = dict(coverage_plan.get("coverage") or {})
+        coverage_missing_dims: List[str] = []
+        if bool(need_comp) and list(coverage_info.get("missing_component_types") or []):
+            coverage_missing_dims.append("component")
+        if bool(need_reason) and list(coverage_info.get("missing_reason_families") or []):
+            coverage_missing_dims.append("reason")
+        if bool(need_time) and int(coverage_info.get("missing_time_cluster_count", 0) or 0) > 0:
+            coverage_missing_dims.append("time_cluster")
+        if bool(intervention_plan.get("call_llm")):
+            profiles = list(intervention_plan.get("profiles") or [])
+            top_prof = dict(profiles[0]) if profiles and isinstance(profiles[0], Mapping) else {}
+            challenger_prof = dict(profiles[1]) if len(profiles) > 1 and isinstance(profiles[1], Mapping) else {}
+            dims = []
+            if bool(need_comp) and str(top_prof.get("component", "")) != str(challenger_prof.get("component", "")):
+                dims.append("component")
+            if bool(need_reason) and str(top_prof.get("reason", "")) != str(challenger_prof.get("reason", "")):
+                dims.append("reason")
+            if bool(need_time) and _candidate_time_cluster(str(top_prof.get("datetime", ""))) != _candidate_time_cluster(str(challenger_prof.get("datetime", ""))):
+                dims.append("time_cluster")
+            gate["evidence_conflict"] = {
+                "has_conflict": True,
+                "reason": "actionable_intervention_challenger",
+                "conflict_dimensions": dims,
+                "top1_profile": top_prof,
+                "challenger_profile": {
+                    **challenger_prof,
+                    "sufficient": True,
+                    "evidence_strength": 3,
+                    "component_family": _candidate_component_family(str(challenger_prof.get("component", "") or "")),
+                    "time_cluster": _candidate_time_cluster(str(challenger_prof.get("datetime", "") or "")),
+                },
+                "challenger_key": dict((list(intervention_plan.get("keys") or []) + [{}])[1] or {}),
+                "checked_challengers": profiles[1:6],
+            }
+        elif coverage_missing_dims and len(challenger_keys) >= 2:
+            gate["evidence_conflict"] = {
+                "has_conflict": True,
+                "reason": "coverage_aware_challenger",
+                "conflict_dimensions": list(coverage_missing_dims),
+                "coverage": dict(coverage_info),
+                "challenger_key": dict(challenger_keys[1] if len(challenger_keys) > 1 else {}),
+            }
         if adapter is not None:
             try:
                 gate = adapter.refine_index_llm_gate(
@@ -2076,6 +2655,23 @@ class IndexedEvidenceAgentRunner:
                 )
             except Exception:
                 pass
+        if (
+            not bool(gate.get("need_llm"))
+            and (bool(intervention_plan.get("call_llm")) or bool(coverage_missing_dims))
+            and len(list(context.get("llm_challenger_candidate_keys") or [])) >= 2
+        ):
+            gate["need_llm"] = True
+            gate.setdefault("reasons", [])
+            gate["reasons"] = list(
+                dict.fromkeys(
+                    list(gate.get("reasons") or [])
+                    + [
+                        "call_llm_due_to_intervention_challenger"
+                        if bool(intervention_plan.get("call_llm"))
+                        else "call_llm_due_to_coverage_challenger"
+                    ]
+                )
+            )
         if not bool(gate.get("need_llm")):
             return IndexedEvidenceDecision(
                 selected_tuples=deterministic,

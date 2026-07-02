@@ -307,6 +307,56 @@ class MarketAdapter(DatasetAdapter):
             base["incoming_symptomness"] = max(self._safe_float(base.get("incoming_symptomness", 0.0)), 0.35 * incoming)
         return base
 
+    def topology_context_for_component(
+        self,
+        *,
+        component: str,
+        context: Mapping[str, Any],
+        limit: int = 6,
+    ) -> Dict[str, Any]:
+        base = dict(super().topology_context_for_component(component=component, context=context, limit=limit))
+        comp = self.parse_component_id(str(component or ""))
+        if not comp:
+            return base
+        ctype = str(self.component_semantic_type(comp) or "")
+        family = _market_semantic_family(comp)
+        edges = self._trace_call_graph_edges(context=context)
+        if edges and family:
+            downstream: List[str] = []
+            upstream: List[str] = []
+            for (src, dst), _count in sorted(edges.items(), key=lambda kv: int(kv[1]), reverse=True):
+                if src == family and dst not in downstream:
+                    downstream.append(dst)
+                if dst == family and src not in upstream:
+                    upstream.append(src)
+            base.update(
+                {
+                    "component_role": ctype,
+                    "trace_upstream": upstream[: max(1, int(limit))],
+                    "trace_downstream": downstream[: max(1, int(limit))],
+                    "trace_fanout": int(len(downstream)),
+                    "trace_fanin": int(len(upstream)),
+                }
+            )
+        if ctype == "node":
+            base.update(
+                {
+                    "component_role": "node",
+                    "is_shared_infra": True,
+                    "rootness_note": (
+                        "node-level anomaly can be a shared infrastructure symptom; prefer a service/container challenger "
+                        "when it has local owned metrics on the affected path"
+                    ),
+                }
+            )
+        elif ctype in {"container", "service", "pod"}:
+            base.setdefault("is_shared_infra", False)
+            base["rootness_note"] = (
+                "service/container candidate; if local metrics are anomalous and topology connects to symptoms, "
+                "it is a stronger intervention target than a shared node"
+            )
+        return base
+
     def llm_reason_rules(self) -> List[str]:
         return [
             "Node reasons should align with node components and node-level metrics.",

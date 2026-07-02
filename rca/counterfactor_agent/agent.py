@@ -37,6 +37,109 @@ class CounterfactualController:
         challenger_sufficient = bool(challenger_profile.get("sufficient", False))
         challenger_strength = int(challenger_profile.get("evidence_strength", 0) or 0)
 
+        def _features(cand: CandidateHypothesis) -> Dict[str, float | str]:
+            evidence = [str(x) for x in list(getattr(cand, "evidence", []) or []) if str(x or "").strip()]
+            blob = " ".join(evidence).lower()
+            ctype = ""
+            rootness: Dict[str, float] = {}
+            metric_count = 0
+            incoming = 0.0
+            for item in evidence:
+                if item.startswith("component_type="):
+                    ctype = item.split("=", 1)[1].strip().lower()
+                if item.startswith("topology_context="):
+                    try:
+                        topo = json.loads(item.split("=", 1)[1])
+                        if isinstance(topo, dict):
+                            if bool(topo.get("shared_infra", False)):
+                                incoming = max(incoming, 0.45)
+                            fanout = float(topo.get("fanout", 0) or 0)
+                            if fanout >= 2:
+                                incoming = max(incoming, min(0.75, 0.35 + 0.08 * fanout))
+                            if not ctype and str(topo.get("role", "") or "").strip():
+                                ctype = str(topo.get("role", "") or "").strip().lower()
+                    except Exception:
+                        pass
+                if item.startswith("supporting_metrics="):
+                    vals = [x for x in item.split("=", 1)[1].split(",") if x.strip()]
+                    metric_count = max(metric_count, len(vals))
+                if item.startswith("rootness_features="):
+                    for part in item.split("=", 1)[1].split(","):
+                        if "=" not in part:
+                            continue
+                        k, v = part.split("=", 1)
+                        try:
+                            rootness[k.strip()] = float(v)
+                        except Exception:
+                            pass
+            owned = max(rootness.get("instance_owned_score", 0.0), rootness.get("ownership", 0.0))
+            sibling = rootness.get("sibling_contrast", 0.0)
+            causal = max(rootness.get("causal_source_score", 0.0), rootness.get("outgoing_propagation", 0.0))
+            incoming = max(float(incoming), float(rootness.get("incoming_symptomness", 0.0) or 0.0))
+            local = min(1.0, owned + 0.35 * sibling + 0.20 * min(1.0, metric_count / 6.0))
+            symptom = min(1.0, incoming + (0.30 if ctype == "node" else 0.0))
+            metric_reason = 0.0
+            reason = str(getattr(cand, "reason", "") or "").lower()
+            if reason:
+                if "cpu" in reason and "cpu" in blob:
+                    metric_reason = 1.0
+                elif "memory" in reason and any(tok in blob for tok in ("mem", "memory", "rss")):
+                    metric_reason = 1.0
+                elif any(tok in reason for tok in ("network", "packet", "latency", "loss")) and any(tok in blob for tok in ("network", "packet", "tcp", "retrans", "latency")):
+                    metric_reason = 1.0
+                elif any(tok in reason for tok in ("read", "write", "disk", "i/o", "io")) and any(tok in blob for tok in ("read", "write", "disk", "io", "fs_")):
+                    metric_reason = 1.0
+            return {
+                "component_type": ctype,
+                "local": float(local),
+                "causal": float(min(1.0, causal)),
+                "symptom": float(symptom),
+                "metric_reason": float(metric_reason),
+            }
+
+        def _auto_intervention_score(cand: CandidateHypothesis) -> float:
+            f = _features(cand)
+            has_time = 1.0 if str(getattr(cand, "datetime", "") or "").strip() else 0.0
+            return float(
+                0.42 * float(f["local"])
+                + 0.22 * float(f["metric_reason"])
+                + 0.18 * float(f["causal"])
+                + 0.08 * has_time
+                - 0.25 * float(f["symptom"])
+            )
+
+        det_auto_intervention = _auto_intervention_score(deterministic)
+        prop_auto_intervention = _auto_intervention_score(proposed)
+        llm_top1_intervention = float(llm_details.get("top1_intervention_score", 0.0) or 0.0)
+        llm_prop_intervention = float(llm_details.get("selected_intervention_score", 0.0) or 0.0)
+        if llm_top1_intervention <= 0.0 and llm_prop_intervention <= 0.0:
+            top1_intervention = det_auto_intervention
+            prop_intervention = prop_auto_intervention
+            intervention_source = "auto_evidence"
+        else:
+            top1_intervention = 0.55 * llm_top1_intervention + 0.45 * det_auto_intervention
+            prop_intervention = 0.55 * llm_prop_intervention + 0.45 * prop_auto_intervention
+            intervention_source = "llm_plus_auto"
+        intervention_gain = float(prop_intervention - top1_intervention)
+        det_features = _features(deterministic)
+        prop_features = _features(proposed)
+        det_type = str(det_features.get("component_type", "") or "")
+        prop_type = str(prop_features.get("component_type", "") or "")
+        symptom_over_local = (
+            prop_type == "node"
+            and det_type in {"container", "pod", "service", "app", "db", "cache", "web"}
+            and float(prop_features["local"]) < float(det_features["local"]) + 0.25
+            and float(prop_features["metric_reason"]) <= float(det_features["metric_reason"])
+        )
+        aggressive_intervention = (
+            bool(adapter_ok)
+            and conf >= 0.45
+            and intervention_gain >= 0.05
+            and float(prop_features["local"]) >= max(0.12, float(det_features["local"]) - 0.10)
+            and float(prop_features["symptom"]) <= float(det_features["symptom"]) + 0.20
+            and not symptom_over_local
+        )
+
         def _same(field: str) -> bool:
             return str(getattr(deterministic, field, "") or "") == str(getattr(proposed, field, "") or "")
 
@@ -49,6 +152,10 @@ class CounterfactualController:
         def _allow_field(field: str) -> tuple[bool, str]:
             if _same(field):
                 return False, "unchanged"
+            if field == "component" and symptom_over_local:
+                return False, "shared_infra_symptom_over_local_candidate"
+            if aggressive_intervention:
+                return True, "positive_intervention_gain"
             if conf < max(0.65, min_conf - 0.15):
                 return False, "llm_confidence_too_low"
             if score_drop > max_drop and not challenger_sufficient:
@@ -115,6 +222,14 @@ class CounterfactualController:
             "challenger_sufficient": bool(challenger_sufficient),
             "challenger_evidence_strength": int(challenger_strength),
             "conflict_dimensions": sorted(conflict_dims),
+            "intervention_source": str(intervention_source),
+            "top1_intervention_score": float(top1_intervention),
+            "proposed_intervention_score": float(prop_intervention),
+            "intervention_gain": float(intervention_gain),
+            "deterministic_evidence_features": dict(det_features),
+            "proposed_evidence_features": dict(prop_features),
+            "aggressive_intervention": bool(aggressive_intervention),
+            "symptom_over_local_blocked": bool(symptom_over_local),
         }
         return merged, details
 
@@ -175,17 +290,46 @@ class CounterfactualController:
             dt = str(it.get("datetime", "") or it.get("root cause occurrence datetime", "") or "").strip()
             if not comp and not reason and not dt:
                 continue
+            evidence = [str(x) for x in list(it.get("evidence") or []) if str(x or "").strip()]
+            metrics = [str(x) for x in list(it.get("supporting_metrics") or []) if str(x or "").strip()]
+            if metrics:
+                evidence.append("supporting_metrics=" + ",".join(metrics[:6]))
+            rootness = dict(it.get("rootness_features", {}) or {}) if isinstance(it.get("rootness_features", {}), Mapping) else {}
+            feature_bits = []
+            for key in ("instance_owned_score", "sibling_contrast", "causal_source_score", "outgoing_propagation", "incoming_symptomness"):
+                if key in rootness:
+                    feature_bits.append(f"{key}={rootness.get(key)}")
+            if feature_bits:
+                evidence.append("rootness_features=" + ",".join(feature_bits[:5]))
+            ctype = str(it.get("component_type", "") or "").strip()
+            if ctype:
+                evidence.append("component_type=" + ctype)
+            topo = dict(it.get("topology_context", {}) or {}) if isinstance(it.get("topology_context", {}), Mapping) else {}
+            if topo:
+                compact_topo = {
+                    "role": str(topo.get("component_role", "") or ""),
+                    "shared_infra": bool(topo.get("is_shared_infra", False)),
+                    "fanout": int(topo.get("trace_fanout", topo.get("fanout", 0)) or 0),
+                    "fanin": int(topo.get("trace_fanin", topo.get("fanin", 0)) or 0),
+                    "upstream": [str(x) for x in list(topo.get("trace_upstream", topo.get("upstream", [])) or [])[:3]],
+                    "downstream": [str(x) for x in list(topo.get("trace_downstream", topo.get("downstream", [])) or [])[:3]],
+                    "note": str(topo.get("rootness_note", "") or "")[:180],
+                }
+                evidence.append("topology_context=" + json.dumps(compact_topo, ensure_ascii=False, separators=(",", ":")))
             out.append(
                 CandidateHypothesis(
                     component=comp,
                     reason=reason,
                     datetime=dt,
-                    evidence=[str(x) for x in list(it.get("evidence") or [])],
+                    evidence=evidence,
                     score=float(it.get("score", 0.0) or 0.0),
                     source=str(it.get("source", "basil_tuple") or "basil_tuple"),
                 )
             )
-        out.sort(key=lambda x: float(getattr(x, "score", 0.0) or 0.0), reverse=True)
+        # Preserve the index/ranker order. The candidate pool may already have
+        # applied dataset-specific rootness, coverage, and tuple selection.
+        # Re-sorting here by raw score can promote high-score symptoms above the
+        # deterministic answer, making the LLM defend the wrong top-1.
         challenger_keys = [x for x in list((context or {}).get("llm_challenger_candidate_keys") or []) if isinstance(x, Mapping)]
         if out and challenger_keys:
             top1 = out[0]
@@ -261,7 +405,7 @@ class CounterfactualController:
             task_focus=str(task_focus or ""),
             context=context,
         )
-        if adapter is not None:
+        if adapter is not None and not bool(context.get("candidate_tuples_ranked", False)):
             fn = getattr(adapter, "rerank_candidate_hypotheses", None)
             if callable(fn):
                 try:

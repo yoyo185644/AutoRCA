@@ -87,8 +87,8 @@ def _compact_candidate_evidence(ev: Dict[str, Any], *, candidate_id: int) -> Dic
         "component": str(ev.get("component", "") or ""),
         "reason": str(ev.get("reason", "") or ""),
         "datetime": str(ev.get("datetime", "") or ""),
-        "score": round(_safe_float(ev.get("score", 0.0)), 4),
-        "score_gap_vs_next": round(_safe_float(ev.get("score_gap_vs_next", 0.0)), 4),
+        # Keep the index score internal. The LLM should judge causal evidence,
+        # not simply follow the deterministic rank.
         "evidence_for": [str(x) for x in list(ev.get("evidence_for") or [])[:2]],
         "evidence_against": [str(x) for x in list(ev.get("evidence_against") or [])[:2]],
         "key_metric_events": _top_metric_events(list(ev.get("metric_timeline") or []), limit=3),
@@ -98,6 +98,79 @@ def _compact_candidate_evidence(ev: Dict[str, Any], *, candidate_id: int) -> Dic
             "upstream_of": [str(x) for x in list(causal.get("upstream_of") or [])[:2]],
             "impacted_by": [str(x) for x in list(causal.get("impacted_by") or [])[:2]],
         },
+    }
+
+
+def _intervention_view(compact_ev: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = []
+    evidence.extend([str(x) for x in list(compact_ev.get("evidence_for") or [])])
+    evidence.extend([str(x) for x in list(compact_ev.get("candidate_summary_evidence") or [])])
+    blob = " ".join(evidence).lower()
+    ctype = ""
+    owned = 0.0
+    sibling = 0.0
+    causal = 0.0
+    symptom = 0.0
+    metric_count = 0
+    for item in evidence:
+        text = str(item)
+        if text.startswith("component_type="):
+            ctype = text.split("=", 1)[1].strip().lower()
+        if text.startswith("topology_context="):
+            try:
+                topo = json.loads(text.split("=", 1)[1])
+                if isinstance(topo, dict):
+                    if bool(topo.get("shared_infra", False)):
+                        symptom = max(symptom, 0.45)
+                    fanout = float(topo.get("fanout", 0) or 0)
+                    if fanout >= 2:
+                        symptom = max(symptom, min(0.75, 0.35 + 0.08 * fanout))
+                    if not ctype and str(topo.get("role", "") or "").strip():
+                        ctype = str(topo.get("role", "") or "").strip().lower()
+            except Exception:
+                pass
+        if text.startswith("supporting_metrics="):
+            metric_count = max(metric_count, len([x for x in text.split("=", 1)[1].split(",") if x.strip()]))
+        if text.startswith("rootness_features="):
+            for part in text.split("=", 1)[1].split(","):
+                if "=" not in part:
+                    continue
+                key, val = part.split("=", 1)
+                try:
+                    fval = float(val)
+                except Exception:
+                    continue
+                key = key.strip()
+                if key in {"instance_owned_score", "ownership"}:
+                    owned = max(owned, fval)
+                elif key == "sibling_contrast":
+                    sibling = max(sibling, fval)
+                elif key in {"causal_source_score", "outgoing_propagation"}:
+                    causal = max(causal, fval)
+                elif key == "incoming_symptomness":
+                    symptom = max(symptom, fval)
+    if ctype == "node":
+        symptom = min(1.0, symptom + 0.30)
+    reason = str(compact_ev.get("reason", "") or "").lower()
+    reason_metric = 0.0
+    if reason:
+        if "cpu" in reason and "cpu" in blob:
+            reason_metric = 1.0
+        elif "memory" in reason and any(tok in blob for tok in ("mem", "memory", "rss")):
+            reason_metric = 1.0
+        elif any(tok in reason for tok in ("network", "packet", "latency", "loss")) and any(tok in blob for tok in ("network", "packet", "tcp", "retrans", "latency")):
+            reason_metric = 1.0
+        elif any(tok in reason for tok in ("read", "write", "disk", "i/o", "io")) and any(tok in blob for tok in ("read", "write", "disk", "io", "fs_")):
+            reason_metric = 1.0
+    local = min(1.0, owned + 0.35 * sibling + 0.20 * min(1.0, metric_count / 6.0))
+    intervention_score = max(0.0, min(1.0, 0.45 * local + 0.22 * reason_metric + 0.18 * causal - 0.25 * symptom + 0.15))
+    return {
+        "component_type": ctype,
+        "local_evidence": round(float(local), 3),
+        "reason_metric_match": round(float(reason_metric), 3),
+        "causal_source": round(float(causal), 3),
+        "symptom_risk": round(float(symptom), 3),
+        "intervention_score": round(float(intervention_score), 3),
     }
 
 
@@ -171,7 +244,7 @@ class CounterfactualExecutor:
         top_k: int = 3,
     ) -> Dict[str, Any]:
         context = context or {}
-        max_prompt_candidates = min(3, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
+        max_prompt_candidates = min(6, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
         top = list(candidates or [])[: max_prompt_candidates]
         if not top:
             raise ValueError("No candidates for LLM verification.")
@@ -181,19 +254,7 @@ class CounterfactualExecutor:
         all_components = [str(c.component) for c in list(candidates or []) if str(getattr(c, "component", "") or "").strip()]
         for i, cand in enumerate(top, start=1):
             next_score = float(top[i].score) if i < len(top) else 0.0
-            try:
-                ev = build_candidate_evidence(
-                    dataset=dataset_name,
-                    instruction=instruction,
-                    component=str(cand.component),
-                    reason=str(cand.reason),
-                    score=float(cand.score),
-                    score_gap_vs_next=max(0.0, float(cand.score) - next_score),
-                    all_candidate_components=all_components,
-                    topology_max_rows=context.get("basil_max_trace_rows"),
-                    enable_trace=bool(enable_trace),
-                ).to_dict()
-            except Exception:
+            if not bool(context.get("llm_build_raw_evidence", False)):
                 ev = {
                     "component": str(cand.component),
                     "reason": str(cand.reason),
@@ -203,13 +264,40 @@ class CounterfactualExecutor:
                     "metric_timeline": [],
                     "trace_timeline": [],
                     "causal_evidence": {},
-                    "evidence_for": [str(x) for x in list(cand.evidence or [])[:4]],
-                    "evidence_against": ["Evidence builder failed; fallback to candidate summary."],
+                    "evidence_for": [str(x) for x in list(cand.evidence or [])[:6]],
+                    "evidence_against": [],
                 }
+            else:
+                try:
+                    ev = build_candidate_evidence(
+                        dataset=dataset_name,
+                        instruction=instruction,
+                        component=str(cand.component),
+                        reason=str(cand.reason),
+                        score=float(cand.score),
+                        score_gap_vs_next=max(0.0, float(cand.score) - next_score),
+                        all_candidate_components=all_components,
+                        topology_max_rows=context.get("basil_max_trace_rows"),
+                        enable_trace=bool(enable_trace),
+                    ).to_dict()
+                except Exception:
+                    ev = {
+                        "component": str(cand.component),
+                        "reason": str(cand.reason),
+                        "datetime": str(getattr(cand, "datetime", "") or ""),
+                        "score": float(cand.score),
+                        "score_gap_vs_next": max(0.0, float(cand.score) - next_score),
+                        "metric_timeline": [],
+                        "trace_timeline": [],
+                        "causal_evidence": {},
+                        "evidence_for": [str(x) for x in list(cand.evidence or [])[:6]],
+                        "evidence_against": ["Evidence builder failed; fallback to indexed candidate summary."],
+                    }
             compact_ev = _compact_candidate_evidence(ev, candidate_id=i)
             compact_ev["datetime"] = str(getattr(cand, "datetime", "") or compact_ev.get("datetime", "") or "")
             if list(getattr(cand, "evidence", []) or []):
-                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:2]]
+                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:4]]
+            compact_ev["intervention_view"] = _intervention_view(compact_ev)
             candidate_payload.append(compact_ev)
 
         uncertainty = dict(context.get("uncertainty_gate", {}) or {})
@@ -218,17 +306,43 @@ class CounterfactualExecutor:
         max_drop = _safe_float(context.get("llm_max_score_drop_vs_det_top1", 0.05), 0.05)
 
         system_prompt = """
-You are an RCA evidence judge. Do bounded reranking only.
+You are a counterfactual RCA evidence judge. Do bounded reranking only.
 Do not invent components, reasons, timestamps, or evidence.
 
-Keep candidate #1 unless a challenger has clearly stronger real evidence.
-A challenger may replace #1 only when it has stronger component-local evidence,
-reason-compatible metrics/logs/traces, better before-after time evidence, or better
-propagation explanation. Reject challengers supported mainly by global/downstream symptoms,
-weak early onset, unsupported reason labels, or marginal score differences.
+Compare candidate #1 against each challenger as a causal explanation:
+1. If candidate #1 were removed, would the challenger's local anomaly still need explanation?
+2. If the challenger were removed, would candidate #1 look like a downstream/global symptom?
+3. Which candidate has stronger component-local evidence, reason-metric consistency,
+   propagation plausibility, and time-change evidence?
+
+Do not trust rank alone. The listed order is only the indexer's current answer,
+not a truth label. A challenger should replace #1 when it has stronger local/root
+evidence and lower symptom risk. Reject candidates supported mainly by
+global node symptoms, weak early onset, unsupported reason labels, or duplicated
+symptom evidence.
+
+Some challengers are intentionally included to cover missing evidence dimensions
+(component type, reason family, or time cluster). Treat them as serious
+alternatives only if their concrete evidence supports that dimension; do not
+discard them merely because they are lower ranked.
+
+Use the intervention_view fields as a compact guide:
+- local_evidence: component-local owned metrics and sibling contrast.
+- reason_metric_match: whether the reason is supported by component metrics.
+- causal_source: whether the component can explain downstream symptoms.
+- symptom_risk: high values mean likely downstream/global symptom.
+- intervention_score: evidence-only estimate; use it to compare challengers.
+
+Use topology_context when present:
+- A shared infrastructure/node candidate with high fanout is often a symptom
+  surface. Do not choose it over a service/container on the affected path unless
+  the node has clearly stronger local evidence and reason-compatible metrics.
+- A service/container with local metrics and topology connection to symptoms is
+  a stronger intervention target than a broad node symptom.
 
 Output JSON only:
 {"selected_id":1,"confidence":0.0,"change_from_top1":false,
+"top1_intervention_score":0.0,"selected_intervention_score":0.0,
 "rationale":"one sentence","decisive_evidence":"one concrete evidence item",
 "rejected_candidates":[{"id":2,"reason":"short reason"}]}
 """
@@ -249,6 +363,8 @@ Output JSON only:
                 "max_score_drop_to_replace_top1": round(float(max_drop), 4),
             },
             "conflict": concise_conflict,
+            "coverage_agent": dict((context or {}).get("coverage_aware_agent") or {}),
+            "intervention_agent": dict((context or {}).get("intervention_agent") or {}),
             "reason_rules": _reason_rules(dataset_name)[:2],
             "deterministic_top": candidate_payload[0] if candidate_payload else {},
             "challengers": candidate_payload[1:],
@@ -279,6 +395,8 @@ Output JSON only:
             "rationale": str(data.get("rationale", "")).strip(),
             "conflict_resolution": str(data.get("conflict_resolution", "") or "").strip(),
             "change_from_top1": bool(data.get("change_from_top1", selected_id != 1)),
+            "top1_intervention_score": normalize_score(data.get("top1_intervention_score", 0.0)),
+            "selected_intervention_score": normalize_score(data.get("selected_intervention_score", 0.0)),
             "decisive_evidence": str(data.get("decisive_evidence", "") or "").strip(),
             "rejected_candidates": ensure_list(data.get("rejected_candidates")),
             "supporting_evidence": ensure_list(data.get("supporting_evidence")) or ensure_list(data.get("decisive_evidence")),
