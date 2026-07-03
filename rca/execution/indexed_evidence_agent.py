@@ -833,6 +833,266 @@ def _coverage_aware_challenger_keys(
     return {"keys": selected, "coverage": coverage}
 
 
+def _llm_only_challenger_expansion(
+    candidates: Sequence[Mapping[str, Any]],
+    context: Mapping[str, Any],
+    *,
+    need_time: bool,
+    need_comp: bool,
+    need_reason: bool,
+    max_extra: int = 16,
+) -> List[Dict[str, Any]]:
+    """Build label-free challenger tuples for the LLM prompt only.
+
+    The deterministic ranker may be conservative and omit low-ranked reason
+    families.  For LLM reranking, however, a challenger is useful only if it
+    covers a genuinely different component/reason/time dimension.  This helper
+    combines observed components with adapter taxonomy reasons using runtime
+    metric support.  It does not read query labels or historical records, and
+    the returned rows are not used for deterministic output.
+    """
+    rows = [dict(x) for x in list(candidates or []) if isinstance(x, Mapping)]
+    if not rows:
+        return []
+    adapter = get_dataset_adapter(str((context or {}).get("dataset", "") or ""))
+    prompt_limit = max(1, int((context or {}).get("llm_max_prompt_candidates", 6) or 6))
+    visible = rows[: min(len(rows), prompt_limit)]
+    visible_reason_families = {
+        _reason_family(str(x.get("reason", "") or ""))
+        for x in visible
+        if str(x.get("reason", "") or "").strip()
+    }
+    visible_component_types = {
+        _candidate_component_type(x, context)
+        for x in visible
+        if _candidate_component_type(x, context)
+    }
+
+    reasons: List[str] = []
+    if need_reason:
+        for r in list((context or {}).get("allowed_reasons") or []):
+            rr = str(r or "").strip()
+            if rr and rr not in reasons:
+                reasons.append(rr)
+        if adapter is not None:
+            try:
+                for r in list(adapter.basil_reason_taxonomy() or []):
+                    rr = str(r or "").strip()
+                    if rr and rr not in reasons:
+                        reasons.append(rr)
+            except Exception:
+                pass
+
+    component_rows: Dict[str, Dict[str, Any]] = {}
+    for item in rows[: max(24, prompt_limit * 4)]:
+        comp = str(item.get("component", "") or "").strip()
+        if not comp:
+            continue
+        current = component_rows.get(comp)
+        if current is None or _local_evidence_strength(item, context) > _local_evidence_strength(current, context):
+            component_rows[comp] = dict(item)
+    for comp in list((context or {}).get("allowed_components") or []):
+        c = str(comp or "").strip()
+        if c and c not in component_rows:
+            component_rows[c] = {
+                "component": c,
+                "reason": "",
+                "datetime": "",
+                "score": float(dict((context or {}).get("component_scores") or {}).get(c, 0.0) or 0.0),
+                "source": "llm_only_allowed_component",
+                "supporting_metrics": list(dict((context or {}).get("top_metrics") or {}).get(c, []) or [])[:6],
+            }
+
+    time_by_component: Dict[str, str] = {}
+    if need_time:
+        for item in rows:
+            comp = str(item.get("component", "") or "").strip()
+            dt = str(item.get("datetime", "") or "").strip()
+            if comp and dt and comp not in time_by_component:
+                time_by_component[comp] = dt
+        for item in list((context or {}).get("time_candidates") or []):
+            if not isinstance(item, Mapping):
+                continue
+            comp = str(item.get("component", "") or "").strip()
+            dt = str(item.get("datetime", "") or "").strip()
+            if comp and dt and comp not in time_by_component:
+                time_by_component[comp] = dt
+
+    existing = {
+        (
+            str(x.get("component", "") or ""),
+            str(x.get("reason", "") or ""),
+            str(x.get("datetime", "") or ""),
+        )
+        for x in rows
+    }
+    extras: List[Dict[str, Any]] = []
+
+    if need_reason and reasons:
+        if not need_comp:
+            reason_scores = dict((context or {}).get("reason_scores") or {})
+            existing_reasons = {
+                str(x.get("reason", "") or "").strip()
+                for x in rows
+                if str(x.get("reason", "") or "").strip()
+            }
+            existing_reason_families = {_reason_family(r) for r in existing_reasons if r}
+            family_best: Dict[str, Dict[str, Any]] = {}
+            family_variants: List[Dict[str, Any]] = []
+            for reason in reasons:
+                fam = _reason_family(reason)
+                if not fam:
+                    continue
+                score = float(reason_scores.get(reason, 0.0) or 0.0)
+                item = {
+                    "component": "",
+                    "reason": reason,
+                    "datetime": str((context or {}).get("time_choice", "") or "") if need_time else "",
+                    "score": max(0.01, score),
+                    "source": "llm_only_reason_taxonomy_family_challenger",
+                    "llm_only_challenger": True,
+                    "llm_challenger_reason": "reason_family_taxonomy_coverage",
+                }
+                if fam not in existing_reason_families:
+                    prev = family_best.get(fam)
+                    if prev is None or float(prev.get("score", 0.0) or 0.0) < float(item.get("score", 0.0) or 0.0):
+                        family_best[fam] = item
+                elif reason not in existing_reasons:
+                    item["source"] = "llm_only_reason_taxonomy_variant_challenger"
+                    item["llm_challenger_reason"] = "reason_variant_coverage"
+                    family_variants.append(item)
+            extras.extend(family_best.values())
+            family_variants.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+            # Keep same-family variants too.  Many RCA labels differ inside a
+            # family (read vs write I/O, packet loss vs corruption).  A family
+            # level challenger is not enough for reason-only and reason-time
+            # tasks, because evaluation is exact-label based.
+            extras.extend(family_variants[: max(2, prompt_limit)])
+
+        for comp, base in component_rows.items():
+            metrics = [str(x) for x in list(base.get("supporting_metrics", []) or []) if str(x or "").strip()]
+            if not metrics:
+                metrics = [str(x) for x in list(dict((context or {}).get("top_metrics") or {}).get(comp, []) or []) if str(x or "").strip()]
+            for reason in reasons:
+                fam = _reason_family(reason)
+                support = 0.0
+                if adapter is not None:
+                    try:
+                        support = float(adapter._reason_metric_support_score(component=comp, reason=reason, metrics=metrics))  # noqa: SLF001
+                    except Exception:
+                        support = 0.0
+                if support <= 0.0:
+                    probe = dict(base)
+                    probe["reason"] = reason
+                    support = _reason_metric_match_score(probe, context)
+                # Always keep one representative for a missing family when it
+                # has any concrete metric support; also keep strong same-family
+                # variants because exact RCA reason labels often differ within
+                # one broad family.
+                if fam in visible_reason_families and support < 0.35:
+                    continue
+                if support < 0.12:
+                    continue
+                dt = time_by_component.get(comp, str(base.get("datetime", "") or "")) if need_time else ""
+                sig = (comp, reason, dt)
+                if sig in existing:
+                    continue
+                item = dict(base)
+                item.update(
+                    {
+                        "component": comp,
+                        "reason": reason,
+                        "datetime": dt,
+                        "score": float(max(float(base.get("score", 0.0) or 0.0), 0.01) + 0.25 * support),
+                        "source": f"{base.get('source', 'basil_tuple')}+llm_only_reason_family_challenger",
+                        "supporting_metrics": metrics[:6],
+                        "llm_only_challenger": True,
+                        "llm_challenger_reason": "reason_family_coverage",
+                    }
+                )
+                extras.append(item)
+
+    if need_comp:
+        for comp, base in component_rows.items():
+            ctype = _candidate_component_type(base, context)
+            if ctype and ctype not in visible_component_types:
+                dt = time_by_component.get(comp, str(base.get("datetime", "") or "")) if need_time else str(base.get("datetime", "") or "")
+                reason = str(base.get("reason", "") or "")
+                sig = (comp, reason, dt)
+                if sig in existing:
+                    continue
+                item = dict(base)
+                item.update(
+                    {
+                        "datetime": dt,
+                        "source": f"{base.get('source', 'basil_tuple')}+llm_only_component_type_challenger",
+                        "llm_only_challenger": True,
+                        "llm_challenger_reason": "component_type_coverage",
+                    }
+                )
+                extras.append(item)
+
+    if need_time:
+        visible_clusters = {
+            _candidate_time_cluster(str(x.get("datetime", "") or ""))
+            for x in visible
+            if str(x.get("datetime", "") or "").strip()
+        }
+        for item in list((context or {}).get("time_candidates") or []):
+            if not isinstance(item, Mapping):
+                continue
+            dt = str(item.get("datetime", "") or "").strip()
+            comp = str(item.get("component", "") or "").strip()
+            if not dt or (need_comp and not comp):
+                continue
+            cluster = _candidate_time_cluster(dt)
+            if cluster in visible_clusters:
+                continue
+            base = dict(component_rows.get(comp, {}))
+            if not base and comp:
+                base = {"component": comp, "supporting_metrics": list(dict((context or {}).get("top_metrics") or {}).get(comp, []) or [])[:6]}
+            reason = str(base.get("reason", "") or "")
+            sig = (comp, reason, dt)
+            if sig in existing:
+                continue
+            base.update(
+                {
+                    "component": comp,
+                    "reason": reason,
+                    "datetime": dt,
+                    "score": float(item.get("score", base.get("score", 0.0)) or 0.0),
+                    "source": f"{item.get('source', 'indexed_time_candidate')}+llm_only_time_cluster_challenger",
+                    "llm_only_challenger": True,
+                    "llm_challenger_reason": "time_cluster_coverage",
+                }
+            )
+            extras.append(base)
+
+    extras.sort(
+        key=lambda x: (
+            _reason_metric_match_score(x, context),
+            _local_evidence_strength(x, context),
+            float(x.get("score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+    out: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in extras:
+        sig = (
+            str(item.get("component", "") or ""),
+            str(item.get("reason", "") or ""),
+            str(item.get("datetime", "") or ""),
+        )
+        if sig in existing or sig in seen:
+            continue
+        out.append(dict(item))
+        seen.add(sig)
+        if len(out) >= max(0, int(max_extra)):
+            break
+    return out
+
+
 def _source_flags(item: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[str, bool]:
     comp = str(item.get("component", "") or "").strip()
     source_blob = " ".join(
@@ -2470,7 +2730,23 @@ class IndexedEvidenceAgentRunner:
             adapter=adapter,
             context=context,
         )
-        context["candidate_tuples"] = [dict(x) for x in list(deterministic_pool or [])[:50] if isinstance(x, Mapping)]
+        llm_only_extras = _llm_only_challenger_expansion(
+            deterministic_pool,
+            context,
+            need_time=bool(need_time),
+            need_comp=bool(need_comp),
+            need_reason=bool(need_reason),
+            max_extra=max(0, int((context or {}).get("llm_max_prompt_candidates", 6) or 6) * 3),
+        )
+        llm_prompt_pool = list(deterministic_pool or []) + list(llm_only_extras or [])
+        if llm_only_extras:
+            llm_prompt_pool = _attach_topology_context_to_rows(
+                llm_prompt_pool,
+                adapter=adapter,
+                context=context,
+            )
+        context["candidate_tuples"] = [dict(x) for x in list(llm_prompt_pool or [])[:80] if isinstance(x, Mapping)]
+        context["llm_only_challenger_count"] = int(len(llm_only_extras or []))
         context["candidate_tuples_ranked"] = True
         deterministic = deterministic_pool[: max(1, int(k))]
         if (
@@ -2515,14 +2791,14 @@ class IndexedEvidenceAgentRunner:
             except Exception:
                 pass
         pool_diagnostics = _candidate_pool_diagnostics(
-            deterministic_pool,
+            llm_prompt_pool,
             context=context,
             need_time=bool(need_time),
             need_comp=bool(need_comp),
             need_reason=bool(need_reason),
         )
         coverage_plan = _coverage_aware_challenger_keys(
-            deterministic_pool,
+            llm_prompt_pool,
             context,
             need_time=bool(need_time),
             need_comp=bool(need_comp),
@@ -2532,7 +2808,7 @@ class IndexedEvidenceAgentRunner:
         pool_diagnostics["coverage_aware_agent"] = dict(coverage_plan.get("coverage") or {})
         context["coverage_aware_agent"] = dict(coverage_plan.get("coverage") or {})
         intervention_plan = _intervention_challenger_plan(
-            deterministic_pool,
+            llm_prompt_pool,
             context,
             need_time=bool(need_time),
             need_comp=bool(need_comp),
@@ -2558,6 +2834,7 @@ class IndexedEvidenceAgentRunner:
         seen_key_sigs: set[tuple[str, str, str]] = set()
         for source_keys in (
             list(coverage_plan.get("keys") or []),
+            [_tuple_key(x) for x in list(llm_only_extras or []) if isinstance(x, Mapping)],
             list(intervention_plan.get("keys") or []),
         ):
             for key in source_keys:

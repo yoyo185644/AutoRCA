@@ -174,6 +174,185 @@ def _intervention_view(compact_ev: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _field_evidence_card(compact_ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a small field-level card so the LLM judges evidence, not rank."""
+
+    view = dict(compact_ev.get("intervention_view", {}) or {})
+    summary = [str(x) for x in list(compact_ev.get("candidate_summary_evidence") or []) if str(x or "").strip()]
+    evidence_for = [str(x) for x in list(compact_ev.get("evidence_for") or []) if str(x or "").strip()]
+    evidence_blob = " | ".join(summary + evidence_for)
+
+    coverage_reason = ""
+    for item in summary:
+        if item.startswith("llm_challenger_reason="):
+            coverage_reason = item.split("=", 1)[1].strip()
+            break
+    is_llm_only = any(item == "llm_only_challenger=true" for item in summary)
+
+    component = str(compact_ev.get("component", "") or "")
+    reason = str(compact_ev.get("reason", "") or "")
+    datetime_s = str(compact_ev.get("datetime", "") or "")
+    topo_note = ""
+    for item in summary:
+        if item.startswith("topology_context="):
+            try:
+                topo = json.loads(item.split("=", 1)[1])
+                if isinstance(topo, dict):
+                    topo_note = str(topo.get("note", "") or "")
+            except Exception:
+                topo_note = ""
+            break
+
+    return {
+        "component_claim": {
+            "value": component,
+            "component_type": str(view.get("component_type", "") or ""),
+            "local_evidence": float(view.get("local_evidence", 0.0) or 0.0),
+            "causal_source": float(view.get("causal_source", 0.0) or 0.0),
+            "symptom_risk": float(view.get("symptom_risk", 0.0) or 0.0),
+            "topology_note": topo_note[:180],
+        },
+        "reason_claim": {
+            "value": reason,
+            "reason_metric_match": float(view.get("reason_metric_match", 0.0) or 0.0),
+            "support_hint": "reason-compatible metrics present"
+            if float(view.get("reason_metric_match", 0.0) or 0.0) > 0.0
+            else "reason support not visible",
+        },
+        "time_claim": {
+            "value": datetime_s,
+            "has_time": bool(datetime_s),
+        },
+        "coverage_claim": {
+            "llm_only_challenger": bool(is_llm_only),
+            "why_included": coverage_reason,
+        },
+        "evidence_excerpt": evidence_blob[:420],
+    }
+
+
+def _explainable_evidence_snippet(compact_ev: Mapping[str, Any]) -> Dict[str, Any]:
+    summary = [str(x) for x in list(compact_ev.get("candidate_summary_evidence") or []) if str(x or "").strip()]
+    evidence_for = [str(x) for x in list(compact_ev.get("evidence_for") or []) if str(x or "").strip()]
+    metrics: List[str] = []
+    rootness = ""
+    topology: Dict[str, Any] = {}
+    challenger_reason = ""
+    for item in summary:
+        if item.startswith("supporting_metrics="):
+            metrics = [x.strip() for x in item.split("=", 1)[1].split(",") if x.strip()][:8]
+        elif item.startswith("rootness_features="):
+            rootness = item.split("=", 1)[1].strip()[:240]
+        elif item.startswith("topology_context="):
+            try:
+                parsed = json.loads(item.split("=", 1)[1])
+                if isinstance(parsed, dict):
+                    topology = {
+                        "role": str(parsed.get("role", "") or ""),
+                        "shared_infra": bool(parsed.get("shared_infra", False)),
+                        "fanout": parsed.get("fanout", 0),
+                        "fanin": parsed.get("fanin", 0),
+                        "upstream": [str(x) for x in list(parsed.get("upstream", []) or [])[:3]],
+                        "downstream": [str(x) for x in list(parsed.get("downstream", []) or [])[:3]],
+                        "note": str(parsed.get("note", "") or "")[:180],
+                    }
+            except Exception:
+                topology = {}
+        elif item.startswith("llm_challenger_reason="):
+            challenger_reason = item.split("=", 1)[1].strip()
+
+    return {
+        "component": str(compact_ev.get("component", "") or ""),
+        "reason": str(compact_ev.get("reason", "") or ""),
+        "datetime": str(compact_ev.get("datetime", "") or ""),
+        "metrics": metrics,
+        "rootness_features": rootness,
+        "topology": topology,
+        "why_in_prompt": challenger_reason,
+        "supporting_text": (evidence_for + summary)[:5],
+    }
+
+
+def _pairwise_counterfactual_tests(candidate_payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compare current top-1 against each challenger in evidence space."""
+
+    if not candidate_payload:
+        return []
+    top1 = dict(candidate_payload[0] or {})
+    top_view = dict(top1.get("intervention_view", {}) or {})
+    tests: List[Dict[str, Any]] = []
+
+    def f(view: Mapping[str, Any], key: str) -> float:
+        try:
+            return float(view.get(key, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    top_local = f(top_view, "local_evidence")
+    top_reason = f(top_view, "reason_metric_match")
+    top_causal = f(top_view, "causal_source")
+    top_symptom = f(top_view, "symptom_risk")
+    top_intervention = f(top_view, "intervention_score")
+
+    for cand in candidate_payload[1:]:
+        view = dict(cand.get("intervention_view", {}) or {})
+        local_delta = f(view, "local_evidence") - top_local
+        reason_delta = f(view, "reason_metric_match") - top_reason
+        causal_delta = f(view, "causal_source") - top_causal
+        symptom_delta = f(view, "symptom_risk") - top_symptom
+        intervention_delta = f(view, "intervention_score") - top_intervention
+
+        challenger_advantages: List[str] = []
+        top1_advantages: List[str] = []
+        if local_delta >= 0.15:
+            challenger_advantages.append("stronger component-local evidence")
+        elif local_delta <= -0.15:
+            top1_advantages.append("stronger component-local evidence")
+        if reason_delta >= 0.50:
+            challenger_advantages.append("reason better supported by metrics")
+        elif reason_delta <= -0.50:
+            top1_advantages.append("reason better supported by metrics")
+        if causal_delta >= 0.15:
+            challenger_advantages.append("more plausible causal source")
+        elif causal_delta <= -0.15:
+            top1_advantages.append("more plausible causal source")
+        if symptom_delta <= -0.20:
+            challenger_advantages.append("lower downstream/global symptom risk")
+        elif symptom_delta >= 0.20:
+            top1_advantages.append("lower downstream/global symptom risk")
+
+        suggested = "keep_top1"
+        if len(challenger_advantages) >= 2 and intervention_delta >= -0.05:
+            suggested = "challenge_top1"
+        elif intervention_delta >= 0.12 and challenger_advantages:
+            suggested = "challenge_top1"
+
+        tests.append(
+            {
+                "challenger_id": int(cand.get("id", 0) or 0),
+                "challenger_component": str(cand.get("component", "") or ""),
+                "challenger_reason": str(cand.get("reason", "") or ""),
+                "challenger_datetime": str(cand.get("datetime", "") or ""),
+                "deltas_vs_top1": {
+                    "local_evidence": round(float(local_delta), 3),
+                    "reason_metric_match": round(float(reason_delta), 3),
+                    "causal_source": round(float(causal_delta), 3),
+                    "symptom_risk": round(float(symptom_delta), 3),
+                    "intervention_score": round(float(intervention_delta), 3),
+                },
+                "challenger_advantages": challenger_advantages,
+                "top1_advantages": top1_advantages,
+                "suggested_test_result": suggested,
+                "decision_rule": "Prefer challenger only when it explains the required field with stronger local/reason/causal evidence and not just broad symptom evidence.",
+                "evidence_comparison": {
+                    "top1": _explainable_evidence_snippet(top1),
+                    "challenger": _explainable_evidence_snippet(cand),
+                },
+            }
+        )
+    return tests
+
+
 class CounterfactualExecutor:
     """
     Executor 负责具体动作执行：
@@ -244,7 +423,7 @@ class CounterfactualExecutor:
         top_k: int = 3,
     ) -> Dict[str, Any]:
         context = context or {}
-        max_prompt_candidates = min(6, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
+        max_prompt_candidates = min(8, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
         top = list(candidates or [])[: max_prompt_candidates]
         if not top:
             raise ValueError("No candidates for LLM verification.")
@@ -296,8 +475,9 @@ class CounterfactualExecutor:
             compact_ev = _compact_candidate_evidence(ev, candidate_id=i)
             compact_ev["datetime"] = str(getattr(cand, "datetime", "") or compact_ev.get("datetime", "") or "")
             if list(getattr(cand, "evidence", []) or []):
-                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:4]]
+                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:8]]
             compact_ev["intervention_view"] = _intervention_view(compact_ev)
+            compact_ev["field_evidence"] = _field_evidence_card(compact_ev)
             candidate_payload.append(compact_ev)
 
         uncertainty = dict(context.get("uncertainty_gate", {}) or {})
@@ -305,11 +485,16 @@ class CounterfactualExecutor:
         min_conf = _safe_float(context.get("llm_change_min_confidence", 0.85), 0.85)
         max_drop = _safe_float(context.get("llm_max_score_drop_vs_det_top1", 0.05), 0.05)
 
+        pairwise_tests = _pairwise_counterfactual_tests(candidate_payload)
+
         system_prompt = """
 You are a counterfactual RCA evidence judge. Do bounded reranking only.
 Do not invent components, reasons, timestamps, or evidence.
 
-Compare candidate #1 against each challenger as a causal explanation:
+Your decision must be based on pairwise counterfactual comparison, not rank.
+Candidate #1 is only the deterministic current answer; it is not a truth label.
+
+First compare candidate #1 against each challenger as a causal explanation:
 1. If candidate #1 were removed, would the challenger's local anomaly still need explanation?
 2. If the challenger were removed, would candidate #1 look like a downstream/global symptom?
 3. Which candidate has stronger component-local evidence, reason-metric consistency,
@@ -320,6 +505,15 @@ not a truth label. A challenger should replace #1 when it has stronger local/roo
 evidence and lower symptom risk. Reject candidates supported mainly by
 global node symptoms, weak early onset, unsupported reason labels, or duplicated
 symptom evidence.
+
+Important decision policy:
+- If pairwise_tests says a challenger has multiple concrete advantages and no
+  obvious symptom-risk penalty, seriously consider replacing candidate #1.
+- If candidate #1 and a challenger each win different fields, use field_decisions
+  to adopt only the fields with clear evidence gain.
+- Do not keep candidate #1 merely because it is candidate #1.
+- Do not select a challenger merely because it covers a missing label family;
+  it must have evidence in field_evidence or pairwise_tests.
 
 Some challengers are intentionally included to cover missing evidence dimensions
 (component type, reason family, or time cluster). Treat them as serious
@@ -340,10 +534,22 @@ Use topology_context when present:
 - A service/container with local metrics and topology connection to symptoms is
   a stronger intervention target than a broad node symptom.
 
-Output JSON only:
+When pairwise_tests contains evidence_comparison, use the concrete metrics and
+topology notes as the primary evidence. If numeric summaries conflict with the
+metric/topology text, explain the conflict and prefer the candidate whose
+component, reason, and time are directly supported by concrete evidence.
+
+Output JSON only. In field_decisions, judge only fields required by the task.
+Use "evidence_gain" to state how much stronger the selected candidate is for
+that field compared with candidate #1: 0 means no gain, 1 means decisive gain.
 {"selected_id":1,"confidence":0.0,"change_from_top1":false,
 "top1_intervention_score":0.0,"selected_intervention_score":0.0,
 "rationale":"one sentence","decisive_evidence":"one concrete evidence item",
+"field_decisions":{
+  "component":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"},
+  "reason":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"},
+  "datetime":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"}
+},
 "rejected_candidates":[{"id":2,"reason":"short reason"}]}
 """
 
@@ -368,6 +574,7 @@ Output JSON only:
             "reason_rules": _reason_rules(dataset_name)[:2],
             "deterministic_top": candidate_payload[0] if candidate_payload else {},
             "challengers": candidate_payload[1:],
+            "pairwise_tests": pairwise_tests,
         }
         user_prompt = json.dumps(incident_summary, ensure_ascii=False, separators=(",", ":"))
 
@@ -398,6 +605,7 @@ Output JSON only:
             "top1_intervention_score": normalize_score(data.get("top1_intervention_score", 0.0)),
             "selected_intervention_score": normalize_score(data.get("selected_intervention_score", 0.0)),
             "decisive_evidence": str(data.get("decisive_evidence", "") or "").strip(),
+            "field_decisions": dict(data.get("field_decisions", {}) or {}) if isinstance(data.get("field_decisions", {}), Mapping) else {},
             "rejected_candidates": ensure_list(data.get("rejected_candidates")),
             "supporting_evidence": ensure_list(data.get("supporting_evidence")) or ensure_list(data.get("decisive_evidence")),
             "raw_response": raw,

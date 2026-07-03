@@ -112,6 +112,28 @@ class CounterfactualController:
         prop_auto_intervention = _auto_intervention_score(proposed)
         llm_top1_intervention = float(llm_details.get("top1_intervention_score", 0.0) or 0.0)
         llm_prop_intervention = float(llm_details.get("selected_intervention_score", 0.0) or 0.0)
+        raw_field_decisions = llm_details.get("field_decisions", {}) or {}
+        field_decisions = dict(raw_field_decisions) if isinstance(raw_field_decisions, Mapping) else {}
+
+        def _field_decision(field: str) -> Dict[str, Any]:
+            item = field_decisions.get(field, {}) if isinstance(field_decisions, Mapping) else {}
+            return dict(item) if isinstance(item, Mapping) else {}
+
+        def _field_gain(field: str) -> float:
+            item = _field_decision(field)
+            try:
+                return max(0.0, min(1.0, float(item.get("evidence_gain", 0.0) or 0.0)))
+            except Exception:
+                return 0.0
+
+        def _field_explicit_adopt(field: str) -> bool:
+            item = _field_decision(field)
+            if not item:
+                return False
+            return bool(item.get("adopt", False)) or _field_gain(field) >= 0.35
+
+        has_field_decisions = bool(field_decisions)
+        max_field_gain = max([_field_gain("component"), _field_gain("reason"), _field_gain("datetime"), 0.0])
         if llm_top1_intervention <= 0.0 and llm_prop_intervention <= 0.0:
             top1_intervention = det_auto_intervention
             prop_intervention = prop_auto_intervention
@@ -138,6 +160,7 @@ class CounterfactualController:
             and float(prop_features["local"]) >= max(0.12, float(det_features["local"]) - 0.10)
             and float(prop_features["symptom"]) <= float(det_features["symptom"]) + 0.20
             and not symptom_over_local
+            and ((not has_field_decisions) or max_field_gain >= 0.25)
         )
 
         def _same(field: str) -> bool:
@@ -154,6 +177,25 @@ class CounterfactualController:
                 return False, "unchanged"
             if field == "component" and symptom_over_local:
                 return False, "shared_infra_symptom_over_local_candidate"
+            explicit_adopt = _field_explicit_adopt(field)
+            gain = _field_gain(field)
+            if has_field_decisions and not explicit_adopt and gain < 0.20:
+                return False, "llm_field_decision_no_evidence_gain"
+            if explicit_adopt and conf >= 0.45:
+                if field == "component":
+                    prop_root = float(prop_features["local"]) + float(prop_features["causal"]) - float(prop_features["symptom"])
+                    det_root = float(det_features["local"]) + float(det_features["causal"]) - float(det_features["symptom"])
+                    if prop_root >= det_root - 0.05 and not symptom_over_local:
+                        return True, "llm_component_field_evidence_gain"
+                    return False, "component_field_gain_not_supported_by_auto_evidence"
+                if field == "reason":
+                    if float(prop_features["metric_reason"]) >= float(det_features["metric_reason"]) or gain >= 0.50:
+                        return True, "llm_reason_field_evidence_gain"
+                    return False, "reason_field_gain_not_supported_by_metrics"
+                if field == "datetime":
+                    if gain >= 0.30 or (score_drop <= max_drop and conf >= min_conf):
+                        return True, "llm_time_field_evidence_gain"
+                    return False, "time_field_gain_too_weak"
             if aggressive_intervention:
                 return True, "positive_intervention_gain"
             if conf < max(0.65, min_conf - 0.15):
@@ -230,6 +272,8 @@ class CounterfactualController:
             "proposed_evidence_features": dict(prop_features),
             "aggressive_intervention": bool(aggressive_intervention),
             "symptom_over_local_blocked": bool(symptom_over_local),
+            "field_decisions": dict(field_decisions),
+            "max_field_evidence_gain": float(max_field_gain),
         }
         return merged, details
 
@@ -304,6 +348,11 @@ class CounterfactualController:
             ctype = str(it.get("component_type", "") or "").strip()
             if ctype:
                 evidence.append("component_type=" + ctype)
+            if bool(it.get("llm_only_challenger", False)):
+                evidence.append("llm_only_challenger=true")
+            challenger_reason = str(it.get("llm_challenger_reason", "") or "").strip()
+            if challenger_reason:
+                evidence.append("llm_challenger_reason=" + challenger_reason)
             topo = dict(it.get("topology_context", {}) or {}) if isinstance(it.get("topology_context", {}), Mapping) else {}
             if topo:
                 compact_topo = {
