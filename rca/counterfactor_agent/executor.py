@@ -159,9 +159,23 @@ def _intervention_view(compact_ev: Dict[str, Any]) -> Dict[str, Any]:
         elif "memory" in reason and any(tok in blob for tok in ("mem", "memory", "rss")):
             reason_metric = 1.0
         elif any(tok in reason for tok in ("network", "packet", "latency", "loss")) and any(tok in blob for tok in ("network", "packet", "tcp", "retrans", "latency")):
-            reason_metric = 1.0
-        elif any(tok in reason for tok in ("read", "write", "disk", "i/o", "io")) and any(tok in blob for tok in ("read", "write", "disk", "io", "fs_")):
-            reason_metric = 1.0
+            if "loss" in reason and "loss" in blob:
+                reason_metric = 1.0
+            elif any(tok in reason for tok in ("retrans", "corruption", "corrupt")) and any(tok in blob for tok in ("retrans", "corrupt")):
+                reason_metric = 1.0
+            elif "latency" in reason and "latency" in blob:
+                reason_metric = 1.0
+            else:
+                reason_metric = 0.65
+        elif any(tok in reason for tok in ("read", "write", "disk", "i/o", "io", "space")) and any(tok in blob for tok in ("read", "write", "disk", "io", "fs_")):
+            if "read" in reason and any(tok in blob for tok in ("read", "r_s", "rkb", "r_await")):
+                reason_metric = 1.0
+            elif "write" in reason and any(tok in blob for tok in ("write", "w_s", "wkb", "w_await")):
+                reason_metric = 1.0
+            elif "space" in reason and any(tok in blob for tok in ("space", "usage", "used", "fs_")):
+                reason_metric = 1.0
+            else:
+                reason_metric = 0.55
     local = min(1.0, owned + 0.35 * sibling + 0.20 * min(1.0, metric_count / 6.0))
     intervention_score = max(0.0, min(1.0, 0.45 * local + 0.22 * reason_metric + 0.18 * causal - 0.25 * symptom + 0.15))
     return {
@@ -343,14 +357,24 @@ def _pairwise_counterfactual_tests(candidate_payload: List[Dict[str, Any]]) -> L
                 "challenger_advantages": challenger_advantages,
                 "top1_advantages": top1_advantages,
                 "suggested_test_result": suggested,
-                "decision_rule": "Prefer challenger only when it explains the required field with stronger local/reason/causal evidence and not just broad symptom evidence.",
+                "falsifies_top1": bool(suggested == "challenge_top1"),
                 "evidence_comparison": {
                     "top1": _explainable_evidence_snippet(top1),
                     "challenger": _explainable_evidence_snippet(cand),
                 },
             }
         )
-    return tests
+    tests.sort(
+        key=lambda x: (
+            bool(x.get("falsifies_top1", False)),
+            float(dict(x.get("deltas_vs_top1", {}) or {}).get("intervention_score", 0.0) or 0.0),
+            len(list(x.get("challenger_advantages") or [])),
+        ),
+        reverse=True,
+    )
+    # Keep the prompt bounded.  The LLM only needs the strongest pairwise
+    # interventions, not every low-evidence challenger.
+    return tests[:4]
 
 
 class CounterfactualExecutor:
@@ -491,29 +515,28 @@ class CounterfactualExecutor:
 You are a counterfactual RCA evidence judge. Do bounded reranking only.
 Do not invent components, reasons, timestamps, or evidence.
 
-Your decision must be based on pairwise counterfactual comparison, not rank.
+Your decision must be a two-stage intervention test, not a generic ranking.
 Candidate #1 is only the deterministic current answer; it is not a truth label.
 
-First compare candidate #1 against each challenger as a causal explanation:
-1. If candidate #1 were removed, would the challenger's local anomaly still need explanation?
-2. If the challenger were removed, would candidate #1 look like a downstream/global symptom?
-3. Which candidate has stronger component-local evidence, reason-metric consistency,
-   propagation plausibility, and time-change evidence?
+Stage A: falsify candidate #1.
+Return top1_falsified=true only if a challenger provides a more specific root
+intervention that explains the required field(s) better than candidate #1.
 
-Do not trust rank alone. The listed order is only the indexer's current answer,
-not a truth label. A challenger should replace #1 when it has stronger local/root
-evidence and lower symptom risk. Reject candidates supported mainly by
-global node symptoms, weak early onset, unsupported reason labels, or duplicated
-symptom evidence.
+Stage B: select the minimal intervention.
+If top1 is falsified, select the challenger whose removal would best explain
+the local anomaly, reason-compatible metrics, propagation, and time evidence.
+If top1 is not falsified, selected_id must be 1.
+
+Reject candidates supported mainly by global node symptoms, weak early onset,
+unsupported reason labels, or duplicated symptom evidence.
 
 Important decision policy:
-- If pairwise_tests says a challenger has multiple concrete advantages and no
-  obvious symptom-risk penalty, seriously consider replacing candidate #1.
+- If pairwise_tests marks a challenger as falsifies_top1 and the concrete
+  evidence supports it, set top1_falsified=true and select that challenger.
 - If candidate #1 and a challenger each win different fields, use field_decisions
   to adopt only the fields with clear evidence gain.
 - Do not keep candidate #1 merely because it is candidate #1.
-- Do not select a challenger merely because it covers a missing label family;
-  it must have evidence in field_evidence or pairwise_tests.
+- Do not select a challenger merely because it covers a missing label family.
 
 Some challengers are intentionally included to cover missing evidence dimensions
 (component type, reason family, or time cluster). Treat them as serious
@@ -542,8 +565,9 @@ component, reason, and time are directly supported by concrete evidence.
 Output JSON only. In field_decisions, judge only fields required by the task.
 Use "evidence_gain" to state how much stronger the selected candidate is for
 that field compared with candidate #1: 0 means no gain, 1 means decisive gain.
-{"selected_id":1,"confidence":0.0,"change_from_top1":false,
+{"top1_falsified":false,"selected_id":1,"confidence":0.0,"change_from_top1":false,
 "top1_intervention_score":0.0,"selected_intervention_score":0.0,
+"falsification_reason":"why top1 is or is not falsified",
 "rationale":"one sentence","decisive_evidence":"one concrete evidence item",
 "field_decisions":{
   "component":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"},
@@ -602,6 +626,8 @@ that field compared with candidate #1: 0 means no gain, 1 means decisive gain.
             "rationale": str(data.get("rationale", "")).strip(),
             "conflict_resolution": str(data.get("conflict_resolution", "") or "").strip(),
             "change_from_top1": bool(data.get("change_from_top1", selected_id != 1)),
+            "top1_falsified": bool(data.get("top1_falsified", selected_id != 1)),
+            "falsification_reason": str(data.get("falsification_reason", "") or "").strip(),
             "top1_intervention_score": normalize_score(data.get("top1_intervention_score", 0.0)),
             "selected_intervention_score": normalize_score(data.get("selected_intervention_score", 0.0)),
             "decisive_evidence": str(data.get("decisive_evidence", "") or "").strip(),

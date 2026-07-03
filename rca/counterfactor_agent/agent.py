@@ -86,9 +86,23 @@ class CounterfactualController:
                 elif "memory" in reason and any(tok in blob for tok in ("mem", "memory", "rss")):
                     metric_reason = 1.0
                 elif any(tok in reason for tok in ("network", "packet", "latency", "loss")) and any(tok in blob for tok in ("network", "packet", "tcp", "retrans", "latency")):
-                    metric_reason = 1.0
-                elif any(tok in reason for tok in ("read", "write", "disk", "i/o", "io")) and any(tok in blob for tok in ("read", "write", "disk", "io", "fs_")):
-                    metric_reason = 1.0
+                    if "loss" in reason and "loss" in blob:
+                        metric_reason = 1.0
+                    elif any(tok in reason for tok in ("retrans", "corruption", "corrupt")) and any(tok in blob for tok in ("retrans", "corrupt")):
+                        metric_reason = 1.0
+                    elif "latency" in reason and "latency" in blob:
+                        metric_reason = 1.0
+                    else:
+                        metric_reason = 0.65
+                elif any(tok in reason for tok in ("read", "write", "disk", "i/o", "io", "space")) and any(tok in blob for tok in ("read", "write", "disk", "io", "fs_")):
+                    if "read" in reason and any(tok in blob for tok in ("read", "r_s", "rkb", "r_await")):
+                        metric_reason = 1.0
+                    elif "write" in reason and any(tok in blob for tok in ("write", "w_s", "wkb", "w_await")):
+                        metric_reason = 1.0
+                    elif "space" in reason and any(tok in blob for tok in ("space", "usage", "used", "fs_")):
+                        metric_reason = 1.0
+                    else:
+                        metric_reason = 0.55
             return {
                 "component_type": ctype,
                 "local": float(local),
@@ -114,6 +128,7 @@ class CounterfactualController:
         llm_prop_intervention = float(llm_details.get("selected_intervention_score", 0.0) or 0.0)
         raw_field_decisions = llm_details.get("field_decisions", {}) or {}
         field_decisions = dict(raw_field_decisions) if isinstance(raw_field_decisions, Mapping) else {}
+        top1_falsified = bool(llm_details.get("top1_falsified", False))
 
         def _field_decision(field: str) -> Dict[str, Any]:
             item = field_decisions.get(field, {}) if isinstance(field_decisions, Mapping) else {}
@@ -147,6 +162,10 @@ class CounterfactualController:
         prop_features = _features(proposed)
         det_type = str(det_features.get("component_type", "") or "")
         prop_type = str(prop_features.get("component_type", "") or "")
+        prop_root_signal = float(prop_features["local"]) + float(prop_features["causal"]) - float(prop_features["symptom"])
+        det_root_signal = float(det_features["local"]) + float(det_features["causal"]) - float(det_features["symptom"])
+        component_evidence_gain = float(prop_root_signal - det_root_signal)
+        reason_evidence_gain = float(prop_features["metric_reason"]) - float(det_features["metric_reason"])
         symptom_over_local = (
             prop_type == "node"
             and det_type in {"container", "pod", "service", "app", "db", "cache", "web"}
@@ -155,12 +174,14 @@ class CounterfactualController:
         )
         aggressive_intervention = (
             bool(adapter_ok)
-            and conf >= 0.45
-            and intervention_gain >= 0.05
+            and bool(top1_falsified)
+            and conf >= 0.40
+            and intervention_gain >= 0.00
             and float(prop_features["local"]) >= max(0.12, float(det_features["local"]) - 0.10)
             and float(prop_features["symptom"]) <= float(det_features["symptom"]) + 0.20
             and not symptom_over_local
             and ((not has_field_decisions) or max_field_gain >= 0.25)
+            and (component_evidence_gain >= -0.05 or reason_evidence_gain >= 0.50)
         )
 
         def _same(field: str) -> bool:
@@ -177,19 +198,21 @@ class CounterfactualController:
                 return False, "unchanged"
             if field == "component" and symptom_over_local:
                 return False, "shared_infra_symptom_over_local_candidate"
+            if not top1_falsified:
+                return False, "top1_not_falsified"
             explicit_adopt = _field_explicit_adopt(field)
             gain = _field_gain(field)
             if has_field_decisions and not explicit_adopt and gain < 0.20:
                 return False, "llm_field_decision_no_evidence_gain"
             if explicit_adopt and conf >= 0.45:
                 if field == "component":
-                    prop_root = float(prop_features["local"]) + float(prop_features["causal"]) - float(prop_features["symptom"])
-                    det_root = float(det_features["local"]) + float(det_features["causal"]) - float(det_features["symptom"])
-                    if prop_root >= det_root - 0.05 and not symptom_over_local:
+                    if component_evidence_gain >= 0.05 and not symptom_over_local:
                         return True, "llm_component_field_evidence_gain"
+                    if gain >= 0.65 and component_evidence_gain >= -0.02 and float(prop_features["symptom"]) < float(det_features["symptom"]):
+                        return True, "llm_component_lower_symptom_risk"
                     return False, "component_field_gain_not_supported_by_auto_evidence"
                 if field == "reason":
-                    if float(prop_features["metric_reason"]) >= float(det_features["metric_reason"]) or gain >= 0.50:
+                    if reason_evidence_gain > 0.0 or (gain >= 0.70 and float(prop_features["metric_reason"]) >= float(det_features["metric_reason"])):
                         return True, "llm_reason_field_evidence_gain"
                     return False, "reason_field_gain_not_supported_by_metrics"
                 if field == "datetime":
@@ -274,6 +297,10 @@ class CounterfactualController:
             "symptom_over_local_blocked": bool(symptom_over_local),
             "field_decisions": dict(field_decisions),
             "max_field_evidence_gain": float(max_field_gain),
+            "top1_falsified": bool(top1_falsified),
+            "falsification_reason": str(llm_details.get("falsification_reason", "") or ""),
+            "component_evidence_gain": float(component_evidence_gain),
+            "reason_evidence_gain": float(reason_evidence_gain),
         }
         return merged, details
 
