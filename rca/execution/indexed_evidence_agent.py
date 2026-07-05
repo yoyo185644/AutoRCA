@@ -79,12 +79,12 @@ def _unique(items: Sequence[Any]) -> List[str]:
 
 
 def _load_counterfactual_prompts(dataset: str) -> tuple[str, str]:
-    ap = importlib.import_module("rca.baseline.rca_agent.prompt.agent_prompt")
+    ap = importlib.import_module("rca.counterfactor_agent.prompt.agent_prompt")
     ds = str(dataset or "")
     if ds == "Bank":
-        bp_name = "rca.baseline.rca_agent.prompt.basic_prompt_Bank"
+        bp_name = "rca.counterfactor_agent.prompt.basic_prompt_Bank"
     else:
-        bp_name = "rca.baseline.rca_agent.prompt.basic_prompt_Telecom"
+        bp_name = "rca.counterfactor_agent.prompt.basic_prompt_Telecom"
     bp = importlib.import_module(bp_name)
     return str(getattr(ap, "rules", "") or ""), str(getattr(bp, "schema", getattr(bp, "cand", "")) or "")
 
@@ -1294,8 +1294,14 @@ def _safe_prediction_to_tuples_constrained(
         reason_only_choice = bool(need_reason) and not bool(need_comp) and not bool(need_time)
         if (not reason_only_choice) and best_score > 0 and matched_score + max(score_guard, 0.0) < best_score:
             continue
+        det_item = deterministic[0] if deterministic else {}
+        matched_evidence = len(list(matched.get("supporting_metrics", []) or []))
+        det_evidence = len(list(det_item.get("supporting_metrics", []) or [])) if isinstance(det_item, Mapping) else 0
+        matched_support = float(matched.get("reason_metric_support", 0.0) or 0.0)
+        det_support = float(det_item.get("reason_metric_support", 0.0) or 0.0) if isinstance(det_item, Mapping) else 0.0
+        if (matched_evidence <= 0 and matched_support <= 0.0) and (det_evidence > 0 or det_support > 0.0):
+            continue
         if adapter is not None:
-            det_item = deterministic[0] if deterministic else {}
             try:
                 ok, _why = adapter.validate_llm_candidate_adoption(
                     proposed_component=str(matched.get("component", "") or ""),
@@ -2105,7 +2111,7 @@ class IndexedEvidenceAgentRunner:
         core_modules = dict((context or {}).get("basil_core_modules", {}) or {})
         if (bool(need_comp) or bool(need_reason)) and bool(core_modules.get("typed_channel_recall", True)):
             try:
-                date_dir = str(getattr(result, "date_dir", "") or "")
+                date_dir = str((context or {}).get("date_dir", "") or getattr(result, "date_dir", "") or "")
                 supplement = adapter.supplement_candidate_pool(
                     list(selected or []),
                     dict(context or {}),
@@ -2134,6 +2140,7 @@ class IndexedEvidenceAgentRunner:
                 if isinstance(item.get("rootness_features", {}), Mapping):
                     setattr(cand, "rootness_features", dict(item.get("rootness_features", {}) or {}))
                 setattr(cand, "symptomness", float(item.get("symptomness", 0.0) or 0.0))
+                setattr(cand, "reason_metric_support", float(item.get("reason_metric_support", 0.0) or 0.0))
                 candidates.append(cand)
             except Exception:
                 return list(selected or [])
@@ -2253,6 +2260,9 @@ class IndexedEvidenceAgentRunner:
                     "component_type": comp_type,
                     "first_anomaly_time": str(original.get("first_anomaly_time", "") or ""),
                     "symptomness": float(getattr(cand, "symptomness", original.get("symptomness", 0.0)) or 0.0),
+                    "reason_metric_support": float(
+                        getattr(cand, "reason_metric_support", original.get("reason_metric_support", 0.0)) or 0.0
+                    ),
                     "rootness_features": rootness_features,
                     "topology_context": topology_context,
                 }
@@ -2470,8 +2480,6 @@ class IndexedEvidenceAgentRunner:
                 instruction=instruction,
                 logger=run_logger,
                 dataset_name=dataset,
-                max_step=int(getattr(args, "controller_max_step", 25) or 25),
-                max_turn=int(getattr(args, "controller_max_turn", 5) or 5),
                 task_focus=_task_focus(int(task_id)),
                 context=context,
             )

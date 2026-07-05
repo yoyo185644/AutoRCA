@@ -53,38 +53,3 @@ class CounterfactualCheck:
             d["deterministic_evidence"] = self.deterministic_evidence.to_dict()
         return d
 
-
-@dataclass
-class ControllerState:
-    instruction: str
-    dataset_name: str = ""
-    task_focus: str = ""
-    max_step: int = 25
-    max_turn: int = 5
-
-    step: int = 0
-    turn: int = 0
-    done: bool = False
-
-    candidates: List[CandidateHypothesis] = field(default_factory=list)
-    checks: List[CounterfactualCheck] = field(default_factory=list)
-    final_candidate: Optional[CandidateHypothesis] = None
-    final_confidence: float = 0.0
-    final_reasoning: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "instruction": self.instruction,
-            "dataset_name": self.dataset_name,
-            "task_focus": self.task_focus,
-            "max_step": self.max_step,
-            "max_turn": self.max_turn,
-            "step": self.step,
-            "turn": self.turn,
-            "done": self.done,
-            "candidates": [c.to_dict() for c in self.candidates],
-            "checks": [c.to_dict() for c in self.checks],
-            "final_candidate": self.final_candidate.to_dict() if self.final_candidate else None,
-            "final_confidence": self.final_confidence,
-            "final_reasoning": self.final_reasoning,
-        }

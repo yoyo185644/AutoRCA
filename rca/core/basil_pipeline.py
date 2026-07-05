@@ -76,11 +76,14 @@ class BasilCorePipeline:
 
     def build(self) -> BasilCoreOutput:
         pool_k = self._pool_k()
+        self._ensure_query_window_context()
         pool = self.deterministic_select(result=self.result, k=int(pool_k))
         pool = [dict(x) for x in list(pool or []) if isinstance(x, Mapping)]
 
+        pool = self._pre_supplement_candidates(pool)
         pool = self._merge_time_dimension(pool, pool_k=pool_k)
-        pool = self._replace_reason_surface_if_needed(pool, pool_k=pool_k)
+        pool = self._bind_reason_time_candidates(pool, pool_k=pool_k)
+        pool = self._expand_component_reason_cross_product(pool, pool_k=pool_k)
         pool = self._expand_candidates(pool, pool_k=pool_k)
         pool = self.adapter_rerank(
             result=self.result,
@@ -174,6 +177,69 @@ class BasilCorePipeline:
         except Exception:
             return int(pool_k)
 
+    def _pre_supplement_candidates(self, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Expose typed-channel supplements before task-dimension binding.
+
+        Some adapters can cheaply recover component-local telemetry candidates
+        from the current incident.  Running that hook before reason/time binding
+        lets the shared core form evidence-backed tuples from those candidates
+        instead of binding only the initial top-k retrieval surface.
+        """
+        if self.adapter is None or not (self.need_comp or self.need_reason):
+            return pool
+        try:
+            date_dir = str((self.context or {}).get("date_dir", "") or getattr(self.result, "date_dir", "") or "")
+            supplement = self.adapter.supplement_candidate_pool(
+                list(pool or []),
+                dict(self.context or {}),
+                date_dir=date_dir,
+            )
+        except Exception:
+            supplement = []
+        if not supplement:
+            return pool
+        merged: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for item in list(pool or []) + [dict(x) for x in list(supplement or []) if isinstance(x, Mapping)]:
+            if not isinstance(item, Mapping):
+                continue
+            key = (
+                str(item.get("component", "") or ""),
+                str(item.get("reason", "") or ""),
+                str(item.get("datetime", "") or ""),
+            )
+            prev = merged.get(key)
+            if prev is None or float(prev.get("score", 0.0) or 0.0) < float(item.get("score", 0.0) or 0.0):
+                merged[key] = dict(item)
+        rows = list(merged.values())
+        rows.sort(key=self._evidence_backed_score, reverse=True)
+        return rows
+
+    def _ensure_query_window_context(self) -> None:
+        if (
+            str((self.context or {}).get("date_dir", "") or "").strip()
+            and str((self.context or {}).get("query_start_local", "") or "").strip()
+            and str((self.context or {}).get("query_end_local", "") or "").strip()
+        ):
+            return
+        instruction = str((self.context or {}).get("instruction", "") or "")
+        if not instruction:
+            return
+        try:
+            from rca.adapter.utils.component_candidates import parse_time_window_generic
+            from rca.common.io import resolve_date_dir
+
+            raw_date, start, end = parse_time_window_generic(instruction)
+            dataset = str((self.context or {}).get("dataset", "") or getattr(self.result, "dataset", "") or "")
+            date_dir = str(resolve_date_dir(dataset, raw_date)) if dataset and raw_date else str(raw_date or "")
+            if date_dir and not str((self.context or {}).get("date_dir", "") or "").strip():
+                self.context["date_dir"] = date_dir
+            if start is not None and not str((self.context or {}).get("query_start_local", "") or "").strip():
+                self.context["query_start_local"] = start.strftime("%Y-%m-%d %H:%M:%S")
+            if end is not None and not str((self.context or {}).get("query_end_local", "") or "").strip():
+                self.context["query_end_local"] = end.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return
+
     def _merge_time_dimension(self, pool: List[Dict[str, Any]], *, pool_k: int) -> List[Dict[str, Any]]:
         if not self.need_time:
             return pool
@@ -239,6 +305,132 @@ class BasilCorePipeline:
             )
         return sorted(out, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[: max(int(pool_k), len(out))]
 
+    def _bind_reason_time_candidates(self, pool: List[Dict[str, Any]], *, pool_k: int) -> List[Dict[str, Any]]:
+        """Create evidence-backed reason/time rows instead of global empty rows.
+
+        For reason-only and reason+time tasks, the old generic path produced
+        ``component=''`` candidates with no metrics.  Those can dominate with
+        score=1.0 and break time/reason alignment.  This binder keeps the
+        output fields component-free later, but ranks reasons through
+        component-local metric support first.
+        """
+        if not self.need_reason or self.need_comp:
+            return pool
+        reason_scores = dict((self.context or {}).get("reason_scores") or {})
+        allowed = [str(x).strip() for x in list((self.context or {}).get("allowed_reasons") or []) if str(x).strip()]
+        reasons = list(dict.fromkeys(list(allowed) + list(reason_scores.keys())))
+        if not reasons:
+            return pool
+
+        comp_rows = self._component_evidence_rows(pool)
+        time_rows = [dict(x) for x in list((self.context or {}).get("time_candidates") or []) if isinstance(x, Mapping)]
+        default_dt = str((self.context or {}).get("time_choice", "") or "").strip()
+        if self.need_time and not default_dt:
+            for item in time_rows:
+                dt = str(item.get("datetime", "") or "").strip()
+                if dt:
+                    default_dt = dt
+                    break
+
+        max_reason = max([abs(float(v or 0.0)) for v in reason_scores.values()] + [1.0])
+        bound: List[Dict[str, Any]] = []
+        for comp_item in comp_rows[: max(12, int(pool_k) * 2)]:
+            comp = str(comp_item.get("component", "") or "").strip()
+            metrics = self._metrics_for_component(comp, comp_item)
+            if not comp or not metrics:
+                continue
+            for reason in reasons:
+                support = self._reason_support(component=comp, reason=reason, metrics=metrics)
+                if support <= 0.0:
+                    continue
+                dt = self._best_time_for_component_reason(comp, reason, default_dt, time_rows)
+                base = float(comp_item.get("score", 0.0) or 0.0)
+                rs = float(reason_scores.get(reason, 0.0) or 0.0) / max(max_reason, 1e-9)
+                score = 0.52 * support + 0.28 * rs + 0.20 * max(0.0, min(1.0, base))
+                bound.append(
+                    {
+                        "component": comp,
+                        "reason": reason,
+                        "datetime": dt if self.need_time else "",
+                        "score": float(score),
+                        "source": "core_reason_time_binder",
+                        "supporting_metrics": metrics[:8],
+                        "component_type": self._component_type(comp),
+                        "reason_metric_support": float(support),
+                    }
+                )
+
+        if not bound:
+            # Keep reason surface as fallback, but make empty-evidence rows
+            # weaker than any evidence-backed candidate.
+            rows = self._replace_reason_surface_if_needed(pool, pool_k=pool_k)
+            for item in rows:
+                if not str(item.get("component", "") or "").strip() and not item.get("supporting_metrics"):
+                    item["score"] = min(float(item.get("score", 0.0) or 0.0), 0.42)
+                    item["source"] = f"{item.get('source', '')}+weak_empty_reason_surface"
+            return rows
+
+        bound.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+        return bound[: max(int(pool_k), self.k)]
+
+    def _expand_component_reason_cross_product(self, pool: List[Dict[str, Any]], *, pool_k: int) -> List[Dict[str, Any]]:
+        """Expand component candidates across taxonomy reasons with evidence.
+
+        This generalizes the old Market-specific component×reason expansion.
+        It is active for tasks that require both component and reason.
+        """
+        if not (self.need_comp and self.need_reason):
+            return pool
+        if self.adapter is None:
+            return pool
+        try:
+            taxonomy = [str(x).strip() for x in list(self.adapter.basil_reason_taxonomy() or []) if str(x).strip()]
+        except Exception:
+            taxonomy = []
+        if not taxonomy:
+            return pool
+
+        merged: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for item in pool:
+            if not isinstance(item, Mapping):
+                continue
+            key = (str(item.get("component", "") or ""), str(item.get("reason", "") or ""), str(item.get("datetime", "") or ""))
+            merged[key] = dict(item)
+
+        comp_rows = self._component_evidence_rows(pool)
+        for comp_item in comp_rows[: max(12, int(pool_k) * 2)]:
+            comp = str(comp_item.get("component", "") or "").strip()
+            metrics = self._metrics_for_component(comp, comp_item)
+            if not comp or not metrics:
+                continue
+            base = max(0.0, min(1.0, float(comp_item.get("score", 0.0) or 0.0)))
+            for reason in taxonomy:
+                support = self._reason_support(component=comp, reason=reason, metrics=metrics)
+                if support <= 0.0:
+                    continue
+                dt = str(comp_item.get("datetime", "") or "")
+                if self.need_time:
+                    dt = self._best_time_for_component_reason(comp, reason, dt, list((self.context or {}).get("time_candidates") or []))
+                score = 0.58 * support + 0.32 * base
+                key = (comp, reason, dt)
+                prev = merged.get(key)
+                row = {
+                    "component": comp,
+                    "reason": reason,
+                    "datetime": dt,
+                    "score": float(score),
+                    "source": "core_component_reason_expand",
+                    "supporting_metrics": metrics[:8],
+                    "component_type": self._component_type(comp),
+                    "reason_metric_support": float(support),
+                }
+                if prev is None or float(prev.get("score", 0.0) or 0.0) < score:
+                    merged[key] = row
+
+        rows = list(merged.values())
+        rows.sort(key=self._evidence_backed_score, reverse=True)
+        return rows[: max(int(pool_k) * 2, 30)]
+
     def _expand_candidates(self, pool: List[Dict[str, Any]], *, pool_k: int) -> List[Dict[str, Any]]:
         if self.adapter is None:
             return pool
@@ -258,6 +450,133 @@ class BasilCorePipeline:
 
     def _sort_time_only(self, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return sorted([dict(x) for x in list(pool or []) if isinstance(x, Mapping)], key=self._time_score, reverse=True)
+
+    def _component_evidence_rows(self, pool: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in list(pool or []):
+            if not isinstance(item, Mapping):
+                continue
+            comp = str(item.get("component", "") or "").strip()
+            if not comp or comp in seen:
+                continue
+            row = dict(item)
+            metrics = self._metrics_for_component(comp, row)
+            if not metrics:
+                continue
+            row["supporting_metrics"] = metrics
+            rows.append(row)
+            seen.add(comp)
+        top_metrics = dict((self.context or {}).get("top_metrics") or {})
+        comp_scores = dict((self.context or {}).get("component_scores") or {})
+        for comp, metrics in top_metrics.items():
+            c = str(comp or "").strip()
+            if not c or c in seen:
+                continue
+            rows.append(
+                {
+                    "component": c,
+                    "reason": "",
+                    "datetime": "",
+                    "score": float(comp_scores.get(c, 0.0) or 0.0),
+                    "source": "core_component_metric_surface",
+                    "supporting_metrics": [str(x) for x in list(metrics or []) if str(x).strip()][:8],
+                    "component_type": self._component_type(c),
+                }
+            )
+            seen.add(c)
+        rows.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+        return rows
+
+    def _metrics_for_component(self, component: str, item: Mapping[str, Any]) -> List[str]:
+        metrics = [str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x).strip()]
+        if metrics:
+            return metrics[:8]
+        top_metrics = dict((self.context or {}).get("top_metrics") or {})
+        return [str(x) for x in list(top_metrics.get(str(component), []) or []) if str(x).strip()][:8]
+
+    def _reason_support(self, *, component: str, reason: str, metrics: Sequence[str]) -> float:
+        if self.adapter is not None:
+            fn = getattr(self.adapter, "_reason_metric_support_score", None)
+            if callable(fn):
+                try:
+                    return max(0.0, min(1.0, float(fn(component=component, reason=reason, metrics=list(metrics)))))
+                except Exception:
+                    pass
+            fn2 = getattr(self.adapter, "_reason_metric_support", None)
+            if callable(fn2):
+                try:
+                    return max(0.0, min(1.0, float(fn2(component=component, reason=reason, top_metrics=list(metrics)))))
+                except Exception:
+                    pass
+            try:
+                keywords = [str(x).lower() for x in list(self.adapter.reason_metric_keywords(str(reason)) or []) if str(x).strip()]
+            except Exception:
+                keywords = []
+            if keywords:
+                blob = " ".join(str(x).lower() for x in list(metrics or []))
+                hits = len({k for k in keywords if k in blob})
+                support = float(hits) / float(max(1, min(4, len(set(keywords)))))
+                try:
+                    expected = set(self.adapter.reason_compatible_component_types(str(reason)) or [])
+                    ctype = str(self.adapter.component_semantic_type(str(component)) or "")
+                    if expected and ctype:
+                        support *= 1.15 if ctype in expected else 0.55
+                except Exception:
+                    pass
+                return max(0.0, min(1.0, support))
+        return 0.0
+
+    def _component_type(self, component: str) -> str:
+        if self.adapter is None:
+            return self.component_family(component)
+        try:
+            return str(self.adapter.component_semantic_type(str(component)) or "")
+        except Exception:
+            return self.component_family(component)
+
+    def _best_time_for_component_reason(
+        self,
+        component: str,
+        reason: str,
+        fallback: str,
+        time_rows: Sequence[Mapping[str, Any]],
+    ) -> str:
+        if not self.need_time:
+            return ""
+        best_dt = str(fallback or "").strip()
+        best_score = -1.0
+        for item in list(time_rows or []):
+            if not isinstance(item, Mapping):
+                continue
+            dt = str(item.get("datetime", "") or "").strip()
+            if not dt:
+                continue
+            c0 = str(item.get("component", "") or "").strip()
+            r0 = str(item.get("reason", "") or "").strip()
+            score = float(item.get("score", 0.0) or 0.0)
+            if c0 and c0 == component:
+                score += 0.50
+            elif c0:
+                score -= 0.08
+            if r0 and r0 == reason:
+                score += 0.25
+            if score > best_score:
+                best_score = score
+                best_dt = dt
+        return best_dt
+
+    def _evidence_backed_score(self, item: Mapping[str, Any]) -> float:
+        score = float(item.get("score", 0.0) or 0.0)
+        metrics = list(item.get("supporting_metrics", []) or [])
+        support = float(item.get("reason_metric_support", 0.0) or 0.0)
+        if not str(item.get("component", "") or "").strip() and not metrics:
+            score *= 0.35
+        if metrics:
+            score += 0.12
+        if support:
+            score += 0.18 * max(0.0, min(1.0, support))
+        return float(score)
 
     def _time_score(self, item: Mapping[str, Any]) -> float:
         if self.adapter is not None:

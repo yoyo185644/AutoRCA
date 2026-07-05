@@ -27,9 +27,8 @@ OpenRCA 是一个用于评测大模型（LLMs）在软件运维场景下根因�
 关键实现文件：
 
 - `rca/execution/framework.py`：通用执行框架（TaskContext / Strategy / Router / UnifiedTaskRunner）
-- `rca/execution/agent_standard.py`：面向当前项目的策略实现与默认路由（fast-solver + counterfactual agent）
-- `rca/run_agent_standard.py`：保留原有评测脚本入口，但内部改为调用统一框架
-- `rca/run.py`：新增统一主入口（可扩展为更多 runner）
+- `rca/agent/agent_standard.py`：面向当前项目的策略实现与默认路由（fast-solver + counterfactual agent）
+- `main/evaluate.py`：唯一的评测脚本入口（跑数据集 + 逐行打分），内部调用统一框架
 
 ## Difficulty 与执行策略
 
@@ -55,17 +54,15 @@ OpenRCA 是一个用于评测大模型（LLMs）在软件运维场景下根因�
 ```
 .
 ├── main/
-│   ├── generate.py
 │   └── evaluate.py
 ├── rca/
 │   ├── execution/
-│   │   ├── framework.py
+│   │   └── framework.py
+│   ├── agent/
 │   │   └── agent_standard.py
 │   ├── baseline/
 │   │   ├── rca_agent/
 │   │   └── counterfactor_agent/
-│   ├── run_agent_standard.py
-│   └── run.py
 └── README.md
 ```
 
@@ -97,46 +94,27 @@ dataset/
 
 ## 常用命令
 
-### 统一入口（新增）
+### 运行 + 评测（唯一入口：main.evaluate）
 
-等价于原 `run_agent_standard`，但提供一个更统一的入口点：
-
-```bash
-python3 -m rca.run --runner agent_standard --dataset Bank
-```
-
-### 保持兼容的旧入口（无需修改）
-
-原命令保持可用：
+`main/evaluate.py` 现在是唯一的测试入口：跑数据集里的每条 query、用 `evaluate()` 逐行打分、写出结果 CSV，一步到位。
 
 ```bash
-python3 -m rca.run_agent_standard --dataset Bank
-python3 -m rca.run_agent_standard --dataset Market/cloudbed-1
-python3 -m rca.run_agent_standard --dataset Market/cloudbed-2
-python3 -m rca.run_agent_standard --dataset Telecom
+python3 -m main.evaluate --dataset Bank
+python3 -m main.evaluate --dataset Market/cloudbed-1
+python3 -m main.evaluate --dataset Market/cloudbed-2
+python3 -m main.evaluate --dataset Telecom
 ```
 
 ### 路由参数示例
 
 ```bash
-python3 -m rca.run_agent_standard --dataset Telecom --route_mode auto
-python3 -m rca.run_agent_standard --dataset Telecom --route_mode counterfactual
+python3 -m main.evaluate --dataset Telecom --route_mode auto
+python3 -m main.evaluate --dataset Telecom --route_mode counterfactual
 ```
-
-### 评测（evaluate）
-
-```bash
-python3 -m main.evaluate \
-  -p [prediction csv files] \
-  -q [query csv files] \
-  -r [report csv file]
-```
-
-prediction CSV 至少包含 `prediction` 字段；每条 prediction 是 JSON-like 字符串（允许多条 failure，用 "1","2",... 编号）。
 
 ## 参数说明（节选）
 
-`python3 -m rca.run_agent_standard --help` 查看完整参数。以下是与执行路由相关的重点参数：
+`python3 -m main.evaluate --help` 查看完整参数。以下是与执行路由相关的重点参数：
 
 - `--route_mode {auto|fast|counterfactual}`：策略路由模式（新增，默认 auto，不破坏旧命令）
 - `--fast_easy_solver / --no_fast_easy_solver`：是否启用 fast-solver（原有参数）
@@ -145,7 +123,7 @@ prediction CSV 至少包含 `prediction` 字段；每条 prediction 是 JSON-lik
 
 ## 输出结果说明
 
-运行 `run_agent_standard`（或 `rca.run --runner agent_standard`）后，会生成 `test/` 目录（与旧行为一致）：
+运行 `main.evaluate` 后，会生成 `test/` 目录（与旧行为一致）：
 
 - `test/result/{DATASET}/agent-{tag}-{model}-{uid}.csv`：每条 query 的 prediction 与评测得分
 - `test/monitor/{DATASET}/agent-{tag}-{model}/{uid}/history/`：日志
@@ -156,9 +134,9 @@ prediction CSV 至少包含 `prediction` 字段；每条 prediction 是 JSON-lik
 
 推荐通过新增 Strategy 的方式接入，而不是侵入式改写旧流程：
 
-1. 在 `rca/execution/agent_standard.py` 中新增一个 `Strategy`（实现 `can_handle()` 与 `run()`，返回 `ExecutionResult`）
+1. 在 `rca/agent/agent_standard.py` 中新增一个 `Strategy`（实现 `can_handle()` 与 `run()`，返回 `ExecutionResult`）
 2. 在 `build_agent_standard_runner()` 中把新 Strategy 注册进路由（控制顺序即可实现优先级与回退）
-3. 如果要新增一个全新的 runner（例如新的评测脚本入口），在 `rca/run.py` 的 `_runner_entrypoints()` 中注册即可
+3. 如果要新增一个全新的评测脚本入口，参考 `main/evaluate.py` 新增一个 `main/*.py`
 
 ## 其他
 

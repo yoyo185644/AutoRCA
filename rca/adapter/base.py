@@ -391,7 +391,13 @@ class DatasetAdapter:
             base_norm = float(getattr(cand, "score", 0.0) or 0.0) / max_base
             comp_norm = float(comp_scores.get(comp, 0.0)) / max_comp if comp else 0.0
             reason_norm = float(reason_scores.get(reason, 0.0)) / max_reason if reason else 0.0
-            metrics = [str(x) for x in list(top_metrics.get(comp, []) or [])]
+            cand_metrics = [
+                str(x)
+                for x in list(getattr(cand, "evidence", []) or [])
+                if str(x).strip()
+            ]
+            context_metrics = [str(x) for x in list(top_metrics.get(comp, []) or [])]
+            metrics = list(dict.fromkeys(cand_metrics + context_metrics))
 
             rootness_features: Dict[str, float] = {}
             if component_only:
@@ -465,6 +471,16 @@ class DatasetAdapter:
             if bool(need_reason):
                 score += 0.25 * reason_norm
             score += self._type_consistency(comp, reason, metrics)
+            try:
+                support = float(getattr(cand, "reason_metric_support", 0.0) or 0.0)
+            except Exception:
+                support = 0.0
+            if bool(need_reason) and support > 0.0:
+                # Candidate-local component/reason evidence is more precise
+                # than global reason priors.  It is computed from telemetry
+                # metric names, not labels, so it is safe to use as a bounded
+                # tie-breaker across adapters.
+                score += 0.22 * max(0.0, min(1.0, support))
             score += self._hint_bonus(
                 comp=comp, reason=reason,
                 hint_components=hint_components, hint_reasons=hint_reasons,

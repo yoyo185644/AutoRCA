@@ -576,8 +576,6 @@ class FieldSolverStrategy:
                     instruction=spec.instruction,
                     logger=ctx.runtime.logger,
                     dataset_name=spec.dataset,
-                    max_step=int(getattr(args, "controller_max_step", 25) or 25),
-                    max_turn=int(getattr(args, "controller_max_turn", 5) or 5),
                     task_focus=_task_focus(int(spec.task_id)),
                     context=context,
                 )

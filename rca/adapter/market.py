@@ -1339,7 +1339,49 @@ class MarketAdapter(DatasetAdapter):
             hit_weight += 0.8
         if comp_type == "node" and any(tok in blob for tok in ["system.io", "system.cpu", "system.mem", "system.net"]):
             hit_weight += 0.35
-        return max(0.0, min(1.0, hit_weight / max(2.5, float(len(keywords)))))
+        support = hit_weight / max(2.5, float(len(keywords)))
+
+        # Calibrate keyword hits by metric-family density.  A single CPU token
+        # mixed into mostly network/I/O node metrics should not outrank a
+        # container whose local metrics are consistently CPU-related.  This is
+        # schema-based and does not use query labels.
+        rows = [str(m or "").lower() for m in list(metrics or []) if str(m or "").strip()]
+        cpu_hits = sum(1 for m in rows if any(tok in m for tok in ["cpu", "cfs", "throttled", "load"]))
+        mem_hits = sum(1 for m in rows if any(tok in m for tok in ["mem", "memory", "rss", "pgfault", "pgmajfault", "heap"]))
+        read_hits = sum(1 for m in rows if any(tok in m for tok in ["r_await", "r_s", "rkb", "read", "reads", "fs_reads"]))
+        write_hits = sum(1 for m in rows if any(tok in m for tok in ["w_await", "w_s", "wkb", "write", "writes", "fs_writes"]))
+        net_hits = sum(1 for m in rows if any(tok in m for tok in ["net.", "network", "tcp", "udp", "retrans", "packet"]))
+        capacity_hits = sum(1 for m in rows if any(tok in m for tok in ["filesystem", "fs_usage", "inode", "disk.used", "readonly", "avg_q", "svctm", "util"]))
+        total_hits = max(1, cpu_hits + mem_hits + read_hits + write_hits + net_hits + capacity_hits)
+        rnorm = norm_token(reason)
+        if "cpu" in rnorm:
+            density = cpu_hits / float(total_hits)
+            if comp_type == "node" and (cpu_hits < 2 or density < 0.34):
+                support *= 0.62
+            elif comp_type in {"container", "service"} and cpu_hits >= 2:
+                support = max(support, 0.78 + 0.04 * min(cpu_hits, 4))
+        elif "memory" in rnorm:
+            density = mem_hits / float(total_hits)
+            if mem_hits < 2 or density < 0.28:
+                support *= 0.70
+            else:
+                support = max(support, 0.72 + 0.04 * min(mem_hits, 4))
+        elif "read" in rnorm:
+            if read_hits <= 0:
+                support *= 0.45
+            else:
+                support = max(support, 0.72 + 0.05 * min(read_hits, 4))
+        elif "write" in rnorm:
+            if write_hits <= 0:
+                support *= 0.45
+            else:
+                support = max(support, 0.72 + 0.05 * min(write_hits, 4))
+        elif "disk space" in rnorm:
+            if capacity_hits <= 0:
+                support *= 0.55
+            else:
+                support = max(support, 0.70 + 0.04 * min(capacity_hits, 4))
+        return max(0.0, min(1.0, support))
 
     def _row_rootness_values(self, row: Mapping[str, Any], *, context: Mapping[str, Any]) -> Dict[str, float]:
         comp = self.parse_component_id(str(row.get("component", "") or ""))
@@ -2221,6 +2263,7 @@ class MarketAdapter(DatasetAdapter):
             )
         )
         pair_reasons = pool_reasons[:2] if pool_reasons else [""]
+        need_reason = bool((context or {}).get("need_reason", False))
         by_type: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
         for comp, ev in telemetry.items():
             by_type.setdefault(str(self.component_semantic_type(comp) or "other"), []).append((comp, ev))
@@ -2230,18 +2273,40 @@ class MarketAdapter(DatasetAdapter):
             for comp, ev in rows[:4]:
                 if comp in covered:
                     continue
-                for reason in pair_reasons:
+                comp_reasons = list(pair_reasons)
+                if need_reason:
+                    metrics = [str(x) for x in list(ev.get("top_metrics", []) or []) if str(x).strip()]
+                    supported: List[Tuple[float, str]] = []
+                    for reason in self.basil_reason_taxonomy():
+                        r = self.parse_root_cause_label(str(reason or ""))
+                        if not r:
+                            continue
+                        expected = self._expected_level_for_reason(r)
+                        if expected == "pod":
+                            expected = "container"
+                        ctype = self.component_semantic_type(comp)
+                        if expected and ctype and expected != ctype:
+                            continue
+                        support = self._reason_metric_support_score(component=comp, reason=r, metrics=metrics)
+                        if support > 0.0:
+                            supported.append((float(support), r))
+                    supported.sort(key=lambda kv: kv[0], reverse=True)
+                    comp_reasons = list(dict.fromkeys(comp_reasons + [r for _s, r in supported[:3]]))
+                for reason in comp_reasons:
+                    metrics = list(ev.get("top_metrics", []) or [])[:6]
+                    support = self._reason_metric_support_score(component=comp, reason=str(reason or ""), metrics=metrics) if reason else 0.0
                     supplements.append(
                         {
                             "component": comp,
                             "reason": reason,
                             "datetime": str(ev.get("first_time", "") or ""),
-                            "score": 0.36 + 0.28 * self._safe_float(ev.get("score", 0.0)),
+                            "score": 0.36 + 0.28 * self._safe_float(ev.get("score", 0.0)) + 0.18 * support,
                             "source": "market_typed_metric_supplement",
-                            "supporting_metrics": list(ev.get("top_metrics", []) or [])[:6],
+                            "supporting_metrics": metrics,
                             "component_type": self.component_semantic_type(comp),
                             "first_anomaly_time": str(ev.get("first_time", "") or ""),
                             "symptomness": self._safe_float(ev.get("symptomness", 0.0)),
+                            "reason_metric_support": float(support),
                         }
                     )
                 covered.add(comp)

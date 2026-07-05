@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from rca.run_agent_standard import main
+from main.evaluate import cli_main as main
 
 
 def run():
@@ -15,8 +15,6 @@ def run():
         sample_num=1,
         start_idx=0,
         end_idx=9999,
-        controller_max_step=25,
-        controller_max_turn=5,
         timeout=600,
         tag=tag,
         auto=False,
