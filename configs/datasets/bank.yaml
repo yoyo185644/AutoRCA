@@ -3,6 +3,32 @@ dataset: Bank
 
 adapter: bank
 
+skill:
+  evidence_sources:
+    metric: true
+    trace: true
+    log: true
+    topology: true
+  modules:
+    typed_channel_recall: true
+    metric_reason_evidence: true
+    log_reason_evidence: true
+    causal_topology: true
+    causal_time_selector: true
+    bounded_llm_rerank: true
+    trace_evidence: true
+  component_types:
+    gateway:
+      patterns: ["IG*", "MG*"]
+    app:
+      patterns: ["Tomcat*"]
+    db:
+      patterns: ["Mysql*"]
+    cache:
+      patterns: ["Redis*"]
+    web:
+      patterns: ["apache*"]
+
 index:
   type: generic_metric_trace_existing
   build:

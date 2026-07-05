@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from rca.common.text import norm_token
+from rca.skill import CoreModulePlan, CorePlanner, DatasetSkill
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,41 @@ class DatasetAdapter:
     def __init__(self, dataset: str, config: Dict[str, Any]) -> None:
         self.dataset = str(dataset)
         self.config = dict(config or {})
+        self.dataset_skill = DatasetSkill.from_config(self.dataset, self.config)
+        try:
+            if not self.dataset_skill.reason_taxonomy:
+                taxonomy = {
+                    str(x): {}
+                    for x in list(self.basil_reason_taxonomy() or [])
+                    if str(x).strip()
+                }
+                if taxonomy:
+                    self.dataset_skill = replace(self.dataset_skill, reason_taxonomy=taxonomy)
+        except Exception:
+            pass
+        self.core_planner = CorePlanner(self.dataset_skill)
+
+    def skill_summary(self) -> Dict[str, Any]:
+        """Return the declarative skill summary for diagnostics/papers."""
+        return self.dataset_skill.to_dict()
+
+    def core_plan(
+        self,
+        *,
+        task_id: int,
+        need_time: bool,
+        need_comp: bool,
+        need_reason: bool,
+        context: Mapping[str, Any] | None = None,
+    ) -> CoreModulePlan:
+        """Return the BASIL core modules selected for this query."""
+        return self.core_planner.plan_for_task(
+            task_id=int(task_id),
+            need_time=bool(need_time),
+            need_comp=bool(need_comp),
+            need_reason=bool(need_reason),
+            context=context or {},
+        )
 
     def solve_time(
         self,
@@ -750,7 +786,11 @@ class DatasetAdapter:
         return score
 
     def constrain_llm_to_index_candidates(self) -> bool:
-        return False
+        try:
+            plan = self.core_plan(task_id=0, need_time=True, need_comp=True, need_reason=True)
+            return bool(plan.bounded_llm_rerank)
+        except Exception:
+            return True
 
     def index_candidate_pool_k(
         self,
@@ -1541,6 +1581,12 @@ class DatasetAdapter:
     ) -> Tuple[List[str], Dict[str, float], Dict[str, Any]]:
         if not need_reason:
             return list(reasons or []), {}, {}
+        try:
+            plan = self.core_plan(task_id=int(task_id), need_time=False, need_comp=True, need_reason=True)
+            if not (bool(plan.metric_reason_evidence) or bool(plan.log_reason_evidence)):
+                return list(reasons or []), {}, {}
+        except Exception:
+            pass
 
         taxonomy = [
             self.parse_root_cause_label(str(x))
@@ -1618,6 +1664,12 @@ class DatasetAdapter:
         # Market/Bank get the same multi-signal fusion (±1min neighbors, reason-aware
         # metric onset, component metric onset) that TelecomAdapter already provides.
         merged = [dict(x) for x in list(time_candidates or []) if isinstance(x, dict)]
+        try:
+            plan = self.core_plan(task_id=int(task_id), need_time=bool(need_time), need_comp=True, need_reason=True)
+            if not bool(plan.causal_time_selector):
+                return merged
+        except Exception:
+            pass
         if need_time:
             try:
                 from rca.adapter.utils.time_candidates import estimate_occurrence_datetime_candidates
@@ -1658,7 +1710,11 @@ class DatasetAdapter:
         return str(prediction_json or "")
 
     def enable_trace_evidence(self) -> bool:
-        return True
+        try:
+            plan = self.core_plan(task_id=0, need_time=True, need_comp=True, need_reason=True)
+            return bool(plan.trace_evidence)
+        except Exception:
+            return True
 
     def basil_query_config_overrides(
         self,

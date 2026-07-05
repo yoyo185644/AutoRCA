@@ -12,6 +12,7 @@ from rca.counterfactor_agent.agent import CounterfactualRCAAgent
 from rca.common.text import service_base
 from rca.common.tasks import required_root_count_from_instruction, task_need_flags
 from rca.adapter.registry import get_dataset_adapter
+from rca.core import BasilCorePipeline
 
 
 @dataclass(frozen=True)
@@ -112,45 +113,6 @@ def _safe_prediction_to_tuples(prediction: str, fallback: List[Dict[str, Any]], 
             }
         )
     return selected or list(fallback or [])[: max(1, int(k))]
-
-
-def _canonical_market_fields(
-    item: Mapping[str, Any],
-    *,
-    adapter: Any,
-    component_level: str,
-) -> tuple[str, str, str]:
-    comp = str(item.get("component") or item.get("root cause component") or "").strip()
-    reason = str(item.get("reason") or item.get("root cause reason") or "").strip()
-    dt = str(item.get("datetime") or item.get("root cause occurrence datetime") or "").strip()
-    if adapter is not None:
-        try:
-            comp = str(adapter.canonicalize_component(component=comp, component_level=component_level) or comp)
-        except Exception:
-            pass
-        try:
-            reason = str(adapter.parse_root_cause_label(reason) or reason)
-        except Exception:
-            pass
-    else:
-        comp = re.sub(r"^node-\d+\.", "", comp)
-        comp = re.sub(r"(\.ts|-grpc)$", "", comp)
-        comp = re.sub(r"^frontend(\d+)-(\d+)$", r"frontend-\1", comp)
-        reason_aliases = {
-            "node cpu spike": "node CPU load",
-            "container packet loss": "container network packet retransmission",
-            "container network packet loss": "container network packet retransmission",
-            "container packet retransmission": "container network packet retransmission",
-            "container packet corruption": "container network packet corruption",
-        }
-        reason = reason_aliases.get(reason.strip().lower(), reason)
-    return comp, reason, dt
-
-
-def _is_market_path(dataset: str, adapter: Any = None) -> bool:
-    if adapter is not None and adapter.__class__.__name__ == "MarketAdapter":
-        return True
-    return str(dataset or "").strip().lower().startswith("market/")
 
 
 def _candidate_component_family(component: str) -> str:
@@ -1231,148 +1193,26 @@ def _safe_prediction_to_tuples_constrained(
     adapter: Any = None,
     context: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Market-safe LLM adoption path.
+    """Bounded LLM adoption over BASIL candidates.
 
-    The LLM may only choose/reorder tuples already proposed by BASIL. It cannot
-    introduce new components, reasons, or timestamps. If its JSON cannot be
-    matched back to the candidate pool, we keep the deterministic BASIL result.
+    The LLM may reorder or choose candidates already proposed by BASIL. It may
+    not introduce unseen components, reasons, or timestamps. Dataset adapters
+    only canonicalize fields and validate semantic compatibility.
     """
     pool = [dict(x) for x in list(fallback_pool or []) if isinstance(x, Mapping)]
     limit = max(1, int(k))
     deterministic = pool[:limit]
-    if not _is_market_path(dataset, adapter):
-        constrain = False
-        if adapter is not None:
-            try:
-                constrain = bool(adapter.constrain_llm_to_index_candidates())
-            except Exception:
-                constrain = False
-        if not constrain:
-            return _safe_prediction_to_tuples(prediction, deterministic, limit)
-        if not pool:
-            return deterministic
-        try:
-            obj = json.loads(str(prediction or ""))
-        except Exception:
-            return deterministic
-        if not isinstance(obj, Mapping):
-            return deterministic
-
-        need_time, need_comp, need_reason = _need_flags(int(task_id))
-        pool_keys: List[tuple[str, str, str, Dict[str, Any]]] = []
-        for item in pool:
-            comp = str(item.get("component") or "").strip()
-            reason = str(item.get("reason") or "").strip()
-            dt = str(item.get("datetime") or "").strip()
-            if adapter is not None:
-                try:
-                    comp = str(adapter.parse_component_id(comp) or comp).strip()
-                except Exception:
-                    pass
-                try:
-                    reason = str(adapter.parse_root_cause_label(reason) or reason).strip()
-                except Exception:
-                    pass
-            pool_keys.append((comp, reason, dt, item))
-        best_score = max([float(item.get("score", 0.0) or 0.0) for item in pool] + [0.0])
-        score_guard = float((context or {}).get("llm_max_score_drop_vs_det_top1", 0.05) or 0.05)
-
-        selected: List[Dict[str, Any]] = []
-        used_idx: set[int] = set()
-        for i in range(1, limit + 1):
-            item = obj.get(str(i))
-            if not isinstance(item, Mapping):
-                continue
-            pred_comp = str(item.get("root cause component") or item.get("component") or "").strip()
-            pred_reason = str(item.get("root cause reason") or item.get("reason") or "").strip()
-            pred_dt = str(item.get("root cause occurrence datetime") or item.get("datetime") or "").strip()
-            if adapter is not None:
-                try:
-                    pred_comp = str(adapter.parse_component_id(pred_comp) or pred_comp).strip()
-                except Exception:
-                    pass
-                try:
-                    pred_reason = str(adapter.parse_root_cause_label(pred_reason) or pred_reason).strip()
-                except Exception:
-                    pass
-
-            best_idx = -1
-            best_match_score = -1
-            for j, (cand_comp, cand_reason, cand_dt, _cand) in enumerate(pool_keys):
-                if j in used_idx:
-                    continue
-                match_score = 0
-                if need_comp:
-                    if pred_comp and cand_comp and pred_comp == cand_comp:
-                        match_score += 4
-                    else:
-                        continue
-                if need_reason:
-                    if pred_reason and cand_reason and pred_reason == cand_reason:
-                        match_score += 3
-                    else:
-                        continue
-                if need_time:
-                    if pred_dt and cand_dt and pred_dt == cand_dt:
-                        match_score += 2
-                    elif not need_comp and not need_reason:
-                        continue
-                if match_score > best_match_score:
-                    best_match_score = match_score
-                    best_idx = j
-            if best_idx < 0:
-                continue
-            matched_score = float(pool_keys[best_idx][3].get("score", 0.0) or 0.0)
-            reason_only_choice = bool(need_reason) and not bool(need_comp) and not bool(need_time)
-            if (not reason_only_choice) and best_score > 0 and matched_score + max(score_guard, 0.0) < best_score:
-                continue
-            if adapter is not None:
-                det_item = deterministic[0] if deterministic else {}
-                try:
-                    ok, _why = adapter.validate_llm_candidate_adoption(
-                        proposed_component=str(pool_keys[best_idx][3].get("component", "") or ""),
-                        proposed_reason=str(pool_keys[best_idx][3].get("reason", "") or ""),
-                        deterministic_component=str(det_item.get("component", "") or ""),
-                        deterministic_reason=str(det_item.get("reason", "") or ""),
-                        context=dict(context or {}),
-                        need_comp=bool(need_comp),
-                        need_reason=bool(need_reason),
-                    )
-                    if not ok:
-                        continue
-                except Exception:
-                    pass
-            used_idx.add(best_idx)
-            matched = dict(pool_keys[best_idx][3])
-            matched["source"] = "counterfactual_agent_candidate_rerank"
-            selected.append(matched)
-            if len(selected) >= limit:
-                break
-
-        if not selected:
-            return deterministic
-        for item in pool:
-            if len(selected) >= limit:
-                break
-            key = (
-                str(item.get("component") or ""),
-                str(item.get("reason") or ""),
-                str(item.get("datetime") or ""),
-            )
-            if any(
-                key == (
-                    str(x.get("component") or ""),
-                    str(x.get("reason") or ""),
-                    str(x.get("datetime") or ""),
-                )
-                for x in selected
-            ):
-                continue
-            selected.append(dict(item))
-        return selected[:limit] or deterministic
     if not pool:
         return deterministic
+
+    constrain = True
+    if adapter is not None:
+        try:
+            constrain = bool(adapter.constrain_llm_to_index_candidates())
+        except Exception:
+            constrain = True
+    if not constrain:
+        return _safe_prediction_to_tuples(prediction, deterministic, limit)
 
     try:
         obj = json.loads(str(prediction or ""))
@@ -1382,48 +1222,95 @@ def _safe_prediction_to_tuples_constrained(
         return deterministic
 
     need_time, need_comp, need_reason = _need_flags(int(task_id))
-    component_level = str((context or {}).get("component_level", "") or "")
-    pool_keys: List[tuple[str, str, Dict[str, Any]]] = []
-    for item in pool:
-        comp, reason, _dt = _canonical_market_fields(item, adapter=adapter, component_level=component_level)
-        pool_keys.append((comp, reason, item))
-    best_score = max([float(item.get("score", 0.0) or 0.0) for item in pool] + [0.0])
-    score_guard = max(0.08, 0.10 * abs(float(best_score)))
 
+    def canon(comp: str, reason: str, dt: str) -> tuple[str, str, str]:
+        c = str(comp or "").strip()
+        r = str(reason or "").strip()
+        d = str(dt or "").strip()
+        if adapter is not None:
+            try:
+                c = str(adapter.parse_component_id(c) or c).strip()
+            except Exception:
+                pass
+            try:
+                r = str(adapter.parse_root_cause_label(r) or r).strip()
+            except Exception:
+                pass
+        return c, r, d
+
+    pool_keys: List[tuple[str, str, str, Dict[str, Any]]] = []
+    for item in pool:
+        c, r, d = canon(
+            str(item.get("component") or ""),
+            str(item.get("reason") or ""),
+            str(item.get("datetime") or ""),
+        )
+        pool_keys.append((c, r, d, item))
+
+    best_score = max([float(item.get("score", 0.0) or 0.0) for item in pool] + [0.0])
+    score_guard = float((context or {}).get("llm_max_score_drop_vs_det_top1", 0.05) or 0.05)
     selected: List[Dict[str, Any]] = []
     used_idx: set[int] = set()
+
     for i in range(1, limit + 1):
         item = obj.get(str(i))
         if not isinstance(item, Mapping):
             continue
-        pred_comp, pred_reason, _pred_dt = _canonical_market_fields(
-            item,
-            adapter=adapter,
-            component_level=component_level,
+        pred_comp, pred_reason, pred_dt = canon(
+            str(item.get("root cause component") or item.get("component") or ""),
+            str(item.get("root cause reason") or item.get("reason") or ""),
+            str(item.get("root cause occurrence datetime") or item.get("datetime") or ""),
         )
-        if need_comp and (not pred_comp or pred_comp.lower() in {"unknown", "none", "null"}):
-            continue
-        if need_reason and (not pred_reason or pred_reason.lower() in {"unknown", "none", "null"}):
-            continue
 
-        match_idx = -1
-        for j, (cand_comp, cand_reason, _cand) in enumerate(pool_keys):
+        best_idx = -1
+        best_match_score = -1
+        for j, (cand_comp, cand_reason, cand_dt, _cand) in enumerate(pool_keys):
             if j in used_idx:
                 continue
-            if need_comp and pred_comp != cand_comp:
-                continue
-            if need_reason and pred_reason != cand_reason:
-                continue
-            match_idx = j
-            break
-        if match_idx < 0:
-            continue
-        matched_score = float(pool_keys[match_idx][2].get("score", 0.0) or 0.0)
-        if best_score > 0 and matched_score + score_guard < best_score:
+            match_score = 0
+            if need_comp:
+                if pred_comp and cand_comp and pred_comp == cand_comp:
+                    match_score += 4
+                else:
+                    continue
+            if need_reason:
+                if pred_reason and cand_reason and pred_reason == cand_reason:
+                    match_score += 3
+                else:
+                    continue
+            if need_time:
+                if pred_dt and cand_dt and pred_dt == cand_dt:
+                    match_score += 2
+                elif not need_comp and not need_reason:
+                    continue
+            if match_score > best_match_score:
+                best_match_score = match_score
+                best_idx = j
+        if best_idx < 0:
             continue
 
-        used_idx.add(match_idx)
-        matched = dict(pool_keys[match_idx][2])
+        matched = dict(pool_keys[best_idx][3])
+        matched_score = float(matched.get("score", 0.0) or 0.0)
+        reason_only_choice = bool(need_reason) and not bool(need_comp) and not bool(need_time)
+        if (not reason_only_choice) and best_score > 0 and matched_score + max(score_guard, 0.0) < best_score:
+            continue
+        if adapter is not None:
+            det_item = deterministic[0] if deterministic else {}
+            try:
+                ok, _why = adapter.validate_llm_candidate_adoption(
+                    proposed_component=str(matched.get("component", "") or ""),
+                    proposed_reason=str(matched.get("reason", "") or ""),
+                    deterministic_component=str(det_item.get("component", "") or ""),
+                    deterministic_reason=str(det_item.get("reason", "") or ""),
+                    context=dict(context or {}),
+                    need_comp=bool(need_comp),
+                    need_reason=bool(need_reason),
+                )
+                if not ok:
+                    continue
+            except Exception:
+                pass
+        used_idx.add(best_idx)
         matched["source"] = "counterfactual_agent_candidate_rerank"
         selected.append(matched)
         if len(selected) >= limit:
@@ -1431,30 +1318,19 @@ def _safe_prediction_to_tuples_constrained(
 
     if not selected:
         return deterministic
-
-    # Preserve required root count and deterministic coverage. The LLM can move
-    # matching candidates up, but unmatched slots are filled by BASIL order.
+    selected_keys = {
+        (str(x.get("component") or ""), str(x.get("reason") or ""), str(x.get("datetime") or ""))
+        for x in selected
+    }
     for item in pool:
         if len(selected) >= limit:
             break
-        key = (
-            str(item.get("component") or ""),
-            str(item.get("reason") or ""),
-            str(item.get("datetime") or ""),
-        )
-        if any(
-            key
-            == (
-                str(x.get("component") or ""),
-                str(x.get("reason") or ""),
-                str(x.get("datetime") or ""),
-            )
-            for x in selected
-        ):
+        key = (str(item.get("component") or ""), str(item.get("reason") or ""), str(item.get("datetime") or ""))
+        if key in selected_keys:
             continue
         selected.append(dict(item))
+        selected_keys.add(key)
     return selected[:limit] or deterministic
-
 
 def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool, int, List[str], Dict[str, int]]:
     llm_called = False
@@ -1898,7 +1774,7 @@ class IndexedEvidenceAgentRunner:
     ) -> Dict[str, Any]:
         need_time, need_comp, need_reason = _need_flags(int(task_id))
         adapter = get_dataset_adapter(str(getattr(result, "dataset", "") or ""))
-        is_market = _is_market_path(str(getattr(result, "dataset", "") or ""), adapter)
+        root_count = int(_required_root_count(result=result, instruction=str(instruction or "")))
         comp_ev = getattr(result, "component_evidence", None)
         comp_scores = dict(getattr(comp_ev, "combined_scores", {}) or {})
         if not comp_scores:
@@ -1960,8 +1836,7 @@ class IndexedEvidenceAgentRunner:
                 adapter_reason_scores = {}
                 adapter_context_overrides = {}
 
-        dataset_name = str(getattr(result, "dataset", "") or "")
-        tuple_limit = 50 if (is_market and "cloudbed-2" in dataset_name) else 20
+        tuple_limit = 50 if root_count > 1 else 20
         tuple_candidates = all_tuples[: int(tuple_limit)]
 
         component_first_times = dict(getattr(comp_ev, "first_times", {}) or {})
@@ -1977,16 +1852,15 @@ class IndexedEvidenceAgentRunner:
         if use_structured_time:
             query_start_local = str(getattr(result, "start_local", "") or "")
             query_end_local = str(getattr(result, "end_local", "") or "")
-            if is_market:
-                for item in time_candidates:
-                    if not isinstance(item, dict):
-                        continue
-                    ev = item.get("evidence")
-                    if not isinstance(ev, dict):
-                        ev = {}
-                    ev.setdefault("query_start_local", query_start_local)
-                    ev.setdefault("query_end_local", query_end_local)
-                    item["evidence"] = ev
+            for item in time_candidates:
+                if not isinstance(item, dict):
+                    continue
+                ev = item.get("evidence")
+                if not isinstance(ev, dict):
+                    ev = {}
+                ev.setdefault("query_start_local", query_start_local)
+                ev.setdefault("query_end_local", query_end_local)
+                item["evidence"] = ev
             seen_time_keys = {
                 (
                     str(item.get("datetime", "") or ""),
@@ -2014,11 +1888,7 @@ class IndexedEvidenceAgentRunner:
                         "score": max(0.05, float(comp_scores.get(c, 0.0) or 0.0) / max(max_comp_score, 1e-9)),
                         "component": c,
                         "reason": "",
-                        "evidence": (
-                            {"from_basil_first_times": True, "query_start_local": query_start_local, "query_end_local": query_end_local}
-                            if is_market
-                            else {"from_basil_first_times": True}
-                        ),
+                        "evidence": {"from_basil_first_times": True, "query_start_local": query_start_local, "query_end_local": query_end_local},
                     }
                 )
             for comp, dt in list(component_peak_times.items()):
@@ -2038,11 +1908,7 @@ class IndexedEvidenceAgentRunner:
                         "score": 0.72 * max(0.05, float(comp_scores.get(c, 0.0) or 0.0) / max(max_comp_score, 1e-9)),
                         "component": c,
                         "reason": "",
-                        "evidence": (
-                            {"from_basil_peak_times": True, "query_start_local": query_start_local, "query_end_local": query_end_local}
-                            if is_market
-                            else {"from_basil_peak_times": True}
-                        ),
+                        "evidence": {"from_basil_peak_times": True, "query_start_local": query_start_local, "query_end_local": query_end_local},
                     }
                 )
             time_candidates.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
@@ -2110,7 +1976,7 @@ class IndexedEvidenceAgentRunner:
             "llm_time_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
             "llm_verify_top_k": (
                 max(8, int(_required_root_count(result, instruction)) * 4)
-                if is_market
+                if root_count > 1
                 else max(3, int(_required_root_count(result, instruction)) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3))
             ),
             "llm_max_prompt_candidates": (
@@ -2125,9 +1991,22 @@ class IndexedEvidenceAgentRunner:
             "evidence_time_gap_threshold": 0.20,
             "basil_max_trace_rows": int(getattr(args, "basil_max_trace_rows", 0) or 0),
         }
-        if is_market:
-            context["llm_change_min_confidence"] = float(getattr(args, "llm_change_min_confidence", 0.85) or 0.85)
-            context["llm_max_score_drop_vs_det_top1"] = float(getattr(args, "llm_max_score_drop_vs_det_top1", 0.05) or 0.05)
+        context["llm_change_min_confidence"] = float(getattr(args, "llm_change_min_confidence", 0.85) or 0.85)
+        context["llm_max_score_drop_vs_det_top1"] = float(getattr(args, "llm_max_score_drop_vs_det_top1", 0.05) or 0.05)
+        if adapter is not None:
+            try:
+                plan = adapter.core_plan(
+                    task_id=int(task_id),
+                    need_time=bool(need_time),
+                    need_comp=bool(need_comp),
+                    need_reason=bool(need_reason),
+                    context=context,
+                )
+                context["dataset_skill"] = dict(adapter.skill_summary() or {})
+                context["basil_core_modules"] = dict(plan.to_dict() or {})
+            except Exception:
+                context.setdefault("dataset_skill", {})
+                context.setdefault("basil_core_modules", {})
 
         # Inject lightweight per-reason evidence from the BASIL index result.
         # In indexed mode this must not call dataset solve_reason() fallbacks:
@@ -2223,7 +2102,8 @@ class IndexedEvidenceAgentRunner:
                 return rows
 
         # ── Supplement pool: metric-scan + closed-set (universal recall fix) ──
-        if bool(need_comp) or bool(need_reason):
+        core_modules = dict((context or {}).get("basil_core_modules", {}) or {})
+        if (bool(need_comp) or bool(need_reason)) and bool(core_modules.get("typed_channel_recall", True)):
             try:
                 date_dir = str(getattr(result, "date_dir", "") or "")
                 supplement = adapter.supplement_candidate_pool(
@@ -2274,7 +2154,7 @@ class IndexedEvidenceAgentRunner:
             return list(selected or [])
         time_candidates = [x for x in list((context or {}).get("time_candidates") or []) if isinstance(x, Mapping)]
 
-        is_market = adapter.__class__.__name__ == "MarketAdapter"
+        avoid_reused_time_clusters = bool(need_time) and int((context or {}).get("required_root_count", 1) or 1) > 1
 
         def time_cluster(dt: str) -> str:
             text = str(dt or "").strip()
@@ -2291,7 +2171,7 @@ class IndexedEvidenceAgentRunner:
             if not time_candidates:
                 return ""
             filtered_time_candidates = list(time_candidates)
-            if is_market and used_clusters:
+            if avoid_reused_time_clusters and used_clusters:
                 tmp = [
                     item
                     for item in filtered_time_candidates
@@ -2332,7 +2212,7 @@ class IndexedEvidenceAgentRunner:
             comp = str(getattr(cand, "component", "") or "")
             reason = str(getattr(cand, "reason", "") or "")
             dt = pick_dt(comp, reason, used_time_clusters) if need_time else ""
-            if is_market and dt:
+            if avoid_reused_time_clusters and dt:
                 used_time_clusters.add(time_cluster(dt))
             evidence_items = [str(x) for x in list(getattr(cand, "evidence", []) or []) if str(x).strip()]
             original = next(
@@ -2410,417 +2290,34 @@ class IndexedEvidenceAgentRunner:
             args=args,
             instruction=instruction,
         )
-        pool_k = max(k, 5)
         adapter = get_dataset_adapter(str(getattr(result, "dataset", "") or ""))
-        if adapter is not None:
-            try:
-                pool_k = int(
-                    adapter.index_candidate_pool_k(
-                        task_id=int(task_id),
-                        k=int(k),
-                        default_pool_k=int(pool_k),
-                        context=dict(context or {}),
-                    )
-                )
-            except Exception:
-                pool_k = max(k, 5)
-        ds_norm = str(dataset or "").strip().lower()
-        if ds_norm.startswith("market") and int(task_id) == 6:
-            if "cloudbed-2" in ds_norm:
-                pool_k = max(pool_k, 40)
-            else:
-                pool_k = max(pool_k, 20)
-        deterministic_pool = self.deterministic_select(result=result, k=int(pool_k))
-        if bool(need_comp) and not bool(need_reason) and not bool(need_time):
-            deterministic_pool = _root_likelihood_order(deterministic_pool)
-        if bool(need_time):
-            time_pool = [dict(x) for x in list((context or {}).get("time_candidates") or []) if isinstance(x, Mapping)]
-            existing_dt = {str(x.get("datetime", "") or "") for x in list(deterministic_pool or []) if isinstance(x, Mapping)}
-            merged_time_items: List[Dict[str, Any]] = []
-            for item in time_pool:
-                dt = str(item.get("datetime", "") or "").strip()
-                if not dt or dt in existing_dt:
-                    continue
-                comp = str(item.get("component", "") or "").strip()
-                reason = str(item.get("reason", "") or "").strip()
-                if bool(need_comp) and not comp:
-                    continue
-                if bool(need_reason) and not reason and bool(need_comp):
-                    # Component+reason+time tuples should keep reason from the
-                    # candidate tuple expansion; avoid adding under-specified
-                    # time-only rows to the joint pool.
-                    continue
-                merged_time_items.append(
-                    {
-                        "component": comp,
-                        "reason": reason,
-                        "datetime": dt,
-                        "score": float(item.get("score", 0.0) or 0.0),
-                        "source": str(item.get("source", "indexed_time_candidate") or "indexed_time_candidate"),
-                        "evidence": dict(item.get("evidence", {}) or {}) if isinstance(item.get("evidence", {}), Mapping) else {},
-                    }
-                )
-                existing_dt.add(dt)
-                if len(merged_time_items) >= int(pool_k):
-                    break
-            if (not bool(need_comp) and not bool(need_reason)) or len({str(x.get("datetime", "") or "") for x in deterministic_pool}) <= 1:
-                def _time_sort_score(item: Mapping[str, Any]) -> float:
-                    if adapter is not None:
-                        try:
-                            return float(adapter._score_time_candidate(dict(item), "", ""))  # noqa: SLF001 - adapter scoring hook
-                        except Exception:
-                            pass
-                    try:
-                        return float(item.get("score", 0.0) or 0.0)
-                    except Exception:
-                        return 0.0
-
-                deterministic_pool = sorted(
-                    list(deterministic_pool or []) + merged_time_items,
-                    key=_time_sort_score,
-                    reverse=True,
-                )[: max(int(pool_k), len(merged_time_items))]
-        if bool(need_reason) and not bool(need_comp):
-            reason_scores = dict((context or {}).get("reason_scores") or {})
-            allowed_reasons = [
-                str(x).strip()
-                for x in list((context or {}).get("allowed_reasons") or [])
-                if str(x).strip()
-            ]
-            if reason_scores or allowed_reasons:
-                default_dt = str((context or {}).get("time_choice", "") or "").strip()
-                latent_time_type = ""
-                if bool(need_time) and not default_dt:
-                    for item in list((context or {}).get("time_candidates") or []):
-                        if not isinstance(item, Mapping):
-                            continue
-                        dt0 = str(item.get("datetime", "") or "").strip()
-                        if dt0:
-                            default_dt = dt0
-                            break
-                if bool(need_time) and adapter is not None:
-                    for item in list((context or {}).get("time_candidates") or []):
-                        if not isinstance(item, Mapping):
-                            continue
-                        dt0 = str(item.get("datetime", "") or "").strip()
-                        if default_dt and dt0 != default_dt:
-                            continue
-                        comp0 = str(item.get("component", "") or "").strip()
-                        if not comp0:
-                            continue
-                        try:
-                            latent_time_type = str(adapter.component_semantic_type(comp0) or "")
-                        except Exception:
-                            latent_time_type = ""
-                        if latent_time_type:
-                            break
-                max_reason_score = max([abs(float(v or 0.0)) for v in reason_scores.values()] + [1.0])
-                ordered_reasons = list(dict.fromkeys(list(allowed_reasons) + list(reason_scores.keys())))
-                reason_pool: List[Dict[str, Any]] = []
-                for rank, reason in enumerate(ordered_reasons, start=1):
-                    score = float(reason_scores.get(reason, 0.0) or 0.0) / max(max_reason_score, 1e-9)
-                    if reason not in reason_scores:
-                        score = max(score, 0.05 / float(rank))
-                    if latent_time_type and adapter is not None and score < 0.90:
-                        try:
-                            compatible = set(adapter.reason_compatible_component_types(str(reason)) or [])
-                        except Exception:
-                            compatible = set()
-                        if compatible:
-                            if latent_time_type in compatible:
-                                score += 0.65
-                            else:
-                                score *= 0.55
-                    reason_pool.append(
-                        {
-                            "component": "",
-                            "reason": reason,
-                            "datetime": default_dt if bool(need_time) else "",
-                            "score": float(score),
-                            "source": "indexed_reason_surface",
-                        }
-                    )
-                if reason_pool:
-                    deterministic_pool = sorted(
-                        reason_pool,
-                        key=lambda x: float(x.get("score", 0.0) or 0.0),
-                        reverse=True,
-                    )[: max(int(pool_k), len(reason_pool))]
-        if adapter is not None:
-            try:
-                expanded_pool = adapter.expand_index_candidate_tuples(
-                    selected=list(deterministic_pool),
-                    context=dict(context or {}),
-                    task_id=int(task_id),
-                    k=int(pool_k),
-                )
-                if isinstance(expanded_pool, list) and expanded_pool:
-                    deterministic_pool = [dict(x) for x in expanded_pool if isinstance(x, Mapping)]
-                    context["candidate_tuples"] = [dict(x) for x in deterministic_pool[:50] if isinstance(x, Mapping)]
-            except Exception:
-                pass
-        deterministic_pool = self._adapter_rerank_selected(
-            result=result,
-            task_id=int(task_id),
-            context=context,
-            selected=deterministic_pool,
-            k=int(pool_k),
-        )
-        if bool(need_time) and not bool(need_comp) and not bool(need_reason) and adapter is not None:
-            def _time_final_score(item: Mapping[str, Any]) -> float:
-                try:
-                    return float(adapter._score_time_candidate(dict(item), "", ""))  # noqa: SLF001 - adapter scoring hook
-                except Exception:
-                    try:
-                        return float(item.get("score", 0.0) or 0.0)
-                    except Exception:
-                        return 0.0
-
-            deterministic_pool = sorted(
-                [dict(x) for x in list(deterministic_pool or []) if isinstance(x, Mapping)],
-                key=_time_final_score,
-                reverse=True,
-            )
-        if ds_norm.startswith("market") and bool(need_reason):
-            allowed_components = [str(x).strip() for x in list((context or {}).get("allowed_components") or []) if str(x).strip()]
-            allowed_reasons = [str(x).strip() for x in list((context or {}).get("allowed_reasons") or []) if str(x).strip()]
-
-            components: List[str] = []
-            for item in list(deterministic_pool or []):
-                if not isinstance(item, Mapping):
-                    continue
-                c = str(item.get("component", "") or "").strip()
-                if c and c not in components:
-                    components.append(c)
-            for c in list(allowed_components):
-                if c and c not in components:
-                    components.append(c)
-            if not components:
-                components = [""]
-
-            reasons: List[str] = []
-            reason_scores = dict((context or {}).get("reason_scores") or {})
-            scored: List[tuple[float, str]] = []
-            for r in list(allowed_reasons):
-                if not r or r in reasons:
-                    continue
-                try:
-                    s = float(reason_scores.get(r, 0.0) or 0.0)
-                except Exception:
-                    s = 0.0
-                scored.append((s, r))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            for _, r in scored:
-                if r and r not in reasons:
-                    reasons.append(r)
-            if not reasons:
-                reasons = [""]
-            if adapter is not None and bool(need_reason):
-                try:
-                    taxonomy_reasons = [str(x).strip() for x in list(adapter.basil_reason_taxonomy() or []) if str(x).strip()]
-                except Exception:
-                    taxonomy_reasons = []
-                source_rows_for_reason = [dict(x) for x in list(deterministic_pool or []) if isinstance(x, Mapping)]
-                for item in source_rows_for_reason[: max(20, int(pool_k))]:
-                    c0 = str(item.get("component", "") or "").strip()
-                    metrics0 = [str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x or "").strip()]
-                    if not c0 or not metrics0:
-                        continue
-                    for r0 in taxonomy_reasons:
-                        if r0 in reasons:
-                            continue
-                        try:
-                            support = float(adapter._reason_metric_support_score(component=c0, reason=r0, metrics=metrics0))  # noqa: SLF001
-                        except Exception:
-                            support = 0.0
-                        if support >= 0.68:
-                            reasons.append(r0)
-
-            comp_scores = dict((context or {}).get("component_scores") or {})
-            max_comp = max([abs(float(v)) for v in comp_scores.values()] + [1.0]) if comp_scores else 1.0
-            max_det_score = 0.0
-            for item in list(deterministic_pool or []):
-                if not isinstance(item, Mapping):
-                    continue
-                try:
-                    max_det_score = max(max_det_score, float(item.get("score", 0.0) or 0.0))
-                except Exception:
-                    pass
-
-            top_comp_n = max(12, int(k) * 4)
-            top_reason_n = max(8, int(getattr(args, "basil_candidate_reason_top_r", 8) or 8))
-            if "cloudbed-2" in ds_norm:
-                top_reason_n = max(top_reason_n, 20)
-
-            local_reason_support: Dict[tuple[str, str], float] = {}
-            if adapter is not None:
-                source_rows = [dict(x) for x in list(deterministic_pool or []) if isinstance(x, Mapping)]
-                for item in source_rows:
-                    c0 = str(item.get("component", "") or "").strip()
-                    metrics0 = [str(x) for x in list(item.get("supporting_metrics", []) or []) if str(x or "").strip()]
-                    if not c0 or not metrics0:
-                        continue
-                    for r0 in reasons[:top_reason_n]:
-                        rr0 = str(r0 or "").strip()
-                        if not rr0:
-                            continue
-                        try:
-                            support = float(adapter._reason_metric_support_score(component=c0, reason=rr0, metrics=metrics0))  # noqa: SLF001
-                        except Exception:
-                            support = 0.0
-                        if support <= 0.0:
-                            continue
-                        key0 = (c0, rr0)
-                        local_reason_support[key0] = max(float(local_reason_support.get(key0, 0.0)), float(support))
-
-            expanded: Dict[tuple[str, str], Dict[str, Any]] = {}
-            for c in (components[:top_comp_n] if (bool(need_comp) or bool(need_time)) else [""]):
-                cs = 0.0
-                if c:
-                    try:
-                        cs = float(comp_scores.get(c, 0.0) or 0.0) / float(max(max_comp, 1e-9))
-                    except Exception:
-                        cs = 0.0
-                for r in reasons[:top_reason_n]:
-                    rr = str(r or "").strip()
-                    if bool(need_reason) and not rr:
-                        continue
-                    rs = 0.0
-                    if rr:
-                        try:
-                            rs = float(reason_scores.get(rr, 0.0) or 0.0)
-                        except Exception:
-                            rs = 0.0
-                    local_support = float(local_reason_support.get((str(c or "").strip(), rr), 0.0))
-                    score = float(0.68 * cs + 0.16 * rs + 0.42 * local_support)
-                    key = (str(c or "").strip(), rr)
-                    prev = expanded.get(key)
-                    if prev is None or float(prev.get("score", 0.0) or 0.0) < score:
-                        expanded[key] = {
-                            "component": key[0],
-                            "reason": key[1],
-                            "datetime": "",
-                            "score": float(score),
-                            "source": "market_basil_expand",
-                        }
-
-            merged: Dict[tuple[str, str], Dict[str, Any]] = {}
-            for item in list(expanded.values()) + [dict(x) for x in list(deterministic_pool or []) if isinstance(x, Mapping)]:
-                c = str(item.get("component", "") or "").strip()
-                r = str(item.get("reason", "") or "").strip()
-                key = (c, r)
-                prev = merged.get(key)
-                if prev is None or float(prev.get("score", 0.0) or 0.0) < float(item.get("score", 0.0) or 0.0):
-                    merged[key] = dict(item)
-            deterministic_pool = sorted(merged.values(), key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[
-                : max(int(pool_k), 30)
-            ]
-            deterministic_pool = self._adapter_rerank_selected(
-                result=result,
-                task_id=int(task_id),
-                context=context,
-                selected=deterministic_pool,
-                k=int(pool_k),
-            )
-            context["candidate_tuples"] = [dict(x) for x in list(deterministic_pool or [])[:50] if isinstance(x, Mapping)]
-        else:
-            context["candidate_tuples"] = [dict(x) for x in list(deterministic_pool or [])[:50] if isinstance(x, Mapping)]
-        deterministic_pool = _attach_topology_context_to_rows(
-            deterministic_pool,
+        core_output = BasilCorePipeline(
             adapter=adapter,
+            need_time=bool(need_time),
+            need_comp=bool(need_comp),
+            need_reason=bool(need_reason),
+            task_id=int(task_id),
+            k=int(k),
+            args=args,
+            result=result,
             context=context,
-        )
-        llm_only_extras = _llm_only_challenger_expansion(
-            deterministic_pool,
-            context,
-            need_time=bool(need_time),
-            need_comp=bool(need_comp),
-            need_reason=bool(need_reason),
-            max_extra=max(0, int((context or {}).get("llm_max_prompt_candidates", 6) or 6) * 3),
-        )
-        llm_prompt_pool = list(deterministic_pool or []) + list(llm_only_extras or [])
-        if llm_only_extras:
-            llm_prompt_pool = _attach_topology_context_to_rows(
-                llm_prompt_pool,
-                adapter=adapter,
-                context=context,
-            )
-        context["candidate_tuples"] = [dict(x) for x in list(llm_prompt_pool or [])[:80] if isinstance(x, Mapping)]
-        context["llm_only_challenger_count"] = int(len(llm_only_extras or []))
-        context["candidate_tuples_ranked"] = True
-        deterministic = deterministic_pool[: max(1, int(k))]
-        if (
-            "cloudbed-2" in ds_norm
-            and bool(need_time)
-            and not bool(need_comp)
-            and not bool(need_reason)
-            and int(k) > 1
-        ):
-            def _parse_dt_for_order(item: Mapping[str, Any]) -> int:
-                text = str(item.get("datetime", "") or "").strip()
-                try:
-                    from datetime import datetime
-
-                    return int(datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp())
-                except Exception:
-                    return 10**18
-
-            deterministic = sorted([dict(x) for x in deterministic if isinstance(x, Mapping)], key=_parse_dt_for_order)
-        if int(task_id) == 6 and int(k) > 1:
-            adapter = get_dataset_adapter(str(getattr(result, "dataset", "") or ""))
-            if adapter is not None:
-                fn = getattr(adapter, "select_multi_root_joint_tuples", None)
-                if callable(fn):
-                    try:
-                        selected = fn(items=list(deterministic_pool), k=int(k), task_id=int(task_id), context=dict(context or {}))
-                        if isinstance(selected, list) and selected:
-                            deterministic = [dict(x) for x in selected if isinstance(x, Mapping)]
-                    except Exception:
-                        pass
-        if ds_norm.startswith("market") and adapter is not None and bool(need_comp) and bool(need_reason) and bool(need_time):
-            try:
-                adjusted = adapter.postprocess_output_tuples(
-                    deterministic,
-                    context=dict(context or {}),
-                    need_comp=True,
-                    need_reason=True,
-                    need_time=True,
-                )
-                if isinstance(adjusted, list) and adjusted:
-                    deterministic = [dict(x) for x in adjusted if isinstance(x, Mapping)]
-            except Exception:
-                pass
-        pool_diagnostics = _candidate_pool_diagnostics(
-            llm_prompt_pool,
-            context=context,
-            need_time=bool(need_time),
-            need_comp=bool(need_comp),
-            need_reason=bool(need_reason),
-        )
-        coverage_plan = _coverage_aware_challenger_keys(
-            llm_prompt_pool,
-            context,
-            need_time=bool(need_time),
-            need_comp=bool(need_comp),
-            need_reason=bool(need_reason),
-            max_keys=int((context or {}).get("llm_max_prompt_candidates", 6) or 6),
-        )
-        pool_diagnostics["coverage_aware_agent"] = dict(coverage_plan.get("coverage") or {})
-        context["coverage_aware_agent"] = dict(coverage_plan.get("coverage") or {})
-        intervention_plan = _intervention_challenger_plan(
-            llm_prompt_pool,
-            context,
-            need_time=bool(need_time),
-            need_comp=bool(need_comp),
-            need_reason=bool(need_reason),
-            max_keys=int((context or {}).get("llm_max_prompt_candidates", 6) or 6),
-        )
-        pool_diagnostics["intervention_agent"] = {
-            "call_llm": bool(intervention_plan.get("call_llm")),
-            "reason": str(intervention_plan.get("reason", "") or ""),
-            "profiles": list(intervention_plan.get("profiles") or [])[:6],
-        }
-        context["intervention_agent"] = dict(pool_diagnostics["intervention_agent"])
+            deterministic_select=self.deterministic_select,
+            root_order=_root_likelihood_order,
+            adapter_rerank=self._adapter_rerank_selected,
+            attach_topology=_attach_topology_context_to_rows,
+            llm_extra=_llm_only_challenger_expansion,
+            diagnostics=_candidate_pool_diagnostics,
+            coverage=_coverage_aware_challenger_keys,
+            intervention=_intervention_challenger_plan,
+        ).build()
+        deterministic_pool = core_output.deterministic_pool
+        deterministic = core_output.deterministic
+        llm_prompt_pool = core_output.llm_prompt_pool
+        llm_only_extras = core_output.llm_only_extras
+        pool_diagnostics = core_output.pool_diagnostics
+        coverage_plan = core_output.coverage_plan
+        intervention_plan = core_output.intervention_plan
+        context.update(dict(core_output.context or {}))
         max_prompt_keys = int((context or {}).get("llm_max_prompt_candidates", 6) or 6)
 
         def _key_sig(key: Mapping[str, Any]) -> tuple[str, str, str]:

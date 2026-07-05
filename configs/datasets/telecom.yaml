@@ -5,6 +5,28 @@ dataset: Telecom
 # configuration is independent, but no new adapter is registered for Telecom.
 adapter: telecom
 
+skill:
+  evidence_sources:
+    metric: true
+    trace: true
+    log: false
+    topology: true
+  modules:
+    typed_channel_recall: true
+    metric_reason_evidence: true
+    log_reason_evidence: false
+    causal_topology: true
+    causal_time_selector: true
+    bounded_llm_rerank: true
+    trace_evidence: true
+  component_types:
+    node:
+      patterns: ["os_*"]
+    container:
+      patterns: ["docker_*"]
+    db:
+      patterns: ["db_*"]
+
 index:
   type: basil_telecom_existing
   cache:

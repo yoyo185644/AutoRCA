@@ -16,3 +16,18 @@ paths:
   telemetry_root: dataset/{dataset}/telemetry
   query: dataset/{dataset}/query.csv
   record: dataset/{dataset}/record.csv
+
+skill:
+  evidence_sources:
+    metric: true
+    trace: true
+    log: false
+    topology: true
+  modules:
+    typed_channel_recall: true
+    metric_reason_evidence: true
+    log_reason_evidence: false
+    causal_topology: true
+    causal_time_selector: true
+    bounded_llm_rerank: true
+    trace_evidence: true

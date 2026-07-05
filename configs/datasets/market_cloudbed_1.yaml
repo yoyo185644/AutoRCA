@@ -4,6 +4,28 @@ dataset: Market/cloudbed-1
 adapter: market
 timezone: Asia/Shanghai
 
+skill:
+  evidence_sources:
+    metric: true
+    trace: true
+    log: true
+    topology: true
+  modules:
+    typed_channel_recall: true
+    metric_reason_evidence: true
+    log_reason_evidence: true
+    causal_topology: true
+    causal_time_selector: true
+    bounded_llm_rerank: true
+    trace_evidence: true
+  component_types:
+    node:
+      patterns: ["node-*"]
+    container:
+      patterns: ["*-0", "*-1", "*-2", "*-3"]
+    service:
+      patterns: ["*service", "*service2", "*.ts"]
+
 paths:
   telemetry_root: dataset/{dataset}/telemetry
 
