@@ -326,6 +326,26 @@ def extract_anomaly_segments(
     )
     from rca.common.io import resolve_date_dir
 
+    # NOTE: an earlier version of this function canonicalized raw component
+    # identities (parse_component_id) here to fix fragmentation (the same
+    # logical service scattered across many raw aliases diluting its score
+    # below the top-K cutoff). That was reverted: canonicalizing at this
+    # stage merges METRIC-derived segments (severity roughly in [0, ~few])
+    # with TRACE-derived segments for names that only coincide with each
+    # other AFTER canonicalization (e.g. metric-side "node-6.checkoutservice-0"
+    # and trace-side "checkoutservice-0" were distinct raw names, and only
+    # collide once both are canonicalized). AnomalySegmentIndex.local_scores()
+    # takes max(severity) across signal types for a component, and trace
+    # severity is on a completely different, uncalibrated scale (observed
+    # values like 68.76 vs metric severity's ~1.0 ceiling) -- so components
+    # that happen to coincide across signal types after canonicalization win
+    # purely from scale contamination, not real anomaly signal. Measured on a
+    # 55-row Market/cloudbed-1 sample: 18 rows regressed vs 4 improved
+    # (mean score 0.379 -> 0.205) with canonicalization enabled here, so it
+    # was reverted. If component-name fragmentation needs fixing again, it
+    # should be done downstream of signal-type-aware scoring (e.g. inside
+    # AnomalySegmentIndex, after per-signal-type normalization), not here.
+
     date_dir, start, end = parse_time_window_generic(instruction)
     date_dir = resolve_date_dir(dataset, date_dir)
     metric_dir = os.path.join("dataset", dataset, "telemetry", date_dir, "metric")
@@ -619,7 +639,9 @@ def extract_trace_topology_edges(
     if not os.path.exists(trace_path):
         return []
     try:
-        edge_df = TelemetryCache.get_topology_edges(dataset, date_dir, trace_path, max_rows=max_rows)
+        edge_df = TelemetryCache.get_topology_edges(
+            dataset, date_dir, trace_path, max_rows=max_rows, window_start_s=int(start_s), window_end_s=int(end_s)
+        )
     except Exception:
         return []
     if edge_df.empty:
@@ -631,11 +653,17 @@ def extract_trace_topology_edges(
         return []
 
     edge_counts: Counter[Tuple[str, str, str]] = Counter()
-    for _, row in edge_df.iterrows():
-        src = str(row.get("src") or "").strip()
-        dst = str(row.get("dst") or "").strip()
-        edge_type = str(row.get("edge_type") or "").strip()
-        count = int(row.get("support_count") or 0)
+    grouped = (
+        edge_df.assign(
+            src=edge_df["src"].astype(str).str.strip(),
+            dst=edge_df["dst"].astype(str).str.strip(),
+            edge_type=edge_df["edge_type"].astype(str).str.strip(),
+        )
+        .groupby(["src", "dst", "edge_type"], observed=True)["support_count"]
+        .sum()
+    )
+    for (src, dst, edge_type), count in grouped.items():
+        count = int(count or 0)
         if src and dst and edge_type and src != dst and count > 0:
             edge_counts[(src, dst, edge_type)] += count
 

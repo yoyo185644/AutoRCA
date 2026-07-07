@@ -243,13 +243,35 @@ def _metric_component_scores(
             continue
         if long.empty:
             continue
-        p95 = long.groupby(["component", "metric"], as_index=False)["value"].quantile(0.95).rename(columns={"value": "p95"})
+        # Robust deviation scoring: (value - median) / scale, where scale is the
+        # metric's own IQR (p75-p25) normally, but falls back to the metric's own
+        # historical "big excursion" size (p99 - median) when the IQR is degenerate
+        # (near-zero). A plain p95-ratio with a flat epsilon fallback (the old
+        # approach) makes near-always-zero counters (e.g. pgmajfault, which can be
+        # 0 at both p50 and p95 for a given component) blow up to the max clipped
+        # score on ANY nonzero blip, letting them dominate top_metrics regardless
+        # of whether that blip is actually large relative to the metric's own
+        # historical spikes. Falling back to p99-median instead of a flat 1.0
+        # keeps the scale tied to what "big" actually looks like for that metric.
+        # Single vectorized multi-quantile groupby (fast) instead of four separate
+        # per-group Python lambdas (which is materially slower on large files).
+        qs = long.groupby(["component", "metric"])["value"].quantile([0.25, 0.5, 0.75, 0.99]).unstack()
+        qs.columns = ["p25", "median", "p75", "p99"]
+        baseline = qs.reset_index()
+        baseline["iqr"] = (baseline["p75"] - baseline["p25"]).abs()
+        baseline["fallback_scale"] = (baseline["p99"] - baseline["median"]).abs()
+        eps = 1e-6
+        degenerate = baseline["iqr"] <= eps
+        baseline["scale"] = baseline["iqr"].where(~degenerate, baseline["fallback_scale"])
+        # still-degenerate metrics (constant even at p99, e.g. always exactly 0)
+        # get a small absolute floor so they can still register, but not explode.
+        baseline["scale"] = baseline["scale"].where(baseline["scale"].abs() > eps, 1.0)
+
         win = long[(long["ts_s"] >= start_s) & (long["ts_s"] <= end_s)].copy()
         if win.empty:
             continue
-        win = win.merge(p95, on=["component", "metric"], how="left").dropna(subset=["p95"]).copy()
-        denom = win["p95"].abs().where(win["p95"].abs() > 1e-6, 1.0)
-        win["breach_ratio"] = (win["value"] - win["p95"]) / denom
+        win = win.merge(baseline[["component", "metric", "median", "scale"]], on=["component", "metric"], how="left").dropna(subset=["median", "scale"]).copy()
+        win["breach_ratio"] = (win["value"] - win["median"]) / (win["scale"].abs() + eps)
         win["breach_ratio"] = win["breach_ratio"].clip(lower=0.0, upper=10.0)
         win = win[win["breach_ratio"] > 0].copy()
         if win.empty:

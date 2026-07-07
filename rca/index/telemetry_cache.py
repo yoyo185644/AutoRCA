@@ -35,12 +35,39 @@ def _cached_header(path: str) -> List[str]:
     return list(_HEADER_CACHE[key])
 
 
-def _chunk_merge_topology(trace_path: str, *, max_rows: Optional[int] = None) -> pd.DataFrame:
-    """Vectorize edge counting and compress dtypes; output is identical to row-wise counting."""
+def _chunk_merge_topology(
+    trace_path: str,
+    *,
+    max_rows: Optional[int] = None,
+    window_start_s: Optional[int] = None,
+    window_end_s: Optional[int] = None,
+    window_pad_s: int = 1800,
+) -> pd.DataFrame:
+    """Vectorize edge counting and compress dtypes; output is identical to row-wise counting.
+
+    When window_start_s/window_end_s are given, chunks entirely before the
+    (padded) window are read but skip the expensive merge/groupby work, and
+    reading stops once several CONSECUTIVE chunks have landed entirely after
+    the window. Trace files here are roughly, but not strictly, time-ordered
+    (buffered writes can locally reorder a handful of rows), so we require
+    multiple consecutive past-window chunks -- not just one -- before
+    bailing out, to avoid silently dropping real in-window edges due to a
+    single out-of-order chunk. This replaces an earlier idea of just capping
+    total rows read (nrows=N): a flat row cap would read a fixed PREFIX of
+    the file regardless of where the query window falls, so any window later
+    in the day would silently lose almost all topology edges. Early-exiting
+    by time instead preserves correctness for windows at any time of day
+    while still avoiding a full-day scan when the window is early.
+    """
     c = TelemetryCache._trace_columns(trace_path)
     needed = [x for x in [c["ts"], c["trace"], c["component"], c["span"], c["parent"], c["ds"], c["service"]] if x]
     if not needed or not c["component"]:
         return pd.DataFrame(columns=["minute", "src", "dst", "edge_type", "support_count"])
+
+    has_window = window_start_s is not None and window_end_s is not None and bool(c["ts"])
+    win_lo = float(window_start_s) - float(window_pad_s) if has_window else None
+    win_hi = float(window_end_s) + float(window_pad_s) if has_window else None
+    consecutive_past_window = 0
 
     edge_counts: Counter[Tuple[int, str, str, str]] = Counter()
     for chunk in TelemetryCache._read_csv_chunks(trace_path, usecols=needed, chunksize=TelemetryCache._chunk_size, nrows=max_rows):
@@ -57,6 +84,21 @@ def _chunk_merge_topology(trace_path: str, *, max_rows: Optional[int] = None) ->
         else:
             chunk = chunk.copy()
             chunk["minute"] = 0
+
+        if has_window and not chunk.empty:
+            chunk_min_s = float(chunk["minute"].min())
+            chunk_max_s = float(chunk["minute"].max())
+            if chunk_min_s > win_hi:
+                consecutive_past_window += 1
+                if consecutive_past_window >= 3:
+                    break
+            else:
+                consecutive_past_window = 0
+            if chunk_max_s < win_lo:
+                # Entirely before the window: cheap to skip the merge/groupby
+                # work below, still counts as "not past the window" so we
+                # don't accidentally trip the early-exit counter on it.
+                continue
 
         if c["trace"] and c["span"] and c["parent"] and all(x in chunk.columns for x in [c["trace"], c["span"], c["parent"], c["component"]]):
             child = chunk[[c["trace"], c["span"], c["parent"], c["component"], "minute"]].dropna().copy()
@@ -100,15 +142,24 @@ def _chunk_merge_topology(trace_path: str, *, max_rows: Optional[int] = None) ->
     return pd.DataFrame(rows)
 
 
-def _get_topology_edges(trace_path: str, *, max_rows: Optional[int] = None) -> pd.DataFrame:
+def _get_topology_edges(
+    trace_path: str,
+    *,
+    max_rows: Optional[int] = None,
+    window_start_s: Optional[int] = None,
+    window_end_s: Optional[int] = None,
+) -> pd.DataFrame:
     """
     Return topology edges for trace_path.
     Computes once per process, caches in-process for subsequent queries.
     """
     row_cap = int(max_rows or 0)
-    key = str(trace_path) if row_cap <= 0 else f"{str(trace_path)}::max_rows={row_cap}"
+    win_key = f"::win={int(window_start_s)}-{int(window_end_s)}" if window_start_s is not None and window_end_s is not None else ""
+    key = f"{str(trace_path)}{win_key}" if row_cap <= 0 else f"{str(trace_path)}::max_rows={row_cap}{win_key}"
     if key not in _TOPOLOGY_CACHE:
-        _TOPOLOGY_CACHE[key] = _chunk_merge_topology(str(trace_path), max_rows=max_rows)
+        _TOPOLOGY_CACHE[key] = _chunk_merge_topology(
+            str(trace_path), max_rows=max_rows, window_start_s=window_start_s, window_end_s=window_end_s
+        )
     return _TOPOLOGY_CACHE[key]
 
 
@@ -121,7 +172,7 @@ class TelemetryCache:
     """
 
     _trace_minute_p95: Dict[Tuple[str, str], pd.DataFrame] = {}
-    _topology_edges: Dict[Tuple[str, str, int], pd.DataFrame] = {}
+    _topology_edges: Dict[Tuple[str, str, int, Tuple[Optional[int], Optional[int]]], pd.DataFrame] = {}
     _metric_scores: Dict[Tuple[str, str], pd.DataFrame] = {}
     _chunk_size = 500_000
 
@@ -139,11 +190,16 @@ class TelemetryCache:
         date_dir: str,
         trace_path: str,
         max_rows: Optional[int] = None,
+        window_start_s: Optional[int] = None,
+        window_end_s: Optional[int] = None,
     ) -> pd.DataFrame:
         row_cap = int(max_rows or 0)
-        key = (str(dataset), str(date_dir), row_cap)
+        win_key = (int(window_start_s), int(window_end_s)) if window_start_s is not None and window_end_s is not None else (None, None)
+        key = (str(dataset), str(date_dir), row_cap, win_key)
         if key not in cls._topology_edges:
-            cls._topology_edges[key] = cls._compute_topology_edges(trace_path, max_rows=max_rows)
+            cls._topology_edges[key] = cls._compute_topology_edges(
+                trace_path, max_rows=max_rows, window_start_s=window_start_s, window_end_s=window_end_s
+            )
         return cls._topology_edges[key]
 
     @classmethod
@@ -250,8 +306,16 @@ class TelemetryCache:
         return result.sort_values(["minute", "component"]).reset_index(drop=True)
 
     @classmethod
-    def _compute_topology_edges(cls, trace_path: str, max_rows: Optional[int] = None) -> pd.DataFrame:
-        return _get_topology_edges(trace_path, max_rows=max_rows)
+    def _compute_topology_edges(
+        cls,
+        trace_path: str,
+        max_rows: Optional[int] = None,
+        window_start_s: Optional[int] = None,
+        window_end_s: Optional[int] = None,
+    ) -> pd.DataFrame:
+        return _get_topology_edges(
+            trace_path, max_rows=max_rows, window_start_s=window_start_s, window_end_s=window_end_s
+        )
 
     @classmethod
     def _compute_metric_scores(cls, metric_paths: Iterable[str]) -> pd.DataFrame:

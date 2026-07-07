@@ -32,6 +32,42 @@ class CandidateEvidence:
 
 
 @dataclass(frozen=True)
+class ReasonEvidence:
+    """Deviation/rank/contrast-based reason evidence -- replaces the old
+    "does a reason keyword appear in this component's top-8 anomalous
+    metrics" binary check, which turned out to be non-discriminative: during
+    a real incident, CPU/memory/disk metrics on the same host frequently
+    breach together, so multiple *different* reason labels on the *same*
+    component (and even on different, wrong components) would all come back
+    "matches" with similar hit counts -- verified empirically on Bank row1
+    (Redis02/"high memory usage" and IG01/"high disk I/O read usage" both
+    scored hits=3 with the old check, giving no way to tell them apart).
+
+    This version scores each reason by the actual deviation magnitude of its
+    metric group (not just presence/absence), ranks that reason against every
+    other known reason on the same component, and -- when a candidate list is
+    supplied -- percentile-ranks it against the other candidates' own claimed
+    (component, reason) pairs. `support` collapses these into one label so a
+    consuming agent has a clear signal, but the raw numbers are also exposed
+    so the agent (or a human) can second-guess the label.
+    """
+
+    component: str
+    reason: str
+    reason_known: bool
+    support: str
+    reason_deviation: float
+    reason_rank_on_component: int
+    gap_to_second_reason: float
+    cross_candidate_percentile: Optional[float]
+    matched_metrics: List[Dict[str, Any]] = field(default_factory=list)
+    competing_reasons: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class TimeEvidence:
     datetime: str
     source: str
@@ -363,12 +399,304 @@ def _trace_minute_summary(
 
 
 _REASON_TOKENS: Dict[str, List[str]] = {
+    # Telecom
     "network loss": ["loss", "drop", "retrans", "timeout", "reset", "error"],
     "network delay": ["tnsping", "ping", "rtt", "latency", "delay"],
     "db connection limit": ["login", "session", "sess", "tps", "exec", "connection", "conn"],
     "db close": ["on_off", "logout", "disconnect", "hang", "shutdown", "restart", "close", "reset"],
     "CPU fault": ["proc", "cpu", "load", "iowait", "util"],
+    # Bank -- previously missing entirely, so the reason-consistency check was
+    # a silent no-op for every Bank query (verified empirically: zero
+    # evidence_for/evidence_against lines for any of these 8 labels).
+    "JVM Out of Memory (OOM) Heap": ["jvm", "heap", "oom", "gc", "outofmemory"],
+    "high CPU usage": ["cpu", "util", "load", "processor"],
+    "high JVM CPU load": ["jvm", "cpu", "load", "util"],
+    "high disk I/O read usage": ["disk", "read", "r_s", "rkb", "await", "svctm", "io"],
+    "high disk space usage": ["disk", "space", "used", "usage", "fs_"],
+    "high memory usage": ["mem", "memory", "rss", "used"],
+    "network latency": ["latency", "delay", "rtt", "ping"],
+    "network packet loss": ["loss", "drop", "packet", "retrans"],
+    # Market/cloudbed -- also previously missing (except a couple entries
+    # duplicated from the out-of-sync copy in rca/index/indexes.py).
+    "container CPU load": ["container", "cpu", "util", "load"],
+    "container memory load": ["container", "mem", "memory", "rss"],
+    "container network latency": ["container", "latency", "delay", "rtt"],
+    "container network packet corruption": ["container", "corrupt", "checksum", "crc", "error"],
+    "container network packet retransmission": ["container", "retrans", "retry"],
+    "container packet loss": ["container", "loss", "drop", "packet"],
+    "container process termination": ["container", "restart", "kill", "terminate", "exit", "oom"],
+    "container read I/O load": ["container", "read", "r_s", "rkb", "io"],
+    "container write I/O load": ["container", "write", "w_s", "wkb", "io"],
+    "node CPU load": ["node", "cpu", "load", "util"],
+    "node CPU spike": ["node", "cpu", "spike", "load", "util"],
+    "node disk read I/O consumption": ["node", "disk", "read", "r_s", "rkb", "io"],
+    "node disk space consumption": ["node", "disk", "space", "used", "usage", "fs_"],
+    "node disk write I/O consumption": ["node", "disk", "write", "w_s", "wkb", "io"],
+    "node memory consumption": ["node", "mem", "memory", "rss"],
 }
+
+# Same vocabulary, exposed under the name used by the deviation-based reason
+# evidence path below. Deliberately the *same dict object* (not a copy) so it
+# cannot independently drift out of sync the way the old evidence_builder /
+# indexes.py copies did.
+REASON_METRIC_GROUPS: Dict[str, List[str]] = _REASON_TOKENS
+
+# Each dataset only ever uses its own small reason vocabulary (verified
+# against every dataset's record.csv). Reason-ranking has to be restricted to
+# this per-dataset subset, not the full 28-label union across all 4 datasets
+# -- otherwise e.g. Market-only labels like "container read I/O load" (whose
+# tokens include the 2-char substring "io", which matches unrelated Bank
+# metrics like "CPUWio") end up "winning" the ranking on Bank components purely
+# from token collisions, even though that reason could never actually apply
+# there. Confirmed empirically: without this restriction, Bank's Redis02 and
+# IG01 both ranked "container read I/O load" above their own true reason.
+DATASET_REASON_VOCAB: Dict[str, Tuple[str, ...]] = {
+    "Bank": (
+        "JVM Out of Memory (OOM) Heap",
+        "high CPU usage",
+        "high JVM CPU load",
+        "high disk I/O read usage",
+        "high disk space usage",
+        "high memory usage",
+        "network latency",
+        "network packet loss",
+    ),
+    "Telecom": (
+        "CPU fault",
+        "db close",
+        "db connection limit",
+        "network delay",
+        "network loss",
+    ),
+    "Market": (
+        "container CPU load",
+        "container memory load",
+        "container network latency",
+        "container network packet corruption",
+        "container network packet retransmission",
+        "container packet loss",
+        "container process termination",
+        "container read I/O load",
+        "container write I/O load",
+        "node CPU load",
+        "node CPU spike",
+        "node disk read I/O consumption",
+        "node disk space consumption",
+        "node disk write I/O consumption",
+        "node memory consumption",
+    ),
+}
+
+
+def _reason_vocab_for_dataset(dataset: str) -> Tuple[str, ...]:
+    ds = str(dataset or "")
+    if ds.startswith("Market"):
+        return DATASET_REASON_VOCAB["Market"]
+    if ds in DATASET_REASON_VOCAB:
+        return DATASET_REASON_VOCAB[ds]
+    # Unknown dataset name -- fall back to the full vocabulary rather than
+    # silently scoring nothing.
+    return tuple(REASON_METRIC_GROUPS.keys())
+
+# Thresholds for build_reason_evidence()'s `support` label. "strong" requires
+# the queried reason to be the single best-fitting reason on this component by
+# a clear margin, and (if peer candidates were supplied) to also stand out
+# against them -- not just "some tokens matched somewhere".
+_REASON_STRONG_GAP = 1.0
+_REASON_STRONG_PERCENTILE = 0.8
+
+# A few reason labels are compound concepts: they only make sense if BOTH a
+# domain marker AND a symptom marker are present on the same metric, not
+# either one alone. Plain OR-token matching made these indistinguishable from
+# their non-JVM counterpart: on real Bank data "high JVM CPU load" and "high
+# CPU usage" scored identically on Redis02 (a non-JVM component) because both
+# token lists share "cpu"/"load"/"util", so a generic OS-level CPU metric
+# satisfied "JVM CPU load" even with zero actual JVM metrics in the match.
+# These reasons require a match from every one of the listed token groups
+# instead of any token from a single flat list.
+_REASON_TOKEN_GROUPS_AND: Dict[str, Tuple[List[str], ...]] = {
+    "high JVM CPU load": (["jvm"], ["cpu", "load", "util"]),
+    "JVM Out of Memory (OOM) Heap": (["jvm"], ["heap", "oom", "gc", "outofmemory"]),
+}
+
+
+def _metric_matches_reason(metric_name: str, reason: str) -> bool:
+    m = str(metric_name or "").lower()
+    and_groups = _REASON_TOKEN_GROUPS_AND.get(str(reason or ""))
+    if and_groups:
+        return all(any(t and t.lower() in m for t in group) for group in and_groups)
+    tokens = REASON_METRIC_GROUPS.get(str(reason or ""), [])
+    return any(t and t.lower() in m for t in tokens)
+
+
+@lru_cache(maxsize=64)
+def _metric_baseline_stats_cached(dataset: str, date_dir: str) -> pd.DataFrame:
+    """Per (component, metric) robust baseline center/spread -- median and IQR
+    -- computed from that metric's own full-day distribution.
+
+    This replaces p95-ratio as the normalization used for reason-evidence
+    scoring. p95-ratio, (value - p95)/p95, is not comparable across metric
+    types: a percent-of-100 metric that's already sitting at a high baseline
+    (e.g. MEMUsedMemPerc) has structurally little room to post a large
+    *relative* breach even during a real incident, while an already-near-zero
+    metric (e.g. iowait%) can show a huge relative multiple for a modest
+    absolute move. Verified on real Bank data: Redis02's true root cause,
+    "high memory usage", scored lower under breach_ratio than "high CPU
+    usage" on the same component/window, purely from this scale mismatch, not
+    because memory was actually less anomalous. A median/IQR z-score puts
+    every metric on the same "how many of its own typical spreads away from
+    its own typical value" scale before anything gets compared.
+    """
+    long = _metric_long_cached(dataset, date_dir)
+    if long.empty:
+        return pd.DataFrame(columns=["component", "metric", "median", "iqr"])
+    g = long.groupby(["component", "metric"])["value"]
+    median = g.median().rename("median")
+    p25 = g.quantile(0.25).rename("p25")
+    p75 = g.quantile(0.75).rename("p75")
+    stats = pd.concat([median, p25, p75], axis=1).reset_index()
+    stats["iqr"] = (stats["p75"] - stats["p25"]).abs()
+    return stats[["component", "metric", "median", "iqr"]]
+
+
+@lru_cache(maxsize=512)
+def _component_all_metric_deviation_cached(dataset: str, date_dir: str, component: str, start_s: int, end_s: int) -> Dict[str, float]:
+    """Mean robust z-score, |value - own_median| / (own_iqr + eps), per metric
+    name, for ALL of a component's metrics in the window -- not capped to a
+    top-K picked by overall magnitude the way `_pick_metrics_for_component`
+    is. Reason-group membership has to be checked against the full metric
+    set, otherwise a genuinely reason-relevant metric that didn't make some
+    unrelated top-8 cut would silently score as "no evidence" for its own
+    reason. Using each metric's own median/IQR (instead of a shared p95-ratio)
+    is what makes scores comparable across metric types -- see
+    `_metric_baseline_stats_cached` docstring for why that matters.
+    """
+    metric_long = _metric_long_cached(dataset, date_dir)
+    baseline = _metric_baseline_stats_cached(dataset, date_dir)
+    comp_s = str(component or "").strip()
+    if metric_long.empty or baseline.empty or not comp_s:
+        return {}
+    win = metric_long[
+        (metric_long["component"] == comp_s) & (metric_long["ts_s"] >= int(start_s)) & (metric_long["ts_s"] <= int(end_s))
+    ].copy()
+    if win.empty:
+        return {}
+    win = win.merge(baseline, on=["component", "metric"], how="left").dropna(subset=["median", "iqr"]).copy()
+    eps = 1e-6
+    # Only the "elevated above normal" direction counts -- these are all
+    # resource-usage reasons ("high X usage"), a value dropping below its
+    # median is not evidence for any of them.
+    win["z"] = ((win["value"] - win["median"]) / (win["iqr"].abs() + eps)).clip(lower=0.0, upper=20.0)
+    by = win.groupby("metric", as_index=False)["z"].mean()
+    return {str(r["metric"]): float(r["z"]) for _, r in by.iterrows()}
+
+
+@lru_cache(maxsize=512)
+def _component_reason_scores_cached(dataset: str, date_dir: str, component: str, start_s: int, end_s: int) -> Dict[str, Dict[str, Any]]:
+    """For every known reason label, how strongly does this component's
+    metric deviation pattern support it: mean z-score across that reason's
+    matched metrics (0.0 if none matched), plus the matched metrics
+    themselves sorted by deviation magnitude. This is the per-component
+    scoreboard that reason_rank_on_component / gap_to_second_reason /
+    competing_reasons are all read from.
+    """
+    deviation_map = _component_all_metric_deviation_cached(dataset, date_dir, component, start_s, end_s)
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in _reason_vocab_for_dataset(dataset):
+        matched = [(m, v) for m, v in deviation_map.items() if _metric_matches_reason(m, r)]
+        matched.sort(key=lambda mv: mv[1], reverse=True)
+        score = (sum(v for _m, v in matched) / len(matched)) if matched else 0.0
+        out[r] = {"score": float(score), "matched": matched}
+    return out
+
+
+def _reason_support_label(rank: int, gap: float, percentile: Optional[float], own_score: float) -> str:
+    if own_score <= 0.0:
+        return "not_supported"
+    if rank == 1 and gap >= _REASON_STRONG_GAP and (percentile is None or percentile >= _REASON_STRONG_PERCENTILE):
+        return "strong"
+    if rank <= 2:
+        return "weak"
+    return "not_supported"
+
+
+def build_reason_evidence(
+    *,
+    dataset: str,
+    instruction: str,
+    component: str,
+    reason: str,
+    all_candidates: Sequence[Tuple[str, str]] = (),
+    top_matched_metrics: int = 5,
+) -> ReasonEvidence:
+    """Test whether `reason` is the metric-group that most strongly and
+    distinctly explains `component`'s anomalous behavior in the instruction's
+    time window -- as opposed to the old check of "did any of this reason's
+    keywords appear in whatever 8 metrics happened to deviate most overall".
+
+    `all_candidates` (optional list of (component, reason) pairs, e.g. the
+    full candidate pool) lets this also report `cross_candidate_percentile`:
+    where this specific (component, reason) pair's own deviation score falls
+    among every other candidate's own claimed (component, reason) deviation
+    score. That is what actually answers "is Redis02's memory anomaly more
+    extreme than IG01's disk anomaly", not just "does Redis02 have some
+    memory-looking metric".
+    """
+    date_dir, start, end = parse_time_window_generic(instruction)
+    date_dir = resolve_date_dir(dataset, date_dir)
+    start_s = int(start.tz_convert("UTC").timestamp())
+    end_s = int(end.tz_convert("UTC").timestamp())
+
+    comp_s = str(component or "").strip()
+    reason_s = str(reason or "").strip()
+    reason_known = reason_s in REASON_METRIC_GROUPS
+
+    scores = _component_reason_scores_cached(str(dataset or ""), date_dir, comp_s, start_s, end_s)
+    own = scores.get(reason_s, {"score": 0.0, "matched": []})
+    own_score = float(own.get("score", 0.0) or 0.0)
+    own_matched = list(own.get("matched", []) or [])[: max(1, int(top_matched_metrics))]
+
+    ranked = sorted(scores.items(), key=lambda kv: float(kv[1].get("score", 0.0) or 0.0), reverse=True)
+    rank = next((i for i, (r, _info) in enumerate(ranked, start=1) if r == reason_s), len(ranked) + 1)
+
+    competing = [
+        {"reason": r, "score": round(float(info.get("score", 0.0) or 0.0), 4)}
+        for r, info in ranked
+        if r != reason_s
+    ][:3]
+    second_best_score = float(competing[0]["score"]) if competing else 0.0
+    gap = round(own_score - second_best_score, 4)
+
+    cross_candidate_percentile: Optional[float] = None
+    if all_candidates:
+        peer_scores: List[float] = []
+        for cand_comp, cand_reason in all_candidates:
+            cand_comp_s = str(cand_comp or "").strip()
+            if not cand_comp_s:
+                continue
+            try:
+                peer_map = _component_reason_scores_cached(str(dataset or ""), date_dir, cand_comp_s, start_s, end_s)
+            except Exception:
+                continue
+            peer_scores.append(float((peer_map.get(str(cand_reason or "").strip(), {}) or {}).get("score", 0.0) or 0.0))
+        if peer_scores:
+            at_or_below = sum(1 for s in peer_scores if s <= own_score)
+            cross_candidate_percentile = round(at_or_below / float(len(peer_scores)), 4)
+
+    support = _reason_support_label(rank, gap, cross_candidate_percentile, own_score)
+
+    return ReasonEvidence(
+        component=comp_s,
+        reason=reason_s,
+        reason_known=bool(reason_known),
+        support=support,
+        reason_deviation=round(own_score, 4),
+        reason_rank_on_component=int(rank),
+        gap_to_second_reason=float(gap),
+        cross_candidate_percentile=cross_candidate_percentile,
+        matched_metrics=[{"metric": m, "breach_ratio": round(float(v), 4)} for m, v in own_matched],
+        competing_reasons=competing,
+    )
 
 
 def build_candidate_evidence(

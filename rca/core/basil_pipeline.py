@@ -114,7 +114,10 @@ class BasilCorePipeline:
         self.context["llm_only_challenger_count"] = int(len(extras or []))
         self.context["candidate_tuples_ranked"] = True
 
-        deterministic = list(pool or [])[: self.k]
+        if self.need_comp and self.k >= 2:
+            deterministic = self._diverse_top_k_by_component(list(pool or []), k=self.k)
+        else:
+            deterministic = list(pool or [])[: self.k]
         if self.need_comp and not self.need_reason and not self.need_time:
             deterministic = self.root_order(deterministic)[: self.k]
 
@@ -124,6 +127,7 @@ class BasilCorePipeline:
             need_time=self.need_time,
             need_comp=self.need_comp,
             need_reason=self.need_reason,
+            preview_n=int((self.context or {}).get("candidate_pool_preview_n", 8) or 8),
         )
         coverage_plan = self.coverage(
             prompt_pool,
@@ -449,7 +453,70 @@ class BasilCorePipeline:
         return pool
 
     def _sort_time_only(self, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return sorted([dict(x) for x in list(pool or []) if isinstance(x, Mapping)], key=self._time_score, reverse=True)
+        # NOTE: candidates for a time-only query come from multiple sources
+        # with un-calibrated raw "score" scales (e.g. "metric_change_point"
+        # time-candidates start around 0.82-0.98, while general BASIL
+        # hypothesis candidates use an unrelated scale that can independently
+        # land higher or lower). `_time_score` (via the adapter's
+        # `_score_time_candidate`) is the actual weighted function that
+        # determines ranking here, but it used to be used ONLY as a sort key
+        # -- the stale, incomparable raw "score" stayed on each item and kept
+        # flowing downstream into the LLM prompt pool, the uncertainty gate's
+        # top1/top2 comparison, and the field-level adoption's score_drop
+        # check. That let a lower-ranked, wrong-source candidate look
+        # "higher scored" than the correctly-ranked top1 to anything reading
+        # the raw score field, even though the real ranking (computed here)
+        # already had it right. (Observed on Market/cloudbed-1 row 15,
+        # task_1: node-5 correctly ranked first by _time_score, but
+        # adservice2's stale raw "basil_hypothesis" score of 0.5 made it look
+        # better than node-5's stale raw "metric_change_point" score of
+        # 0.4325 to the LLM verifier, which adopted the wrong datetime.)
+        # Persist the calibrated score back onto each item so every
+        # downstream consumer compares apples to apples.
+        items = [dict(x) for x in list(pool or []) if isinstance(x, Mapping)]
+        for item in items:
+            item["score"] = float(self._time_score(item))
+        return sorted(items, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+
+    def _diverse_top_k_by_component(self, pool: List[Dict[str, Any]], *, k: int) -> List[Dict[str, Any]]:
+        """Pick the top-k final candidates preferring a distinct component per
+        slot before falling back to repeats.
+
+        A plain `pool[:k]` slice (the pool is expanded/reranked through many
+        stages by this point, and stays score-sorted) can hand back the SAME
+        component twice when the query needs >=2 root causes -- e.g. a node's
+        "disk read" and "disk write" candidates can both legitimately outscore
+        every other component, collapsing two supposedly independent
+        incidents into one component predicted twice. Since separate
+        incidents are almost always distinct components, we fill slots by
+        first-seen distinct component, and only allow a repeat once there
+        aren't enough distinct components left to fill every slot.
+        """
+        items = [dict(x) for x in list(pool or []) if isinstance(x, Mapping)]
+        k = max(1, int(k))
+        if k < 2 or len(items) <= k:
+            return items[:k]
+
+        selected: List[Dict[str, Any]] = []
+        used_components: set[str] = set()
+        deferred: List[Dict[str, Any]] = []
+        for item in items:
+            comp = str(item.get("component", "") or "").strip()
+            comp_key = comp or str(item.get("family", "") or (service_base(comp) if comp else ""))
+            if comp_key and comp_key in used_components:
+                deferred.append(item)
+                continue
+            selected.append(item)
+            if comp_key:
+                used_components.add(comp_key)
+            if len(selected) >= k:
+                break
+        if len(selected) < k:
+            for item in deferred:
+                selected.append(item)
+                if len(selected) >= k:
+                    break
+        return selected[:k]
 
     def _component_evidence_rows(self, pool: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []

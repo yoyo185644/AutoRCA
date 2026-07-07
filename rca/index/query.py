@@ -667,7 +667,26 @@ def _evidence_cache_path(cfg: BasilQueryConfig, *, dataset: str, incident_id: st
         "dataset": str(dataset),
         "incident_id": str(incident_id),
         "params": dict(params or {}),
-        "cache_version": 2,
+        # Bump this whenever anomaly-segment/component-scoring logic changes
+        # (breach_ratio formula, component-name canonicalization, reason
+        # scoring inputs, etc.) -- otherwise a stale on-disk cache entry from
+        # before the change silently keeps serving old results forever, no
+        # matter what the code does, since the cache key doesn't otherwise
+        # encode the code version. Was 2 for a long time; bumped to 3 for the
+        # breach_ratio z-score/IQR fix + component-name canonicalization in
+        # extract_anomaly_segments; bumped to 4 after fixing
+        # MarketAdapter.parse_component_id's .ts/-grpc/:port branch (see
+        # market.py); bumped to 5 after REVERTING the component-name
+        # canonicalization inside extract_anomaly_segments -- measured on a
+        # 55-row Market/cloudbed-1 sample it caused 18 regressions vs 4
+        # improvements (mean score 0.379 -> 0.205), because it merged
+        # metric-derived and trace-derived segments (different, uncalibrated
+        # severity scales) under names that only collided after
+        # canonicalization. See the comment in extract_anomaly_segments for
+        # the full mechanism. parse_component_id's own .ts/-grpc/:port fix
+        # (cache_version 4) stays, since it's still correct for whatever
+        # else calls parse_component_id directly.
+        "cache_version": 5,
     }
     digest = hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     return os.path.join(str(cfg.memory_cache_dir), _cache_dataset_name(dataset), f"{digest}.json")

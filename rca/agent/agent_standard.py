@@ -201,6 +201,26 @@ def _timing_step(
         "llm_changed_count",
         "llm_veto_count",
         "llm_adopted_count",
+        "agent_loop_turns_used",
+        "agent_loop_inspected_count",
+        "agent_loop_comparisons_count",
+        "agent_loop_actions",
+        "llm_verify_error",
+        "llm_decide_component",
+        "llm_decide_reason",
+        "llm_decide_datetime",
+        "llm_rationale",
+        "llm_decisive_evidence",
+        "llm_adopted_fields",
+        "llm_rejected_fields",
+        "llm_component_evidence_gain",
+        "llm_reason_evidence_gain",
+        "gate_top1_score",
+        "gate_top2_score",
+        "gate_score_gap",
+        "gate_reasons",
+        "gate_consistency_accept",
+        "evidence_consistency_gate",
         "needs_component",
         "needs_reason",
         "needs_time",
@@ -321,6 +341,34 @@ class BasilIndexStrategy:
 
         trajectory: List[Any] = []
         trajectory.extend(list(decision.trajectory or []))
+
+        pool_diag = dict(decision.candidate_pool_diagnostics or {})
+        # When the uncertainty gate itself decides need_llm=False, execution
+        # returns straight from indexed_evidence_agent.py with a trajectory
+        # step {"action":"uncertainty_gate","output":{top1_score,top2_score,
+        # score_gap,reasons,...}} -- but that path never calls
+        # _collect_agent_stats (only reached once agent.run() is actually
+        # invoked), so those numbers previously never reached
+        # candidate_pool_diagnostics/CSV at all. A row with poor deterministic
+        # accuracy and llm_gate_called=False was otherwise unexplainable --
+        # pull them out here so they always surface regardless of whether the
+        # LLM ended up being called.
+        for step in decision.trajectory or []:
+            if not isinstance(step, Mapping):
+                continue
+            if str(step.get("action") or "") != "uncertainty_gate":
+                continue
+            gate_out = step.get("output")
+            if isinstance(gate_out, Mapping):
+                pool_diag.setdefault("gate_top1_score", float(gate_out.get("top1_score", 0.0) or 0.0))
+                pool_diag.setdefault("gate_top2_score", float(gate_out.get("top2_score", 0.0) or 0.0))
+                pool_diag.setdefault("gate_score_gap", float(gate_out.get("score_gap", 0.0) or 0.0))
+                try:
+                    pool_diag.setdefault("gate_reasons", json.dumps(list(gate_out.get("reasons") or []), ensure_ascii=False))
+                except Exception:
+                    pass
+            break
+
         trajectory.append(
             _timing_step(
                 strategy=self.name,
@@ -334,7 +382,7 @@ class BasilIndexStrategy:
                 postprocess_seconds=post_seconds,
                 llm_input_tokens=int(decision.input_tokens),
                 llm_called=bool(decision.llm_called),
-                candidate_pool_diagnostics=dict(decision.candidate_pool_diagnostics or {}),
+                candidate_pool_diagnostics=pool_diag,
             )
         )
         return ExecutionResult(prediction=str(pred), trajectory=trajectory, prompt=list(decision.prompt or []))
@@ -526,14 +574,27 @@ class FieldSolverStrategy:
                 "enable_uncertainty_llm": True,
                 "enable_time_llm": bool(getattr(args, "time_llm", False)),
                 "deterministic_only": False,
+                "force_llm_verify": bool(getattr(args, "llm_verify_all_candidates", False)),
+                "agent_loop_verify": bool(getattr(args, "agent_loop_verify", False)),
+                "agent_loop_max_turns": int(getattr(args, "agent_loop_max_turns", 5) or 5),
+                "tool_agent_verify": bool(getattr(args, "tool_agent_verify", False)),
+                "tool_agent_max_turns": int(getattr(args, "tool_agent_max_turns", 6) or 6),
                 "llm_uncertain_gap_threshold": float(getattr(args, "evidence_score_gap_threshold", 0.15) or 0.15),
                 "llm_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
                 "llm_time_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
-                "llm_verify_top_k": max(3, int(k_fail) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)),
+                "llm_verify_top_k": (
+                    len(pool)
+                    if bool(getattr(args, "llm_verify_all_candidates", False))
+                    else max(3, int(k_fail) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3))
+                ),
                 "llm_max_prompt_candidates": (
-                    min(8, max(len(reasons), int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)))
-                    if bool(need_reason) and not bool(need_comp)
-                    else min(8, max(5, int(k_fail) * 4))
+                    max(1, len(pool))
+                    if bool(getattr(args, "llm_verify_all_candidates", False))
+                    else (
+                        min(8, max(len(reasons), int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)))
+                        if bool(need_reason) and not bool(need_comp)
+                        else min(8, max(5, int(k_fail) * 4))
+                    )
                 ),
                 "evidence_score_gap_threshold": float(getattr(args, "evidence_score_gap_threshold", 0.15) or 0.15),
                 "evidence_top1_score_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),

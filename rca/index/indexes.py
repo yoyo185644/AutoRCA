@@ -16,16 +16,39 @@ from rca.index.schemas import (
 
 
 REASON_TOKENS: Dict[str, List[str]] = {
+    # Kept in sync with rca/execution/evidence_builder.py::_REASON_TOKENS --
+    # these two dicts used to diverge (this one had 10 keys, the evidence
+    # builder's copy had only 5, and neither covered Bank/Market's actual
+    # reason vocabulary), which meant reason-consistency scoring/evidence was
+    # silently a no-op for most datasets. Update both together.
     "network loss": ["loss", "drop", "retrans", "timeout", "reset", "error"],
     "network delay": ["tnsping", "ping", "rtt", "latency", "delay"],
     "db connection limit": ["login", "session", "sess", "tps", "exec", "connection", "conn"],
     "db close": ["close", "disconnect", "logout", "on_off", "shutdown", "restart"],
     "CPU fault": ["cpu", "load", "iowait", "proc", "util"],
-    "high memory usage": ["mem", "memory", "rss", "heap", "oom"],
-    "container memory load": ["container", "mem", "memory", "rss", "heap", "oom"],
-    "node memory consumption": ["node", "mem", "memory", "rss", "heap", "oom"],
-    "node CPU load": ["node", "cpu", "load", "util"],
+    "JVM Out of Memory (OOM) Heap": ["jvm", "heap", "oom", "gc", "outofmemory"],
+    "high CPU usage": ["cpu", "util", "load", "processor"],
+    "high JVM CPU load": ["jvm", "cpu", "load", "util"],
+    "high disk I/O read usage": ["disk", "read", "r_s", "rkb", "await", "svctm", "io"],
+    "high disk space usage": ["disk", "space", "used", "usage", "fs_"],
+    "high memory usage": ["mem", "memory", "rss", "heap", "oom", "used"],
+    "network latency": ["latency", "delay", "rtt", "ping"],
+    "network packet loss": ["loss", "drop", "packet", "retrans"],
     "container CPU load": ["container", "cpu", "load", "util"],
+    "container memory load": ["container", "mem", "memory", "rss", "heap", "oom"],
+    "container network latency": ["container", "latency", "delay", "rtt"],
+    "container network packet corruption": ["container", "corrupt", "checksum", "crc", "error"],
+    "container network packet retransmission": ["container", "retrans", "retry"],
+    "container packet loss": ["container", "loss", "drop", "packet"],
+    "container process termination": ["container", "restart", "kill", "terminate", "exit", "oom"],
+    "container read I/O load": ["container", "read", "r_s", "rkb", "io"],
+    "container write I/O load": ["container", "write", "w_s", "wkb", "io"],
+    "node CPU load": ["node", "cpu", "load", "util"],
+    "node CPU spike": ["node", "cpu", "spike", "load", "util"],
+    "node disk read I/O consumption": ["node", "disk", "read", "r_s", "rkb", "io"],
+    "node disk space consumption": ["node", "disk", "space", "used", "usage", "fs_"],
+    "node disk write I/O consumption": ["node", "disk", "write", "w_s", "wkb", "io"],
+    "node memory consumption": ["node", "mem", "memory", "rss", "heap", "oom"],
 }
 
 

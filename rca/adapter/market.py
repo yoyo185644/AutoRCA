@@ -159,8 +159,21 @@ class MarketAdapter(DatasetAdapter):
         if self._preserve_service_instance_output() and c.endswith("-http"):
             return re.sub(r"-http$", "", c)
         if re.search(r"\.ts(?::\d+)?$", c) or re.search(r":\d+$", c) or c.endswith("-grpc"):
-            base = service_base(c)
-            return base or c
+            # Strip only the decorative protocol/port suffix here (".ts",
+            # ":PORT", "-grpc"), not the aggressive service_base() collapse
+            # that used to run in this branch. service_base() strips ANY
+            # trailing "-N", which is correct for genuine pod/replica noise
+            # but wrong for this dataset's many sibling deployments whose
+            # "-N" IS their real identity -- record.csv for cloudbed-1 has
+            # "shippingservice", "shippingservice-1", and "shippingservice2-0"
+            # as three separate, valid ground-truth components (same for
+            # cartservice/frontend/recommendationservice/etc.), so collapsing
+            # them here made ~40%+ of service-level answers unreachable no
+            # matter how good the underlying anomaly scoring was.
+            c2 = re.sub(r"\.ts(?::\d+)?$", "", c)
+            c2 = re.sub(r":\d+$", "", c2)
+            c2 = re.sub(r"-grpc$", "", c2)
+            return c2 or c
         c = re.sub(r"(\.ts|-grpc)$", "", c)
         c = re.sub(r"^frontend(\d+)-\d+$", r"frontend-\1", c)
         return c
@@ -1313,74 +1326,82 @@ class MarketAdapter(DatasetAdapter):
         return "cloudbed-2" in str(self.dataset or "").strip().lower()
 
     def _reason_metric_support_score(self, *, component: str, reason: str, metrics: Sequence[str]) -> float:
+        """How strongly this component's *actually anomalous* metrics support `reason`.
+
+        `metrics` arrives already ranked by breach_ratio -- most anomalous
+        first (see `component_candidates.py`'s top_metrics construction,
+        which sorts by `breach_ratio` before truncating to top-K). That rank
+        is the only per-metric magnitude signal available at this layer
+        without threading raw breach_ratio values through several more call
+        sites, so matches are weighted by position instead of counted as a
+        flat, unordered bag.
+
+        This replaces an earlier version that only checked whether a
+        reason's keywords appeared *anywhere* in the (unweighted) metric-name
+        list, then applied hardcoded per-reason-family boosts (e.g. "if this
+        component has >=2 memory-family metric names, floor memory's score at
+        0.72+") regardless of whether those metrics were actually near the
+        top of the anomaly ranking. On real cloudbed-1 data this meant
+        near-universal cgroup counters like `container_memory_failures.*
+        .pgfault`/`pgmajfault` -- which exist on essentially every container
+        by schema, not just anomalous ones -- silently pushed "memory"/"cpu"/
+        "read"/"write"/"disk space" reasons to a high floor for almost any
+        component. Worse, those boost branches only existed for that
+        five-family list -- network-family reasons (packet loss/
+        retransmission/corruption/latency) had no equivalent floor at all,
+        an unintentional asymmetry that made every network-caused incident
+        in this dataset systematically lose to a memory/disk-io guess.
+        Rank-weighting removes the need for any of those hardcoded floors:
+        a reason only scores high if its keywords hit the metrics that are
+        actually closest to the top of this component's own anomaly
+        ranking, for every reason family alike.
+        """
         reason = self.parse_root_cause_label(str(reason or ""))
         if not reason:
             return 0.0
-        blob = " ".join(str(x).lower() for x in list(metrics or []) if str(x or "").strip())
-        if not blob:
+        rows = [str(m or "").lower() for m in list(metrics or []) if str(m or "").strip()]
+        if not rows:
             return 0.0
         keywords = [str(x).lower() for x in self.reason_metric_keywords(reason) if str(x or "").strip()]
         if not keywords:
             return 0.0
-        hit_weight = 0.0
-        for tok in keywords:
-            if tok not in blob:
-                continue
-            weight = 1.0
-            if tok in {"read", "write", "retrans", "corrupt", "loss", "restart", "termination"}:
-                weight = 1.6
-            if tok in {"io", "iops", "diskio", "blkio"}:
-                weight = 1.3
-            hit_weight += weight
-        # A metric name containing a concrete channel marker is stronger than
-        # a generic token match such as "io" on a broad node metric.
-        comp_type = self.component_semantic_type(component)
-        if comp_type in {"container", "service"} and any(tok in blob for tok in ["container_", "pod_", "fs_reads", "fs_writes", "network_", "grpc"]):
-            hit_weight += 0.8
-        if comp_type == "node" and any(tok in blob for tok in ["system.io", "system.cpu", "system.mem", "system.net"]):
-            hit_weight += 0.35
-        support = hit_weight / max(2.5, float(len(keywords)))
 
-        # Calibrate keyword hits by metric-family density.  A single CPU token
-        # mixed into mostly network/I/O node metrics should not outrank a
-        # container whose local metrics are consistently CPU-related.  This is
-        # schema-based and does not use query labels.
-        rows = [str(m or "").lower() for m in list(metrics or []) if str(m or "").strip()]
-        cpu_hits = sum(1 for m in rows if any(tok in m for tok in ["cpu", "cfs", "throttled", "load"]))
-        mem_hits = sum(1 for m in rows if any(tok in m for tok in ["mem", "memory", "rss", "pgfault", "pgmajfault", "heap"]))
-        read_hits = sum(1 for m in rows if any(tok in m for tok in ["r_await", "r_s", "rkb", "read", "reads", "fs_reads"]))
-        write_hits = sum(1 for m in rows if any(tok in m for tok in ["w_await", "w_s", "wkb", "write", "writes", "fs_writes"]))
-        net_hits = sum(1 for m in rows if any(tok in m for tok in ["net.", "network", "tcp", "udp", "retrans", "packet"]))
-        capacity_hits = sum(1 for m in rows if any(tok in m for tok in ["filesystem", "fs_usage", "inode", "disk.used", "readonly", "avg_q", "svctm", "util"]))
-        total_hits = max(1, cpu_hits + mem_hits + read_hits + write_hits + net_hits + capacity_hits)
-        rnorm = norm_token(reason)
-        if "cpu" in rnorm:
-            density = cpu_hits / float(total_hits)
-            if comp_type == "node" and (cpu_hits < 2 or density < 0.34):
-                support *= 0.62
-            elif comp_type in {"container", "service"} and cpu_hits >= 2:
-                support = max(support, 0.78 + 0.04 * min(cpu_hits, 4))
-        elif "memory" in rnorm:
-            density = mem_hits / float(total_hits)
-            if mem_hits < 2 or density < 0.28:
-                support *= 0.70
-            else:
-                support = max(support, 0.72 + 0.04 * min(mem_hits, 4))
-        elif "read" in rnorm:
-            if read_hits <= 0:
-                support *= 0.45
-            else:
-                support = max(support, 0.72 + 0.05 * min(read_hits, 4))
-        elif "write" in rnorm:
-            if write_hits <= 0:
-                support *= 0.45
-            else:
-                support = max(support, 0.72 + 0.05 * min(write_hits, 4))
-        elif "disk space" in rnorm:
-            if capacity_hits <= 0:
-                support *= 0.55
-            else:
-                support = max(support, 0.70 + 0.04 * min(capacity_hits, 4))
+        rank_weight = 0.0
+        matched_any = False
+        for idx, m in enumerate(rows):
+            position_w = 1.0 / (1.0 + idx)  # rank 0 (most anomalous) -> 1.0, rank 7 -> 0.125
+            for tok in keywords:
+                if tok not in m:
+                    continue
+                matched_any = True
+                tok_w = 1.0
+                if tok in {"read", "write", "retrans", "corrupt", "loss", "restart", "termination"}:
+                    tok_w = 1.3
+                if tok in {"io", "iops", "diskio", "blkio"}:
+                    tok_w = 1.15
+                rank_weight += position_w * tok_w
+                break  # one match per metric is enough signal from that metric
+
+        if not matched_any:
+            return 0.0
+
+        # Normalize against the best achievable rank-weight (matching the #1
+        # metric with the strongest token weight) so the result stays in a
+        # comparable [0, 1] range regardless of how many keywords a given
+        # reason happens to have.
+        support = min(1.0, rank_weight / 1.3)
+
+        # Mild component-type compatibility check -- a reason whose expected
+        # component type doesn't match the candidate is still penalized, but
+        # this only nudges the magnitude-driven score, it does not override it
+        # with a hardcoded floor the way the old per-family branches did.
+        try:
+            expected = set(self.reason_compatible_component_types(reason) or [])
+            ctype = str(self.component_semantic_type(component) or "")
+            if expected and ctype:
+                support *= 1.1 if ctype in expected else 0.7
+        except Exception:
+            pass
         return max(0.0, min(1.0, support))
 
     def _row_rootness_values(self, row: Mapping[str, Any], *, context: Mapping[str, Any]) -> Dict[str, float]:

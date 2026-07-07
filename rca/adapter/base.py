@@ -466,6 +466,23 @@ class DatasetAdapter:
                     pass
             else:
                 score = 0.50 * base_norm
+                # NOTE: an earlier version of this branch added a Market-only
+                # bounded term here (0.20 * component_local_metric_evidence)
+                # to ground task_2/4/6/7 reason-path scoring in real
+                # breach-ratio telemetry evidence instead of pure keyword/
+                # prior matching. It was trialed on Market/cloudbed-1's
+                # task_2 rows (10-row sample): it changed which WRONG
+                # candidate won on 3/10 rows but never surfaced the correct
+                # answer, because most of that sample's ground-truth reasons
+                # were network packet corruption/retransmission/latency or
+                # process termination -- categories with no signal in a
+                # metric-breach-ratio-derived evidence function (which is
+                # tuned for CPU/memory/disk-style numeric metrics). No
+                # regressions were observed, but with zero measured benefit
+                # it was reverted rather than kept as unproven complexity.
+                # If revisited, the real gap is trace/log-derived evidence
+                # for network- and process-lifecycle-type reasons, not more
+                # metric-based grounding.
             if bool(need_comp) and not (bool(need_comp) and not bool(need_reason) and not bool(need_time)):
                 score += 0.25 * comp_norm
             if bool(need_reason):

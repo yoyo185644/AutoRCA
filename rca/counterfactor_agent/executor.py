@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from rca.api_router import get_chat_completion
 from rca.adapter.registry import get_dataset_adapter
-from rca.execution.evidence_builder import build_candidate_evidence
+from rca.adapter.utils.time_candidates import TimeCandidate
+from rca.execution.evidence_builder import build_candidate_evidence, build_time_evidence, build_reason_evidence
 from .schemas import CandidateHypothesis, CounterfactualCheck, DeterministicEvidence
 from .utils import ensure_list, normalize_score, safe_json_loads
 
@@ -377,6 +378,68 @@ def _pairwise_counterfactual_tests(candidate_payload: List[Dict[str, Any]]) -> L
     return tests[:4]
 
 
+def _compare_two_candidates(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Generic pairwise comparison card between any two candidate payloads.
+
+    Same heuristics as `_pairwise_counterfactual_tests` (which is hardwired to
+    "top1 vs every challenger"), but usable for an arbitrary pair -- this is
+    what the multi-turn agent loop's `compare` action calls on demand."""
+
+    view_a = dict(a.get("intervention_view", {}) or {})
+    view_b = dict(b.get("intervention_view", {}) or {})
+
+    def f(view: Mapping[str, Any], key: str) -> float:
+        try:
+            return float(view.get(key, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    deltas = {
+        "local_evidence": round(f(view_b, "local_evidence") - f(view_a, "local_evidence"), 3),
+        "reason_metric_match": round(f(view_b, "reason_metric_match") - f(view_a, "reason_metric_match"), 3),
+        "causal_source": round(f(view_b, "causal_source") - f(view_a, "causal_source"), 3),
+        "symptom_risk": round(f(view_b, "symptom_risk") - f(view_a, "symptom_risk"), 3),
+        "intervention_score": round(f(view_b, "intervention_score") - f(view_a, "intervention_score"), 3),
+    }
+    b_advantages: List[str] = []
+    a_advantages: List[str] = []
+    if deltas["local_evidence"] >= 0.15:
+        b_advantages.append("stronger component-local evidence")
+    elif deltas["local_evidence"] <= -0.15:
+        a_advantages.append("stronger component-local evidence")
+    if deltas["reason_metric_match"] >= 0.50:
+        b_advantages.append("reason better supported by metrics")
+    elif deltas["reason_metric_match"] <= -0.50:
+        a_advantages.append("reason better supported by metrics")
+    if deltas["causal_source"] >= 0.15:
+        b_advantages.append("more plausible causal source")
+    elif deltas["causal_source"] <= -0.15:
+        a_advantages.append("more plausible causal source")
+    if deltas["symptom_risk"] <= -0.20:
+        b_advantages.append("lower downstream/global symptom risk")
+    elif deltas["symptom_risk"] >= 0.20:
+        a_advantages.append("lower downstream/global symptom risk")
+
+    suggested = "keep_a"
+    if len(b_advantages) >= 2 and deltas["intervention_score"] >= -0.05:
+        suggested = "prefer_b"
+    elif deltas["intervention_score"] >= 0.12 and b_advantages:
+        suggested = "prefer_b"
+
+    return {
+        "a_id": int(a.get("id", 0) or 0),
+        "b_id": int(b.get("id", 0) or 0),
+        "deltas_b_minus_a": deltas,
+        "b_advantages": b_advantages,
+        "a_advantages": a_advantages,
+        "suggested": suggested,
+        "evidence_comparison": {
+            "a": _explainable_evidence_snippet(a),
+            "b": _explainable_evidence_snippet(b),
+        },
+    }
+
+
 class CounterfactualExecutor:
     """
     Executor 负责具体动作执行：
@@ -437,6 +500,89 @@ class CounterfactualExecutor:
             self.logger.info(f"[Executor] LLM response received. elapsed_seconds={elapsed:.6f}")
         return content
 
+    @staticmethod
+    def _dedupe_candidate_pool(cands: List[CandidateHypothesis]) -> List[CandidateHypothesis]:
+        """Collapse exact (component, reason, datetime) duplicates, keeping the
+        highest-scored copy at its first-seen position.
+
+        Candidate expansion can legitimately emit the same tuple more than once
+        from different expansion paths (e.g. dimension recombination), which
+        just wastes menu slots and dilutes the agent-loop's attention across
+        rows that carry zero additional information."""
+        best: Dict[tuple, CandidateHypothesis] = {}
+        order: List[tuple] = []
+        for cand in cands:
+            key = (str(cand.component), str(cand.reason), str(getattr(cand, "datetime", "") or ""))
+            if key not in best:
+                best[key] = cand
+                order.append(key)
+            elif float(cand.score) > float(best[key].score):
+                best[key] = cand
+        return [best[k] for k in order]
+
+    def _build_candidate_payload_entry(
+        self,
+        *,
+        cand: CandidateHypothesis,
+        candidate_id: int,
+        next_score: float,
+        instruction: str,
+        dataset_name: str,
+        context: Dict[str, Any],
+        all_components: List[str],
+    ) -> Dict[str, Any]:
+        """Build one candidate's compact evidence card (component/reason/datetime
+        summary + metric/trace/topology digest). Shared by the single-shot
+        bounded verifier and the multi-turn agent loop's on-demand `inspect`
+        action, so evidence is computed identically in both paths."""
+        enable_trace = bool(context.get("enable_trace_evidence", True))
+        if not bool(context.get("llm_build_raw_evidence", False)):
+            ev = {
+                "component": str(cand.component),
+                "reason": str(cand.reason),
+                "datetime": str(getattr(cand, "datetime", "") or ""),
+                "score": float(cand.score),
+                "score_gap_vs_next": max(0.0, float(cand.score) - float(next_score)),
+                "metric_timeline": [],
+                "trace_timeline": [],
+                "causal_evidence": {},
+                "evidence_for": [str(x) for x in list(cand.evidence or [])[:6]],
+                "evidence_against": [],
+            }
+        else:
+            try:
+                ev = build_candidate_evidence(
+                    dataset=dataset_name,
+                    instruction=instruction,
+                    component=str(cand.component),
+                    reason=str(cand.reason),
+                    score=float(cand.score),
+                    score_gap_vs_next=max(0.0, float(cand.score) - float(next_score)),
+                    all_candidate_components=all_components,
+                    topology_max_rows=context.get("basil_max_trace_rows"),
+                    enable_trace=bool(enable_trace),
+                ).to_dict()
+            except Exception:
+                ev = {
+                    "component": str(cand.component),
+                    "reason": str(cand.reason),
+                    "datetime": str(getattr(cand, "datetime", "") or ""),
+                    "score": float(cand.score),
+                    "score_gap_vs_next": max(0.0, float(cand.score) - float(next_score)),
+                    "metric_timeline": [],
+                    "trace_timeline": [],
+                    "causal_evidence": {},
+                    "evidence_for": [str(x) for x in list(cand.evidence or [])[:6]],
+                    "evidence_against": ["Evidence builder failed; fallback to indexed candidate summary."],
+                }
+        compact_ev = _compact_candidate_evidence(ev, candidate_id=candidate_id)
+        compact_ev["datetime"] = str(getattr(cand, "datetime", "") or compact_ev.get("datetime", "") or "")
+        if list(getattr(cand, "evidence", []) or []):
+            compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:8]]
+        compact_ev["intervention_view"] = _intervention_view(compact_ev)
+        compact_ev["field_evidence"] = _field_evidence_card(compact_ev)
+        return compact_ev
+
     def select_best_candidate_with_llm(
         self,
         instruction: str,
@@ -447,62 +593,30 @@ class CounterfactualExecutor:
         top_k: int = 3,
     ) -> Dict[str, Any]:
         context = context or {}
-        max_prompt_candidates = min(8, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
+        if bool(context.get("force_llm_verify", False)):
+            # Experimental "give the agent every candidate" mode: no top-8 cap.
+            max_prompt_candidates = max(1, int(context.get("llm_max_prompt_candidates", len(candidates or [])) or len(candidates or [])))
+        else:
+            max_prompt_candidates = min(8, max(1, int(context.get("llm_max_prompt_candidates", top_k) or top_k)))
         top = list(candidates or [])[: max_prompt_candidates]
         if not top:
             raise ValueError("No candidates for LLM verification.")
-        enable_trace = bool(context.get("enable_trace_evidence", True))
 
         candidate_payload: List[Dict[str, Any]] = []
         all_components = [str(c.component) for c in list(candidates or []) if str(getattr(c, "component", "") or "").strip()]
         for i, cand in enumerate(top, start=1):
             next_score = float(top[i].score) if i < len(top) else 0.0
-            if not bool(context.get("llm_build_raw_evidence", False)):
-                ev = {
-                    "component": str(cand.component),
-                    "reason": str(cand.reason),
-                    "datetime": str(getattr(cand, "datetime", "") or ""),
-                    "score": float(cand.score),
-                    "score_gap_vs_next": max(0.0, float(cand.score) - next_score),
-                    "metric_timeline": [],
-                    "trace_timeline": [],
-                    "causal_evidence": {},
-                    "evidence_for": [str(x) for x in list(cand.evidence or [])[:6]],
-                    "evidence_against": [],
-                }
-            else:
-                try:
-                    ev = build_candidate_evidence(
-                        dataset=dataset_name,
-                        instruction=instruction,
-                        component=str(cand.component),
-                        reason=str(cand.reason),
-                        score=float(cand.score),
-                        score_gap_vs_next=max(0.0, float(cand.score) - next_score),
-                        all_candidate_components=all_components,
-                        topology_max_rows=context.get("basil_max_trace_rows"),
-                        enable_trace=bool(enable_trace),
-                    ).to_dict()
-                except Exception:
-                    ev = {
-                        "component": str(cand.component),
-                        "reason": str(cand.reason),
-                        "datetime": str(getattr(cand, "datetime", "") or ""),
-                        "score": float(cand.score),
-                        "score_gap_vs_next": max(0.0, float(cand.score) - next_score),
-                        "metric_timeline": [],
-                        "trace_timeline": [],
-                        "causal_evidence": {},
-                        "evidence_for": [str(x) for x in list(cand.evidence or [])[:6]],
-                        "evidence_against": ["Evidence builder failed; fallback to indexed candidate summary."],
-                    }
-            compact_ev = _compact_candidate_evidence(ev, candidate_id=i)
-            compact_ev["datetime"] = str(getattr(cand, "datetime", "") or compact_ev.get("datetime", "") or "")
-            if list(getattr(cand, "evidence", []) or []):
-                compact_ev["candidate_summary_evidence"] = [str(x) for x in list(getattr(cand, "evidence", []) or [])[:8]]
-            compact_ev["intervention_view"] = _intervention_view(compact_ev)
-            compact_ev["field_evidence"] = _field_evidence_card(compact_ev)
-            candidate_payload.append(compact_ev)
+            candidate_payload.append(
+                self._build_candidate_payload_entry(
+                    cand=cand,
+                    candidate_id=i,
+                    next_score=next_score,
+                    instruction=instruction,
+                    dataset_name=dataset_name,
+                    context=context,
+                    all_components=all_components,
+                )
+            )
 
         uncertainty = dict(context.get("uncertainty_gate", {}) or {})
         evidence_conflict = dict(uncertainty.get("evidence_conflict", {}) or {})
@@ -625,8 +739,16 @@ that field compared with candidate #1: 0 means no gain, 1 means decisive gain.
             "confidence": normalize_score(data.get("confidence", selected.score)),
             "rationale": str(data.get("rationale", "")).strip(),
             "conflict_resolution": str(data.get("conflict_resolution", "") or "").strip(),
-            "change_from_top1": bool(data.get("change_from_top1", selected_id != 1)),
-            "top1_falsified": bool(data.get("top1_falsified", selected_id != 1)),
+            "change_from_top1": bool(selected_id != 1 or data.get("change_from_top1", False)),
+            # An objective fact (a different candidate id was actually
+            # selected) must not be overridden by the model's own,
+            # separately-filled top1_falsified flag saying otherwise -- that
+            # flag can only ever add True, never take away a real difference.
+            # Seen on a real Bank run: the model picked a different component
+            # with strong, well-reasoned evidence but still wrote
+            # top1_falsified=false, which used to silently block every field
+            # from being adopted regardless of how good the evidence was.
+            "top1_falsified": bool(selected_id != 1 or data.get("top1_falsified", False)),
             "falsification_reason": str(data.get("falsification_reason", "") or "").strip(),
             "top1_intervention_score": normalize_score(data.get("top1_intervention_score", 0.0)),
             "selected_intervention_score": normalize_score(data.get("selected_intervention_score", 0.0)),
@@ -638,6 +760,870 @@ that field compared with candidate #1: 0 means no gain, 1 means decisive gain.
             "approx_input_tokens": int(self.last_llm_call.get("approx_input_tokens", 0) or 0),
             "elapsed_seconds": float(self.last_llm_call.get("elapsed_seconds", 0.0) or 0.0),
             "prompt_candidate_count": int(len(candidate_payload)),
+        }
+        return {"candidate": selected, "details": details}
+
+    def select_best_candidate_with_agent_loop(
+        self,
+        instruction: str,
+        candidates: List[CandidateHypothesis],
+        dataset_name: str = "",
+        task_focus: str = "",
+        context: Optional[Dict[str, Any]] = None,
+        max_turns: int = 5,
+    ) -> Dict[str, Any]:
+        """Multi-turn (ReAct-style) verifier over the FULL candidate pool.
+
+        Unlike `select_best_candidate_with_llm` (single-shot, capped at 8
+        candidates, full evidence pre-computed for every candidate up front),
+        this hands the LLM a cheap id/component/reason/datetime/score menu for
+        ALL candidates and lets it decide, turn by turn, which candidates are
+        worth pulling full evidence for (`inspect`), which pair is worth a
+        direct comparison (`compare`), and when it has enough to commit
+        (`decide`). Evidence is computed lazily, on demand, instead of for
+        every candidate regardless of relevance.
+
+        Bounded by `max_turns` real LLM calls; if the budget runs out without
+        a `decide` action, this falls back to the deterministic top-1 exactly
+        like the bounded verifier's own fallback path.
+        """
+        context = context or {}
+        pool = self._dedupe_candidate_pool(list(candidates or []))
+        if not pool:
+            raise ValueError("No candidates for agent-loop verification.")
+
+        all_components = [str(c.component) for c in pool if str(getattr(c, "component", "") or "").strip()]
+
+        def _cheap_hint(cand: CandidateHypothesis) -> Dict[str, float]:
+            # Free triage signal: parsed straight out of the evidence strings
+            # already attached to the candidate (rootness_features=,
+            # supporting_metrics=, topology_context=), no telemetry lookup.
+            # Without this, the menu is bare index scores and the LLM has no
+            # way to tell "Redis02 + high memory usage" apart from five other
+            # Redis02 + <other reason> rows with similar scores.
+            compact_ev = {
+                "reason": str(cand.reason),
+                "candidate_summary_evidence": [str(x) for x in list(getattr(cand, "evidence", []) or [])[:8]],
+                "evidence_for": [],
+            }
+            view = _intervention_view(compact_ev)
+            return {
+                "reason_metric_match": float(view.get("reason_metric_match", 0.0) or 0.0),
+                "intervention_score": float(view.get("intervention_score", 0.0) or 0.0),
+                "symptom_risk": float(view.get("symptom_risk", 0.0) or 0.0),
+            }
+
+        def _menu_entry(cand: CandidateHypothesis, idx: int) -> Dict[str, Any]:
+            hint = _cheap_hint(cand)
+            return {
+                "id": int(idx),
+                "component": str(cand.component),
+                "reason": str(cand.reason),
+                "datetime": str(getattr(cand, "datetime", "") or ""),
+                "score": round(float(cand.score), 4),
+                "source": str(getattr(cand, "source", "") or ""),
+                "reason_metric_match": round(hint["reason_metric_match"], 3),
+                "intervention_score": round(hint["intervention_score"], 3),
+                "symptom_risk": round(hint["symptom_risk"], 3),
+            }
+
+        menu = [_menu_entry(c, i) for i, c in enumerate(pool, start=1)]
+        inspected: Dict[int, Dict[str, Any]] = {}
+        comparisons: List[Dict[str, Any]] = []
+        actions_log: List[Dict[str, Any]] = []
+        total_input_tokens = 0
+        total_elapsed = 0.0
+
+        def _payload_for(idx: int) -> Optional[Dict[str, Any]]:
+            if idx in inspected:
+                return inspected[idx]
+            if idx < 1 or idx > len(pool):
+                return None
+            cand = pool[idx - 1]
+            next_score = float(pool[idx].score) if idx < len(pool) else 0.0
+            entry = self._build_candidate_payload_entry(
+                cand=cand,
+                candidate_id=idx,
+                next_score=next_score,
+                instruction=instruction,
+                dataset_name=dataset_name,
+                context=context,
+                all_components=all_components,
+            )
+            inspected[idx] = entry
+            return entry
+
+        system_prompt = """
+You are a counterfactual RCA evidence judge working in a bounded multi-turn loop.
+You are given a MENU of ALL candidate root causes (id, component, reason,
+datetime, deterministic score only -- no detailed evidence yet). Candidate #1
+is only the deterministic current answer; it is not a truth label.
+
+Each turn you must return exactly one JSON action, nothing else:
+{"action":"inspect","id":<int>}            -- pull detailed evidence for one candidate
+{"action":"compare","ids":[<int>,<int>]}    -- pairwise evidence comparison of two candidates
+{"action":"decide", ...}                    -- commit to a final answer (schema below)
+
+Each menu row also has three free, already-computed hints (no evidence fetch
+needed to see these): reason_metric_match (does the reason label match the
+kind of metrics typically seen for it), intervention_score (rough evidence-only
+plausibility as a root cause), symptom_risk (high means this candidate looks
+like a downstream/global symptom rather than a root cause). These are cheap
+heuristics, not proof -- use them to decide what to `inspect`, not as the
+final answer. A candidate with high intervention_score / low symptom_risk
+but a lower raw score is often worth inspecting even if it is not near the
+top of the menu -- do not only look at the top few rows by score.
+
+Guidance:
+- Triage from the menu first using score AND the three hints together; do not
+  rely on raw score alone -- several rows can share a component with very
+  similar scores but only one reason variant is actually evidence-supported.
+- Only `inspect` candidates that could plausibly change the answer; do not
+  inspect every candidate on the menu.
+- Use `compare` once you have inspected two specific candidates you are
+  genuinely torn between.
+- You have a limited number of turns. Decide as soon as you have enough
+  evidence; do not spend turns you do not need.
+- Do not invent components, reasons, timestamps, or evidence beyond what the
+  menu and the evidence you have inspected show.
+
+When ready, return "decide" with:
+{"action":"decide","top1_falsified":false,"selected_id":1,"confidence":0.0,
+"change_from_top1":false,"top1_intervention_score":0.0,"selected_intervention_score":0.0,
+"falsification_reason":"why top1 is or is not falsified",
+"rationale":"one sentence","decisive_evidence":"one concrete evidence item",
+"field_decisions":{
+  "component":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"},
+  "reason":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"},
+  "datetime":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"}
+}}
+
+Output JSON only, exactly one action per turn.
+"""
+
+        final_data: Dict[str, Any] = {}
+        turns_used = 0
+        for turn in range(1, max(1, int(max_turns)) + 1):
+            turns_used = turn
+            turns_remaining = max(0, int(max_turns) - turn)
+            user_payload = {
+                "dataset": str(dataset_name or ""),
+                "task_focus": str(task_focus or "")[:240],
+                "query": str(instruction or "")[:420],
+                "turn": int(turn),
+                "turns_remaining": int(turns_remaining),
+                "candidate_menu": menu,
+                "inspected_candidates": [inspected[i] for i in sorted(inspected.keys())],
+                "comparisons_done": comparisons,
+            }
+            user_prompt = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
+            raw = self._chat(system_prompt, user_prompt)
+            total_input_tokens += int(self.last_llm_call.get("approx_input_tokens", 0) or 0)
+            total_elapsed += float(self.last_llm_call.get("elapsed_seconds", 0.0) or 0.0)
+            data = safe_json_loads(raw, {"action": "decide", "selected_id": 1, "confidence": float(pool[0].score)})
+            if not isinstance(data, Mapping):
+                data = {"action": "invalid"}
+            action = str(data.get("action", "") or "").strip().lower()
+            actions_log.append({"turn": int(turn), "action": action or "invalid"})
+
+            if action == "inspect":
+                try:
+                    idx = int(data.get("id", 0) or 0)
+                except Exception:
+                    idx = 0
+                _payload_for(idx)
+                continue
+            if action == "compare":
+                ids = data.get("ids") or []
+                try:
+                    id_a, id_b = int(ids[0]), int(ids[1])
+                except Exception:
+                    continue
+                pa, pb = _payload_for(id_a), _payload_for(id_b)
+                if pa is not None and pb is not None:
+                    comparisons.append(_compare_two_candidates(pa, pb))
+                continue
+            if action == "decide":
+                final_data = dict(data)
+                break
+            # Unknown / malformed action: treat as a wasted turn and continue.
+            continue
+
+        if not final_data:
+            # Ran out of turns without a decision: safe fallback to deterministic top-1.
+            final_data = {
+                "selected_id": 1,
+                "confidence": float(pool[0].score),
+                "rationale": "Agent loop exhausted max_turns without deciding; fell back to deterministic top-1.",
+                "top1_falsified": False,
+                "field_decisions": {},
+            }
+            actions_log.append({"turn": int(turns_used), "action": "fallback_max_turns_exhausted"})
+
+        try:
+            selected_id = int(final_data.get("selected_id", 1))
+        except Exception:
+            selected_id = 1
+        if selected_id < 1 or selected_id > len(pool):
+            selected_id = 1
+        selected = pool[selected_id - 1]
+
+        details = {
+            "selected_id": int(selected_id),
+            "selected_candidate": selected.to_dict(),
+            "confidence": normalize_score(final_data.get("confidence", selected.score)),
+            "rationale": str(final_data.get("rationale", "")).strip(),
+            "change_from_top1": bool(selected_id != 1 or final_data.get("change_from_top1", False)),
+            "top1_falsified": bool(selected_id != 1 or final_data.get("top1_falsified", False)),
+            "falsification_reason": str(final_data.get("falsification_reason", "") or "").strip(),
+            "top1_intervention_score": normalize_score(final_data.get("top1_intervention_score", 0.0)),
+            "selected_intervention_score": normalize_score(final_data.get("selected_intervention_score", 0.0)),
+            "decisive_evidence": str(final_data.get("decisive_evidence", "") or "").strip(),
+            "field_decisions": dict(final_data.get("field_decisions", {}) or {}) if isinstance(final_data.get("field_decisions", {}), Mapping) else {},
+            "rejected_candidates": ensure_list(final_data.get("rejected_candidates")),
+            "supporting_evidence": ensure_list(final_data.get("supporting_evidence")) or ensure_list(final_data.get("decisive_evidence")),
+            "approx_input_tokens": int(total_input_tokens),
+            "elapsed_seconds": float(total_elapsed),
+            "prompt_candidate_count": int(len(pool)),
+            "agent_loop_turns_used": int(turns_used),
+            "agent_loop_max_turns": int(max_turns),
+            "agent_loop_inspected_count": int(len(inspected)),
+            "agent_loop_comparisons_count": int(len(comparisons)),
+            "agent_loop_actions": actions_log,
+        }
+        return {"candidate": selected, "details": details}
+
+    def verify_with_tool_agent(
+        self,
+        instruction: str,
+        candidates: List[CandidateHypothesis],
+        dataset_name: str = "",
+        task_focus: str = "",
+        context: Optional[Dict[str, Any]] = None,
+        max_turns: int = 6,
+    ) -> Dict[str, Any]:
+        """General tool-calling RCA verifier: candidate pool = recall, agent = verification.
+
+        The candidate list handed to the LLM here is deliberately score-free --
+        just candidate_id/component/reason/datetime. No score, rank, source,
+        or pre-computed evidence hint is shown. The point of the candidate
+        list is only to maximize the chance the right tuple is present
+        somewhere (recall); it must not anchor the LLM's judgment the way a
+        sorted, pre-scored menu does. Verification is done entirely through
+        real tool calls (`query_evidence`, `query_time`, `compare`) against
+        `build_candidate_evidence`/`build_time_evidence`, so the LLM is
+        reasoning from actual metric/trace data it fetched itself, not from a
+        rank it was shown. It can also query components/reasons that were
+        never in the candidate list at all, which is what a fixed-menu
+        verifier can never recover from (e.g. row6 in the Bank agent-loop
+        experiment, where the ground-truth component never appeared anywhere
+        in the 39-candidate pool).
+
+        Same backstop as the other two verifier paths: the proposed answer
+        still goes through the controller's field-level evidence-gated
+        adoption and adapter.validate_llm_candidate_adoption() veto before it
+        can actually replace the deterministic answer.
+        """
+        context = context or {}
+        pool = self._dedupe_candidate_pool(list(candidates or []))
+        if not pool:
+            raise ValueError("No candidates for tool-agent verification.")
+
+        all_components = [str(c.component) for c in pool if str(getattr(c, "component", "") or "").strip()]
+        enable_trace = bool(context.get("enable_trace_evidence", True))
+
+        def _menu_entry(cand: CandidateHypothesis, idx: int) -> Dict[str, Any]:
+            # Deliberately no score/rank/source/evidence here -- see docstring.
+            return {
+                "candidate_id": f"c{idx}",
+                "component": str(cand.component),
+                "reason": str(cand.reason),
+                "datetime": str(getattr(cand, "datetime", "") or ""),
+            }
+
+        menu = [_menu_entry(c, i) for i, c in enumerate(pool, start=1)]
+        id_to_cand = {f"c{i}": c for i, c in enumerate(pool, start=1)}
+        top1 = pool[0]
+        query_log: List[Dict[str, Any]] = []
+        actions_log: List[Dict[str, Any]] = []
+        total_input_tokens = 0
+        total_elapsed = 0.0
+        compare_count = 0
+        reason_checks = 0
+        # Stateful pruning: `remaining_ids` is the live working set. Pruning a
+        # candidate here actually removes it from every later list_candidates
+        # view -- it is not just a note attached to the final decide action,
+        # so "repeat until few candidates remain" is a real narrowing loop,
+        # not something the agent has to self-report after the fact.
+        remaining_ids: List[str] = [f"c{i}" for i in range(1, len(pool) + 1)]
+        pruned_log: List[Dict[str, Any]] = []
+
+        # General (not query-specific) safety net for the failure pattern
+        # seen on real Bank runs: the agent tests one or two reason
+        # hypotheses, gets inconclusive ("weak") support, drifts into
+        # comparing an unrelated pair, and then decides on a THIRD
+        # (component, reason) it never queried at all -- typically silently
+        # reverting to the deterministic top-1 without ever having verified
+        # it either. This log records every (component, reason) pair this
+        # conversation actually ran query_reason_evidence on (directly, or as
+        # either side of compare_reason_candidates), so decide-time can tell
+        # a verified answer from an untested guess -- for any dataset/query,
+        # not just this one.
+        reason_evidence_log: Dict[tuple[str, str], Dict[str, Any]] = {}
+        _SUPPORT_RANK = {"strong": 2, "weak": 1, "not_supported": 0}
+
+        def _best_logged_reason_candidate() -> tuple[Optional[tuple[str, str]], Dict[str, Any]]:
+            best_key: Optional[tuple[str, str]] = None
+            best_ev: Dict[str, Any] = {}
+            best_score = (-1, -1.0)
+            for key, ev in reason_evidence_log.items():
+                score = (_SUPPORT_RANK.get(str(ev.get("support", "")), -1), float(ev.get("reason_deviation", 0.0) or 0.0))
+                if score > best_score:
+                    best_score = score
+                    best_key = key
+                    best_ev = ev
+            return best_key, best_ev
+
+        def _tool_query_evidence(component: str, reason: str, include_topology: bool = False) -> Dict[str, Any]:
+            try:
+                # Topology/trace extraction parses the full per-day trace_span.csv,
+                # which for datasets like Bank can be multi-GB and take tens of
+                # seconds on a first (uncached) call -- far more expensive than the
+                # metric-only lookup. Default it off; the agent has to explicitly
+                # ask for it via include_topology=true and pay that cost knowingly.
+                use_trace = bool(enable_trace) and bool(include_topology)
+                ev = build_candidate_evidence(
+                    dataset=str(dataset_name or ""),
+                    instruction=str(instruction or ""),
+                    component=str(component or ""),
+                    reason=str(reason or ""),
+                    score=0.0,
+                    score_gap_vs_next=0.0,
+                    all_candidate_components=all_components,
+                    topology_max_rows=context.get("basil_max_trace_rows"),
+                    enable_trace=bool(use_trace),
+                ).to_dict()
+                return {
+                    "component": str(component or ""),
+                    "reason": str(reason or ""),
+                    "metric_timeline": list(ev.get("metric_timeline") or [])[:8],
+                    "trace_timeline": list(ev.get("trace_timeline") or [])[:5],
+                    "causal_evidence": dict(ev.get("causal_evidence") or {}),
+                    "evidence_for": list(ev.get("evidence_for") or []),
+                    "evidence_against": list(ev.get("evidence_against") or []),
+                    "topology_queried": bool(use_trace),
+                }
+            except Exception as exc:
+                return {"error": f"query_evidence failed: {exc}"}
+
+        def _tool_query_time(component: str, reason: str, dt: str, include_topology: bool = False) -> Dict[str, Any]:
+            try:
+                use_trace = bool(enable_trace) and bool(include_topology)
+                tev = build_time_evidence(
+                    dataset=str(dataset_name or ""),
+                    instruction=str(instruction or ""),
+                    time_candidate=TimeCandidate(
+                        datetime=str(dt or ""),
+                        source="tool_agent_query",
+                        score=0.0,
+                        component=str(component or ""),
+                        reason=str(reason or ""),
+                        evidence={},
+                    ),
+                    component=str(component or ""),
+                    reason=str(reason or ""),
+                    enable_trace=bool(use_trace),
+                ).to_dict()
+                return {
+                    "datetime": str(tev.get("datetime", "") or ""),
+                    "metric_at_this_time": list(tev.get("metric_at_this_time") or [])[:8],
+                    "trace_at_this_time": dict(tev.get("trace_at_this_time") or {}),
+                    "metric_1min_before": list(tev.get("metric_1min_before") or [])[:5],
+                    "metric_1min_after": list(tev.get("metric_1min_after") or [])[:5],
+                    "evidence_for": list(tev.get("evidence_for") or []),
+                    "evidence_against": list(tev.get("evidence_against") or []),
+                }
+            except Exception as exc:
+                return {"error": f"query_time failed: {exc}"}
+
+        def _resolve_item(item: Mapping[str, Any]) -> tuple[str, str, str]:
+            """A compare side can be given as {"candidate_id": "c17"} or as an
+            explicit {"component":..., "reason":..., "datetime":...} -- the
+            latter lets the agent compare something it found via query_evidence
+            that was never on the recall menu at all."""
+            cid = str(item.get("candidate_id", "") or "").strip()
+            if cid and cid in id_to_cand:
+                c = id_to_cand[cid]
+                return str(c.component), str(c.reason), str(getattr(c, "datetime", "") or "")
+            return (
+                str(item.get("component", "") or ""),
+                str(item.get("reason", "") or ""),
+                str(item.get("datetime", "") or ""),
+            )
+
+        def _tool_compare(item_a: Mapping[str, Any], item_b: Mapping[str, Any], include_topology: bool = False) -> Dict[str, Any]:
+            # No heuristic verdict is computed here on purpose -- this just
+            # fetches real evidence for both sides side by side. The LLM does
+            # the actual comparison reasoning itself in its next response,
+            # instead of trusting a system-computed score delta.
+            comp_a, reason_a, dt_a = _resolve_item(item_a)
+            comp_b, reason_b, dt_b = _resolve_item(item_b)
+            ev_a = _tool_query_evidence(comp_a, reason_a, include_topology=include_topology)
+            ev_b = _tool_query_evidence(comp_b, reason_b, include_topology=include_topology)
+            out: Dict[str, Any] = {
+                "a": {"component": comp_a, "reason": reason_a, "datetime": dt_a, "evidence": ev_a},
+                "b": {"component": comp_b, "reason": reason_b, "datetime": dt_b, "evidence": ev_b},
+            }
+            if dt_a:
+                out["a"]["time_evidence"] = _tool_query_time(comp_a, reason_a, dt_a, include_topology=include_topology)
+            if dt_b:
+                out["b"]["time_evidence"] = _tool_query_time(comp_b, reason_b, dt_b, include_topology=include_topology)
+            return out
+
+        all_candidate_pairs = [(str(c.component), str(c.reason)) for c in pool]
+
+        def _tool_query_reason_evidence(component: str, reason: str) -> Dict[str, Any]:
+            # Deviation/rank/contrast based reason test -- this is the real
+            # way to test a reason hypothesis. It replaces the old "does a
+            # reason keyword appear in this component's top-8 metrics" check
+            # (still visible inside query_evidence's evidence_for/against
+            # lines for backward compatibility, but that check is weak: on
+            # real Bank data, "high memory usage" and "high disk I/O read
+            # usage" both came back "matches" for the SAME component with
+            # near-identical hit counts, giving no way to tell them apart).
+            try:
+                ev = build_reason_evidence(
+                    dataset=str(dataset_name or ""),
+                    instruction=str(instruction or ""),
+                    component=str(component or ""),
+                    reason=str(reason or ""),
+                    all_candidates=all_candidate_pairs,
+                ).to_dict()
+                return ev
+            except Exception as exc:
+                return {"error": f"query_reason_evidence failed: {exc}"}
+
+        def _tool_compare_reason_candidates(item_a: Mapping[str, Any], item_b: Mapping[str, Any]) -> Dict[str, Any]:
+            comp_a, reason_a, _dt_a = _resolve_item(item_a)
+            comp_b, reason_b, _dt_b = _resolve_item(item_b)
+            ev_a = _tool_query_reason_evidence(comp_a, reason_a)
+            ev_b = _tool_query_reason_evidence(comp_b, reason_b)
+            score_a = float(ev_a.get("reason_deviation", 0.0) or 0.0) if "error" not in ev_a else 0.0
+            score_b = float(ev_b.get("reason_deviation", 0.0) or 0.0) if "error" not in ev_b else 0.0
+            return {
+                "a": {"component": comp_a, "reason": reason_a, "evidence": ev_a},
+                "b": {"component": comp_b, "reason": reason_b, "evidence": ev_b},
+                "reason_deviation_gap_a_minus_b": round(score_a - score_b, 4),
+            }
+
+        system_prompt = """
+You are a counterfactual RCA agent with real tool access to telemetry evidence.
+
+The candidate list below is deliberately score-free: no rank, no confidence,
+no pre-computed evidence. It exists only so you know which (component, reason,
+datetime) tuples the system's own pipeline considers plausible -- it is a
+recall aid, not a verdict, and it may be wrong, incomplete, or missing the
+right answer entirely. Your job is verification, not "pick the one that was
+listed first": form your own view of which candidates are worth checking by
+comparing component/reason/time textually, then confirm or refute them with
+real evidence, not with any ordering the system gave you.
+
+Each turn, return exactly one JSON action, nothing else:
+{"action":"list_candidates"}
+   -- see the recall candidate list (candidate_id/component/reason/datetime only)
+{"action":"query_evidence","component":"<name>","reason":"<label>","include_topology":false}
+   -- fetch real metric evidence for this component (pass reason="" to just
+      inspect the component). If you pass a reason label, the
+      evidence_for/evidence_against lines about it are only a coarse
+      keyword-presence check (does some anomalous metric name contain a
+      word associated with this reason) -- it is NOT reliable for choosing
+      between two plausible reasons on the same component, because several
+      different reasons routinely share the same keyword-matching metrics
+      during one real incident. Use query_reason_evidence (below) instead
+      whenever you actually need to test or compare a reason hypothesis.
+      You may query ANY component, not just ones on the candidate list.
+      include_topology=true also fetches trace/dependency evidence but is
+      much slower (can take tens of seconds on some datasets) -- only set it
+      true when you specifically need upstream/downstream dependency
+      evidence.
+{"action":"query_time","component":"<name>","reason":"<label>","datetime":"YYYY-MM-DD HH:MM:SS","include_topology":false}
+   -- fetch metric evidence at one specific timestamp for this component.
+{"action":"query_reason_evidence","component":"<name>","reason":"<label>"}
+   -- the real way to test a reason hypothesis. Returns how strongly and
+      distinctly this component's actual metric deviation in the time window
+      supports this specific reason: reason_deviation (deviation magnitude of
+      this reason's metric group), reason_rank_on_component (1 = this is the
+      single best-fitting reason on this component out of all known reasons
+      for this dataset), gap_to_second_reason (how far ahead of the next-best
+      reason on this component), cross_candidate_percentile (how this
+      candidate's own deviation compares to every other candidate's own
+      claimed reason), matched_metrics (which metrics actually drove the
+      score), and competing_reasons (what else this component's data could
+      instead support). `support` summarizes these as "strong"/"weak"/
+      "not_supported" but the raw numbers are there for you to judge
+      yourself -- a reason with rank 1 but a small gap, or a low
+      cross_candidate_percentile, is not solid evidence even if support
+      says "weak" rather than "not_supported".
+{"action":"compare_reason_candidates","a":{"candidate_id":"c3"},"b":{"candidate_id":"c17"}}
+   -- run query_reason_evidence for both sides in one turn (each side may
+      also be given as {"component":"...","reason":"..."} for something not
+      on the candidate list) and report the deviation gap between them
+      directly, so you can weigh two competing (component, reason)
+      hypotheses against each other without two separate turns.
+{"action":"compare","a":{"candidate_id":"c3"},"b":{"candidate_id":"c17"},"include_topology":false}
+   -- fetch real evidence for two candidates side by side in one turn, so you
+      can weigh them against each other. Either side may instead be given as
+      {"component":"...","reason":"...","datetime":"..."} to compare something
+      not on the candidate list. This does not compute a verdict for you --
+      you must judge which side the evidence actually supports yourself, in
+      your next action.
+{"action":"prune","ids":["c4","c9"],"reason":"short reason"}
+   -- permanently remove these candidate_ids from the working set based on
+      evidence you already queried (weak/missing/contradicted). This is a
+      real removal: list_candidates will not show them again. Use this
+      repeatedly to narrow a large candidate list down to a handful before
+      you commit to a final answer. Do not prune a candidate you have not
+      actually queried evidence for.
+{"action":"decide", ...}
+   -- commit to a final answer (schema below)
+
+Suggested workflow (repeat steps 2-4 across several turns as needed, choosing
+whichever dimension -- time, component, or reason -- looks most useful to
+narrow on next; there is no fixed order). Whichever order you pick, do not
+decide on a final reason for a candidate you have never run
+query_reason_evidence on -- component fit and time fit do not substitute for
+actually testing the reason dimension.
+1. list_candidates, and skim it for component/reason/time plausibility only
+   (no scores to lean on -- judge by content, not by list position).
+2. query_evidence / query_time on whichever candidates (or components not
+   even on the list) look most worth checking next for component/time fit.
+   query_reason_evidence / compare_reason_candidates on whichever
+   (component, reason) pairs look most worth checking next for reason fit --
+   this is the only action that actually tests a reason hypothesis with a
+   discriminative signal (rank/gap/percentile), not just keyword presence.
+3. prune candidates whose evidence turned out weak, missing, or contradicted
+   -- do this as you go, not only at the very end.
+4. Once list_candidates shows only a few candidates left (or you have checked
+   enough that you are confident none of the rest matter), do a final close
+   compare among what remains.
+5. decide once you have real evidence behind your answer, not before.
+
+Do not invent metric values, timestamps, or evidence beyond what the tool
+responses actually show you. You have a limited number of turns -- do not
+query components you have no concrete reason to suspect.
+
+Hard rule: you may only decide on a (component, reason) pair that is either
+(a) identical to the deterministic top-1 you started with, or (b) a pair you
+have actually run query_reason_evidence (or compare_reason_candidates) on
+during this conversation. Deciding on some third pair you never checked --
+for example because your first hypothesis only got "weak" support and you
+drifted into comparing two other components instead of following through --
+will be rejected and cost you a turn. If you got inconclusive support for
+your first idea, either dig further on it, explicitly test the deterministic
+top-1 itself, or test whatever new candidate you actually want to propose --
+do not default to something you never verified.
+
+When ready, return "decide" with:
+{"action":"decide","component":"<name>","reason":"<label>","datetime":"YYYY-MM-DD HH:MM:SS or empty",
+"confidence":0.0,"change_from_top1":false,"top1_falsified":false,
+"falsification_reason":"why the deterministic top-1 is or is not right",
+"rationale":"one sentence","decisive_evidence":"one concrete evidence item",
+"rejected_candidates":[{"component":"...","reason":"...","reason_rejected":"short reason"}],
+"field_decisions":{
+  "component":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"},
+  "reason":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison, must cite a query_reason_evidence result (rank/gap/percentile), not a guess from raw metrics"},
+  "datetime":{"adopt":false,"evidence_gain":0.0,"reason":"short evidence comparison"}
+}}
+
+Output JSON only, exactly one action per turn.
+"""
+
+        final_data: Dict[str, Any] = {}
+        turns_used = 0
+        for turn in range(1, max(1, int(max_turns)) + 1):
+            turns_used = turn
+            turns_remaining = max(0, int(max_turns) - turn)
+            user_payload = {
+                "dataset": str(dataset_name or ""),
+                "task_focus": str(task_focus or "")[:240],
+                "query": str(instruction or "")[:420],
+                "turn": int(turn),
+                "turns_remaining": int(turns_remaining),
+                "candidate_count": int(len(menu)),
+                "remaining_candidate_count": int(len(remaining_ids)),
+                "queries_done": query_log,
+            }
+            user_prompt = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
+            raw = self._chat(system_prompt, user_prompt)
+            total_input_tokens += int(self.last_llm_call.get("approx_input_tokens", 0) or 0)
+            total_elapsed += float(self.last_llm_call.get("elapsed_seconds", 0.0) or 0.0)
+            data = safe_json_loads(
+                raw,
+                {
+                    "action": "decide",
+                    "component": str(top1.component),
+                    "reason": str(top1.reason),
+                    "datetime": str(getattr(top1, "datetime", "") or ""),
+                    "confidence": float(top1.score),
+                },
+            )
+            if not isinstance(data, Mapping):
+                # safe_json_loads' fallback regex can match a bracketed list
+                # in the raw text and return that instead of a dict (seen on
+                # real Bank runs: "'list' object has no attribute 'get'"
+                # crashed the whole turn loop). Treat a non-dict parse the
+                # same as an invalid/malformed action rather than letting it
+                # blow up the loop.
+                data = {"action": "invalid"}
+            action = str(data.get("action", "") or "").strip().lower()
+
+            if action == "list_candidates":
+                live_menu = [m for m in menu if m["candidate_id"] in remaining_ids]
+                query_log.append({"turn": int(turn), "tool": "list_candidates", "result_preview": live_menu})
+                actions_log.append({"turn": int(turn), "action": "list_candidates", "remaining_count": int(len(remaining_ids))})
+                continue
+            if action == "query_evidence":
+                comp = str(data.get("component", "") or "")
+                reason = str(data.get("reason", "") or "")
+                include_topo = bool(data.get("include_topology", False))
+                result = _tool_query_evidence(comp, reason, include_topology=include_topo)
+                query_log.append({"turn": int(turn), "tool": "query_evidence", "component": comp, "reason": reason, "include_topology": include_topo, "result": result})
+                actions_log.append({"turn": int(turn), "action": "query_evidence", "component": comp, "reason": reason})
+                continue
+            if action == "query_time":
+                comp = str(data.get("component", "") or "")
+                reason = str(data.get("reason", "") or "")
+                dt = str(data.get("datetime", "") or "")
+                include_topo = bool(data.get("include_topology", False))
+                result = _tool_query_time(comp, reason, dt, include_topology=include_topo)
+                query_log.append({"turn": int(turn), "tool": "query_time", "component": comp, "reason": reason, "datetime": dt, "include_topology": include_topo, "result": result})
+                actions_log.append({"turn": int(turn), "action": "query_time", "component": comp, "reason": reason, "datetime": dt})
+                continue
+            if action == "query_reason_evidence":
+                comp = str(data.get("component", "") or "")
+                reason = str(data.get("reason", "") or "")
+                reason_checks += 1
+                result = _tool_query_reason_evidence(comp, reason)
+                if "error" not in result:
+                    reason_evidence_log[(comp, reason)] = result
+                query_log.append({"turn": int(turn), "tool": "query_reason_evidence", "component": comp, "reason": reason, "result": result})
+                actions_log.append({"turn": int(turn), "action": "query_reason_evidence", "component": comp, "reason": reason, "support": result.get("support")})
+                continue
+            if action == "compare_reason_candidates":
+                item_a = data.get("a", {}) if isinstance(data.get("a", {}), Mapping) else {}
+                item_b = data.get("b", {}) if isinstance(data.get("b", {}), Mapping) else {}
+                reason_checks += 2
+                compare_count += 1
+                result = _tool_compare_reason_candidates(item_a, item_b)
+                for side in ("a", "b"):
+                    side_info = result.get(side) if isinstance(result.get(side), Mapping) else {}
+                    side_ev = side_info.get("evidence") if isinstance(side_info.get("evidence"), Mapping) else {}
+                    if side_ev and "error" not in side_ev:
+                        reason_evidence_log[(str(side_info.get("component", "")), str(side_info.get("reason", "")))] = side_ev
+                query_log.append({"turn": int(turn), "tool": "compare_reason_candidates", "a": dict(item_a), "b": dict(item_b), "result": result})
+                actions_log.append({"turn": int(turn), "action": "compare_reason_candidates", "a": dict(item_a), "b": dict(item_b)})
+                continue
+            if action == "compare":
+                item_a = data.get("a", {}) if isinstance(data.get("a", {}), Mapping) else {}
+                item_b = data.get("b", {}) if isinstance(data.get("b", {}), Mapping) else {}
+                include_topo = bool(data.get("include_topology", False))
+                result = _tool_compare(item_a, item_b, include_topology=include_topo)
+                compare_count += 1
+                query_log.append({"turn": int(turn), "tool": "compare", "a": dict(item_a), "b": dict(item_b), "result": result})
+                actions_log.append({"turn": int(turn), "action": "compare", "a": dict(item_a), "b": dict(item_b)})
+                continue
+            if action == "prune":
+                ids_to_prune = [str(x) for x in list(data.get("ids") or []) if str(x).strip()]
+                prune_reason = str(data.get("reason", "") or "").strip()
+                actually_pruned = [i for i in ids_to_prune if i in remaining_ids]
+                for i in actually_pruned:
+                    remaining_ids.remove(i)
+                pruned_log.append({"turn": int(turn), "ids": actually_pruned, "reason": prune_reason})
+                query_log.append({"turn": int(turn), "tool": "prune", "ids": actually_pruned, "reason": prune_reason, "remaining_count": int(len(remaining_ids))})
+                actions_log.append({"turn": int(turn), "action": "prune", "ids": actually_pruned, "remaining_count": int(len(remaining_ids))})
+                continue
+            if action == "decide":
+                decide_component = str(data.get("component", "") or top1.component)
+                decide_reason = str(data.get("reason", "") or top1.reason)
+                is_top1_pair = (decide_component == str(top1.component) and decide_reason == str(top1.reason))
+                is_tested_pair = (decide_component, decide_reason) in reason_evidence_log
+                if (not is_top1_pair) and (not is_tested_pair) and turns_remaining > 0:
+                    # General guardrail (not specific to any one dataset/query):
+                    # deciding on a (component, reason) that was never actually
+                    # run through query_reason_evidence -- and isn't just a
+                    # no-op agreement with the deterministic top-1 -- silently
+                    # reproduces whatever the deterministic pipeline already
+                    # said without the agent ever verifying it, which defeats
+                    # the entire point of tool-based verification. Reject the
+                    # action and consume the turn instead of accepting it,
+                    # while turns remain to actually go test it.
+                    actions_log.append(
+                        {
+                            "turn": int(turn),
+                            "action": "decide_rejected_untested_reason",
+                            "component": decide_component,
+                            "reason": decide_reason,
+                        }
+                    )
+                    query_log.append(
+                        {
+                            "turn": int(turn),
+                            "tool": "decide_rejected",
+                            "component": decide_component,
+                            "reason": decide_reason,
+                            "note": "rejected: not the deterministic top-1 and never checked with query_reason_evidence",
+                        }
+                    )
+                    continue
+                if (not is_top1_pair) and (not is_tested_pair):
+                    # Out of turns to go verify it. Do not silently trust an
+                    # untested guess over something this run actually checked
+                    # with real evidence -- prefer the best logged
+                    # query_reason_evidence result if it cleared at least a
+                    # "weak" bar, whatever dataset/query this is.
+                    best_key, best_ev = _best_logged_reason_candidate()
+                    if best_key is not None and str(best_ev.get("support", "")) in ("strong", "weak"):
+                        data = dict(data)
+                        data["component"], data["reason"] = best_key[0], best_key[1]
+                        data["rationale"] = (
+                            str(data.get("rationale", "") or "")
+                            + f" [auto-substituted: original decide ({decide_component}, {decide_reason}) was never "
+                            f"verified with query_reason_evidence; replaced with the best-tested result ({best_key[0]}, "
+                            f"{best_key[1]}, support={best_ev.get('support')})."
+                        ).strip()
+                        actions_log.append(
+                            {
+                                "turn": int(turn),
+                                "action": "decide_auto_substituted",
+                                "component": best_key[0],
+                                "reason": best_key[1],
+                                "support": best_ev.get("support"),
+                            }
+                        )
+                final_data = dict(data)
+                actions_log.append({"turn": int(turn), "action": "decide"})
+                break
+            # Unknown / malformed action: treat as a wasted turn and continue.
+            actions_log.append({"turn": int(turn), "action": action or "invalid"})
+            continue
+
+        if not final_data:
+            best_key, best_ev = _best_logged_reason_candidate()
+            if best_key is not None and str(best_ev.get("support", "")) in ("strong", "weak"):
+                final_data = {
+                    "component": best_key[0],
+                    "reason": best_key[1],
+                    "datetime": str(getattr(top1, "datetime", "") or ""),
+                    "confidence": float(best_ev.get("reason_deviation", 0.0) or 0.0),
+                    "rationale": (
+                        "Tool agent exhausted max_turns without deciding; auto-selected the best "
+                        f"query_reason_evidence result ({best_key[0]}, {best_key[1]}, support={best_ev.get('support')}) "
+                        "instead of blindly falling back to the deterministic top-1."
+                    ),
+                    "top1_falsified": bool(best_key != (str(top1.component), str(top1.reason))),
+                    "field_decisions": {},
+                }
+                actions_log.append({"turn": int(turns_used), "action": "fallback_max_turns_exhausted_used_best_tested"})
+            else:
+                final_data = {
+                    "component": str(top1.component),
+                    "reason": str(top1.reason),
+                    "datetime": str(getattr(top1, "datetime", "") or ""),
+                    "confidence": float(top1.score),
+                    "rationale": "Tool agent exhausted max_turns without deciding; fell back to deterministic top-1.",
+                    "top1_falsified": False,
+                    "field_decisions": {},
+                }
+                actions_log.append({"turn": int(turns_used), "action": "fallback_max_turns_exhausted"})
+
+        proposed_component = str(final_data.get("component", "") or top1.component)
+        proposed_reason = str(final_data.get("reason", "") or top1.reason)
+        proposed_datetime = str(final_data.get("datetime", "") or getattr(top1, "datetime", "") or "")
+
+        # controller._field_level_adopt_candidate gates every proposed field
+        # change on "auto evidence" it extracts by parsing this candidate's
+        # own `evidence` string list (component_type=/supporting_metrics=/
+        # rootness_features= tokens) -- if evidence=[] here, that parsing
+        # sees nothing, prop_features all come back 0.0, and
+        # component_evidence_gain/reason_evidence_gain end up negative no
+        # matter how strong the real evidence the agent gathered was. That
+        # silently vetoed every tool-agent adoption regardless of the actual
+        # verification quality (confirmed on real Bank runs: llm_changed_count
+        # =1, llm_veto_count=1, llm_adopted_count=0 even after the deviation-
+        # based reason evidence correctly favored the true answer). Populate
+        # evidence from whatever this run actually established for the
+        # decided (component, reason): the original pool candidate's evidence
+        # if it was already a recall candidate, plus the real matched metrics
+        # from any query_reason_evidence call this turn loop made for it.
+        selected_evidence: List[str] = []
+        for c in pool:
+            if str(c.component) == proposed_component and str(c.reason) == proposed_reason:
+                selected_evidence = list(getattr(c, "evidence", []) or [])
+                break
+        for q in query_log:
+            if (
+                q.get("tool") == "query_reason_evidence"
+                and str(q.get("component", "")) == proposed_component
+                and str(q.get("reason", "")) == proposed_reason
+            ):
+                result = q.get("result") or {}
+                matched = [
+                    str(m.get("metric", ""))
+                    for m in list(result.get("matched_metrics") or [])
+                    if isinstance(m, Mapping) and str(m.get("metric", "")).strip()
+                ]
+                if matched:
+                    selected_evidence.append("supporting_metrics=" + ",".join(matched[:6]))
+                selected_evidence.append(f"reason_support={result.get('support', '')}")
+                break
+
+        selected = CandidateHypothesis(
+            component=proposed_component,
+            reason=proposed_reason,
+            datetime=proposed_datetime,
+            evidence=selected_evidence,
+            score=normalize_score(final_data.get("confidence", top1.score)),
+            source="tool_agent_decide",
+        )
+
+        changed_default = (
+            proposed_component != str(top1.component)
+            or proposed_reason != str(top1.reason)
+            or proposed_datetime != str(getattr(top1, "datetime", "") or "")
+        )
+        details = {
+            "selected_id": -1,
+            "selected_candidate": selected.to_dict(),
+            "confidence": normalize_score(final_data.get("confidence", selected.score)),
+            "rationale": str(final_data.get("rationale", "")).strip(),
+            "change_from_top1": bool(changed_default or final_data.get("change_from_top1", False)),
+            # See the same fix in select_best_candidate_with_llm above: a
+            # real field difference must win over the model's own
+            # (possibly inconsistent) top1_falsified flag, not the other way
+            # around. This is exactly what blocked row1 on a real Bank run --
+            # the model proposed a different, well-evidenced component
+            # (component_evidence_gain=1.09) but wrote top1_falsified=false,
+            # and controller._allow_field's hard "if not top1_falsified:
+            # return False" gate rejected the change outright before it ever
+            # got to weighing the evidence.
+            "top1_falsified": bool(changed_default or final_data.get("top1_falsified", False)),
+            "falsification_reason": str(final_data.get("falsification_reason", "") or "").strip(),
+            "top1_intervention_score": normalize_score(final_data.get("top1_intervention_score", 0.0)),
+            "selected_intervention_score": normalize_score(final_data.get("selected_intervention_score", 0.0)),
+            "decisive_evidence": str(final_data.get("decisive_evidence", "") or "").strip(),
+            "field_decisions": dict(final_data.get("field_decisions", {}) or {}) if isinstance(final_data.get("field_decisions", {}), Mapping) else {},
+            "rejected_candidates": ensure_list(final_data.get("rejected_candidates")) + pruned_log,
+            "supporting_evidence": ensure_list(final_data.get("supporting_evidence")) or ensure_list(final_data.get("decisive_evidence")),
+            "approx_input_tokens": int(total_input_tokens),
+            "elapsed_seconds": float(total_elapsed),
+            "prompt_candidate_count": int(len(pool)),
+            "remaining_candidate_count": int(len(remaining_ids)),
+            "agent_loop_turns_used": int(turns_used),
+            "agent_loop_max_turns": int(max_turns),
+            "agent_loop_inspected_count": int(len([q for q in query_log if q.get("tool") in ("query_evidence", "query_time", "query_reason_evidence")])),
+            "agent_loop_comparisons_count": int(compare_count),
+            "agent_loop_reason_checks_count": int(reason_checks),
+            "agent_loop_actions": actions_log,
         }
         return {"candidate": selected, "details": details}
 

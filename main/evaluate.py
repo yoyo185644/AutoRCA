@@ -159,6 +159,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gate_skip_gap_threshold", type=float, default=0.30)
     p.add_argument("--llm_change_min_confidence", type=float, default=0.85)
     p.add_argument("--llm_max_score_drop_vs_det_top1", type=float, default=0.05)
+    p.set_defaults(llm_verify_all_candidates=False)
+    p.add_argument(
+        "--llm_verify_all_candidates",
+        action="store_true",
+        help=(
+            "Experimental: skip the uncertainty gate (always consult the LLM) and "
+            "pass the full BASIL candidate pool (no top-8 cap) into the counterfactual "
+            "verifier prompt, instead of the default bounded gated top-K flow."
+        ),
+    )
+    p.set_defaults(agent_loop_verify=False)
+    p.add_argument(
+        "--agent_loop_verify",
+        action="store_true",
+        help=(
+            "Experimental: replace the single-shot verifier prompt with a bounded "
+            "multi-turn (inspect/compare/decide) agent loop over the full candidate "
+            "pool, computing per-candidate evidence lazily instead of up front."
+        ),
+    )
+    p.add_argument("--agent_loop_max_turns", type=int, default=5)
+    p.add_argument(
+        "--candidate_pool_preview_n",
+        type=int,
+        default=8,
+        help="How many candidates to dump into the result CSV's candidate_pool_preview column (debug only; does not affect what the verifier/agent actually sees, which is controlled separately).",
+    )
+    p.set_defaults(tool_agent_verify=False)
+    p.add_argument(
+        "--tool_agent_verify",
+        action="store_true",
+        help=(
+            "Experimental: replace the fixed-candidate-pool verifier with a general "
+            "tool-calling agent that can query real metric/trace/topology evidence "
+            "for ANY component/reason/time it names, not just ones the deterministic "
+            "pipeline enumerated. Takes precedence over --agent_loop_verify if both are set."
+        ),
+    )
+    p.add_argument("--tool_agent_max_turns", type=int, default=6)
     p.set_defaults(adaptive_profile=False)
     p.add_argument("--adaptive_profile", action="store_true")
     p.add_argument("--confidence_level", type=float, default=0.95)
@@ -357,6 +396,26 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         "candidate_time_cluster_count",
         "llm_max_prompt_candidates",
         "candidate_pool_preview",
+        "agent_loop_turns_used",
+        "agent_loop_inspected_count",
+        "agent_loop_comparisons_count",
+        "agent_loop_actions",
+        "llm_verify_error",
+        "llm_decide_component",
+        "llm_decide_reason",
+        "llm_decide_datetime",
+        "llm_rationale",
+        "llm_decisive_evidence",
+        "llm_adopted_fields",
+        "llm_rejected_fields",
+        "llm_component_evidence_gain",
+        "llm_reason_evidence_gain",
+        "gate_top1_score",
+        "gate_top2_score",
+        "gate_score_gap",
+        "gate_reasons",
+        "gate_consistency_accept",
+        "evidence_consistency_gate",
     ]
     pd.DataFrame(columns=columns).to_csv(out_path, index=False)
 
@@ -489,6 +548,26 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
             "candidate_time_cluster_count": int(timing.get("candidate_time_cluster_count", 0) or 0),
             "llm_max_prompt_candidates": int(timing.get("llm_max_prompt_candidates", 0) or 0),
             "candidate_pool_preview": json.dumps(timing.get("candidate_pool_preview", []) or [], ensure_ascii=False),
+            "agent_loop_turns_used": int(timing.get("agent_loop_turns_used", 0) or 0),
+            "agent_loop_inspected_count": int(timing.get("agent_loop_inspected_count", 0) or 0),
+            "agent_loop_comparisons_count": int(timing.get("agent_loop_comparisons_count", 0) or 0),
+            "agent_loop_actions": str(timing.get("agent_loop_actions", "") or ""),
+            "llm_verify_error": str(timing.get("llm_verify_error", "") or ""),
+            "llm_decide_component": str(timing.get("llm_decide_component", "") or ""),
+            "llm_decide_reason": str(timing.get("llm_decide_reason", "") or ""),
+            "llm_decide_datetime": str(timing.get("llm_decide_datetime", "") or ""),
+            "llm_rationale": str(timing.get("llm_rationale", "") or ""),
+            "llm_decisive_evidence": str(timing.get("llm_decisive_evidence", "") or ""),
+            "llm_adopted_fields": str(timing.get("llm_adopted_fields", "") or ""),
+            "llm_rejected_fields": str(timing.get("llm_rejected_fields", "") or ""),
+            "llm_component_evidence_gain": float(timing.get("llm_component_evidence_gain", 0.0) or 0.0),
+            "llm_reason_evidence_gain": float(timing.get("llm_reason_evidence_gain", 0.0) or 0.0),
+            "gate_top1_score": float(timing.get("gate_top1_score", 0.0) or 0.0),
+            "gate_top2_score": float(timing.get("gate_top2_score", 0.0) or 0.0),
+            "gate_score_gap": float(timing.get("gate_score_gap", 0.0) or 0.0),
+            "gate_reasons": str(timing.get("gate_reasons", "") or ""),
+            "gate_consistency_accept": bool(timing.get("gate_consistency_accept", False)),
+            "evidence_consistency_gate": json.dumps(timing.get("evidence_consistency_gate", {}) or {}, ensure_ascii=False),
         }
         rows.append(row_obj)
         n_total += 1

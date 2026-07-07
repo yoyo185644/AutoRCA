@@ -13,6 +13,7 @@ from rca.common.text import service_base
 from rca.common.tasks import required_root_count_from_instruction, task_need_flags
 from rca.adapter.registry import get_dataset_adapter
 from rca.core import BasilCorePipeline
+from rca.index.indexes import REASON_TOKENS
 
 
 @dataclass(frozen=True)
@@ -385,24 +386,61 @@ def _local_evidence_strength(item: Mapping[str, Any], context: Mapping[str, Any]
 
 
 def _reason_metric_match_score(item: Mapping[str, Any], context: Mapping[str, Any]) -> float:
-    reason = str(item.get("reason", "") or "").strip().lower()
+    """How well this candidate's metrics support `reason` (fallback path).
+
+    Only used when the dataset adapter's own `_reason_metric_support_score`
+    returns exactly 0 (no adapter, or truly no keyword overlap). The previous
+    implementation bucketed reasons into 4 coarse groups (cpu/memory/network/
+    disk-io) and returned a flat 1.0 for ANY reason in a group as soon as the
+    metrics blob contained ANY one matching token -- e.g. "container network
+    packet corruption", "container network latency", "container packet loss",
+    and "node disk space consumption" could all score an identical 1.0 off
+    the same metrics list, even though they are semantically distinct and
+    only some are actually supported. Combined with `_llm_only_challenger_
+    expansion`'s `base_score + 0.25 * support` formula, several unrelated
+    reasons ended up with byte-identical final scores, so which one "won"
+    came down to arbitrary tie-break order rather than evidence. This
+    version scores each reason against its OWN token list (REASON_TOKENS,
+    shared with the rest of the pipeline) and returns the matched fraction,
+    so reasons with more/stronger matches score higher than ones with a
+    single incidental shared word.
+    """
+    reason = str(item.get("reason", "") or "").strip()
     if not reason:
         return 0.0
     comp = str(item.get("component", "") or "").strip()
     metrics = [str(x).lower() for x in list(item.get("supporting_metrics", []) or []) if str(x or "").strip()]
     metrics.extend(str(x).lower() for x in list((context or {}).get("top_metrics", {}).get(comp, []) or []) if str(x or "").strip())
-    blob = " ".join(metrics + [str(item.get("source", "") or "").lower()])
-    if not blob:
+    if not metrics:
         return 0.0
-    if "cpu" in reason:
-        return 1.0 if "cpu" in blob or "load" in blob else 0.0
-    if any(tok in reason for tok in ("memory", "mem")):
-        return 1.0 if any(tok in blob for tok in ("mem", "memory", "rss", "heap", "gc")) else 0.0
-    if any(tok in reason for tok in ("network", "packet", "latency", "loss", "retrans")):
-        return 1.0 if any(tok in blob for tok in ("network", "packet", "tcp", "retrans", "latency", "loss")) else 0.0
-    if any(tok in reason for tok in ("read", "write", "disk", "io", "i/o")):
-        return 1.0 if any(tok in blob for tok in ("read", "write", "disk", "io", "i/o", "fs_")) else 0.0
-    return 0.3
+    token_set: set = set()
+    for m in metrics:
+        token_set.add(m)
+        for part in m.replace(".", "_").split("_"):
+            if part:
+                token_set.add(part)
+    toks = REASON_TOKENS.get(reason, [])
+    if not toks:
+        toks = [t for t in reason.lower().replace("-", " ").split() if t]
+    if not toks:
+        return 0.0
+    # "container"/"node"/"docker"/"service" are dataset-namespace prefixes,
+    # not real discriminating signal: in Market almost every container-level
+    # metric is literally named "container_*", so this token alone matches
+    # any "container X" reason regardless of whether X (cpu/memory/network/
+    # disk-io/...) is actually what's anomalous. Left uncorrected, every
+    # "container ..." reason shares this one hit and floors at the same
+    # non-zero score (e.g. 1/3 for a 3-token reason), reintroducing a
+    # smaller version of the flat-tie bug this function was rewritten to
+    # fix. A generic token only counts once a genuinely specific token
+    # (cpu, memory, read, retrans, corrupt, ...) has ALSO matched.
+    generic_tokens = {"container", "node", "docker", "service"}
+    matched = [t for t in toks if t and t.lower() in token_set]
+    specific_hits = [t for t in matched if t.lower() not in generic_tokens]
+    if not specific_hits:
+        return 0.0
+    hits = len(matched)
+    return min(1.0, hits / max(1.0, min(3.0, float(len(toks)))))
 
 
 def _temporal_change_score(item: Mapping[str, Any], context: Mapping[str, Any], *, need_time: bool) -> float:
@@ -1066,7 +1104,14 @@ def _source_flags(item: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[s
     ).lower()
     metric = bool(comp and (item.get("supporting_metrics") or (context or {}).get("top_metrics", {}).get(comp)))
     trace = any(tok in source_blob for tok in ("trace", "span", "p95", "duration", "latency"))
-    log = any(tok in source_blob for tok in ("log", "event", "exception", "error"))
+    # Word-boundary match: plain substring matching on "log" false-positives on
+    # metric names like "Login_Per_Sec" or "Logic_Read_Per_Sec" (db connection
+    # metrics), which wrongly makes the gate believe log/event evidence is
+    # present in datasets (e.g. Telecom) that never collect log evidence at
+    # all. That phantom "log" requirement makes evidence_consistency_gate
+    # reject every top-1 candidate, since a real log source flag can never be
+    # true. Require the token to appear as its own word/segment instead.
+    log = any(re.search(rf"(?:^|[^a-z]){tok}(?:[^a-z]|$)", source_blob) for tok in ("log", "event", "exception", "error"))
     return {"metric": bool(metric), "trace": bool(trace), "log": bool(log)}
 
 
@@ -1328,14 +1373,53 @@ def _safe_prediction_to_tuples_constrained(
         (str(x.get("component") or ""), str(x.get("reason") or ""), str(x.get("datetime") or ""))
         for x in selected
     }
-    for item in pool:
-        if len(selected) >= limit:
-            break
-        key = (str(item.get("component") or ""), str(item.get("reason") or ""), str(item.get("datetime") or ""))
-        if key in selected_keys:
-            continue
-        selected.append(dict(item))
-        selected_keys.add(key)
+    # NOTE: when the LLM-proposed slot for a multi-root query gets rejected
+    # above (e.g. by the score_guard check), this fallback used to fill the
+    # remaining slot(s) by walking `pool` in raw score order with no
+    # per-component awareness -- for multi-root (need_comp) tasks that
+    # silently reintroduces the same "same component fills every slot"
+    # class of bug already fixed in BasilCorePipeline._diverse_top_k_by_
+    # component and CounterfactualController.run()'s required_k>1 branch.
+    # Prefer a distinct component per slot first; only fall back to
+    # allowing a repeat component if there aren't enough distinct ones to
+    # fill every remaining slot, so this never shrinks the prediction.
+    if bool(need_comp):
+        used_components = {
+            str(x.get("component") or "").strip() for x in selected if str(x.get("component") or "").strip()
+        }
+        deferred: List[Dict[str, Any]] = []
+        for item in pool:
+            if len(selected) >= limit:
+                break
+            key = (str(item.get("component") or ""), str(item.get("reason") or ""), str(item.get("datetime") or ""))
+            if key in selected_keys:
+                continue
+            comp = str(item.get("component") or "").strip()
+            if comp and comp in used_components:
+                deferred.append(item)
+                continue
+            selected.append(dict(item))
+            selected_keys.add(key)
+            if comp:
+                used_components.add(comp)
+        if len(selected) < limit:
+            for item in deferred:
+                if len(selected) >= limit:
+                    break
+                key = (str(item.get("component") or ""), str(item.get("reason") or ""), str(item.get("datetime") or ""))
+                if key in selected_keys:
+                    continue
+                selected.append(dict(item))
+                selected_keys.add(key)
+    else:
+        for item in pool:
+            if len(selected) >= limit:
+                break
+            key = (str(item.get("component") or ""), str(item.get("reason") or ""), str(item.get("datetime") or ""))
+            if key in selected_keys:
+                continue
+            selected.append(dict(item))
+            selected_keys.add(key)
     return selected[:limit] or deterministic
 
 def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool, int, List[str], Dict[str, int]]:
@@ -1347,6 +1431,25 @@ def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool,
         "llm_changed_count": 0,
         "llm_veto_count": 0,
         "llm_adopted_count": 0,
+        "agent_loop_turns_used": 0,
+        "agent_loop_inspected_count": 0,
+        "agent_loop_comparisons_count": 0,
+        "agent_loop_actions": "",
+        "llm_verify_error": "",
+        "llm_decide_component": "",
+        "llm_decide_reason": "",
+        "llm_decide_datetime": "",
+        "llm_rationale": "",
+        "llm_decisive_evidence": "",
+        "llm_adopted_fields": "",
+        "llm_rejected_fields": "",
+        "llm_component_evidence_gain": 0.0,
+        "llm_reason_evidence_gain": 0.0,
+        "gate_top1_score": 0.0,
+        "gate_top2_score": 0.0,
+        "gate_score_gap": 0.0,
+        "gate_reasons": "",
+        "gate_consistency_accept": False,
     }
     for step in trajectory or []:
         if not isinstance(step, Mapping):
@@ -1354,6 +1457,16 @@ def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool,
         action = str(step.get("action") or "")
         if action in {"llm_verify_topk", "llm_verify_topk_failed", "llm_verify_candidate", "llm_verify_candidate_failed"}:
             llm_called = True
+        if action == "llm_verify_candidate_failed":
+            # Previously this exception was only visible in the in-memory
+            # trajectory, which never reaches the CSV -- a verifier crash and
+            # a legitimate "nothing to change" both looked like
+            # llm_verify_count=0 with no way to tell them apart after the
+            # fact. Surface the actual error text so a silent fallback to the
+            # deterministic candidate is distinguishable from a real crash.
+            output = step.get("output")
+            if isinstance(output, Mapping):
+                stats["llm_verify_error"] = str(output.get("error", "") or "")[:500]
         if action == "llm_verify_candidate":
             stats["llm_verify_count"] += 1
             output = step.get("output")
@@ -1363,14 +1476,68 @@ def _collect_agent_stats(trajectory: Sequence[Mapping[str, Any]]) -> tuple[bool,
                     changed = bool(output.get("change_from_top1", False)) or int(output.get("selected_id", 1) or 1) != 1
                 except Exception:
                     changed = bool(output.get("change_from_top1", False))
+                # Multi-turn agent-loop verifier (select_best_candidate_with_agent_loop)
+                # stashes its own diagnostics in the same "output" dict; surface them
+                # here so they reach the result CSV instead of being silently dropped.
+                if "agent_loop_turns_used" in output:
+                    stats["agent_loop_turns_used"] = int(output.get("agent_loop_turns_used", 0) or 0)
+                    stats["agent_loop_inspected_count"] = int(output.get("agent_loop_inspected_count", 0) or 0)
+                    stats["agent_loop_comparisons_count"] = int(output.get("agent_loop_comparisons_count", 0) or 0)
+                    try:
+                        stats["agent_loop_actions"] = json.dumps(list(output.get("agent_loop_actions") or []), ensure_ascii=False)
+                    except Exception:
+                        stats["agent_loop_actions"] = ""
+                # What the LLM actually proposed and why, independent of
+                # whether the field-level gate below ends up adopting it --
+                # without this, a rejected proposal and "LLM agreed with
+                # top1" were indistinguishable from the CSV alone.
+                selected_candidate = output.get("selected_candidate")
+                if isinstance(selected_candidate, Mapping):
+                    stats["llm_decide_component"] = str(selected_candidate.get("component", "") or "")
+                    stats["llm_decide_reason"] = str(selected_candidate.get("reason", "") or "")
+                    stats["llm_decide_datetime"] = str(selected_candidate.get("datetime", "") or "")
+                stats["llm_rationale"] = str(output.get("rationale", "") or "")[:300]
+                stats["llm_decisive_evidence"] = str(output.get("decisive_evidence", "") or "")[:300]
             if changed:
                 stats["llm_changed_count"] += 1
+        if action in {"llm_veto", "llm_field_adoption"}:
+            # These two actions are mutually exclusive outputs of the same
+            # field-level gate call (controller._field_level_adopt_candidate):
+            # "llm_field_adoption" when at least one field was adopted,
+            # "llm_veto" when nothing was. Either way this is where the real
+            # adopt/reject reasoning and gain numbers live.
+            output = step.get("output")
+            if isinstance(output, Mapping):
+                try:
+                    stats["llm_adopted_fields"] = json.dumps(list(output.get("adopted_fields") or []), ensure_ascii=False)
+                    stats["llm_rejected_fields"] = json.dumps(dict(output.get("rejected_fields") or {}), ensure_ascii=False)
+                except Exception:
+                    pass
+                stats["llm_component_evidence_gain"] = float(output.get("component_evidence_gain", 0.0) or 0.0)
+                stats["llm_reason_evidence_gain"] = float(output.get("reason_evidence_gain", 0.0) or 0.0)
         if action == "llm_veto":
             stats["llm_veto_count"] += 1
-        if action == "uncertainty_gate":
+        if action in {"uncertainty_gate", "evidence_consistency_gate"}:
             output = step.get("output")
             if isinstance(output, Mapping):
                 reasons.extend([str(x) for x in list(output.get("reasons") or [])])
+                # Surface the actual numbers the skip decision was made from --
+                # without these, "llm_gate_called=False" on a row with poor
+                # deterministic accuracy is unexplainable from the CSV alone.
+                # evidence_consistency_gate runs BEFORE uncertainty_gate and
+                # can short-circuit straight to "accept top-1, never call
+                # LLM" -- when that happens, uncertainty_gate's own step
+                # never even runs, so this earlier gate's own accept/reasons
+                # need to be visible too, not just the later one's.
+                stats["gate_top1_score"] = float(output.get("top1_score", 0.0) or 0.0)
+                stats["gate_top2_score"] = float(output.get("top2_score", 0.0) or 0.0)
+                stats["gate_score_gap"] = float(output.get("score_gap", 0.0) or 0.0)
+                if action == "evidence_consistency_gate":
+                    stats["gate_consistency_accept"] = bool(output.get("accept", False))
+                try:
+                    stats["gate_reasons"] = json.dumps(list(output.get("reasons") or []), ensure_ascii=False)
+                except Exception:
+                    stats["gate_reasons"] = ""
         output = step.get("output")
         if isinstance(output, Mapping):
             input_tokens += int(output.get("approx_input_tokens", 0) or 0)
@@ -1611,6 +1778,12 @@ class IndexedEvidenceAgentRunner:
     """
 
     def deterministic_select(self, *, result: Any, k: int) -> List[Dict[str, Any]]:
+        # NOTE: `k` here is the raw candidate-pool size hint (pool_k, always
+        # >= 5), not the number of root causes the query actually needs --
+        # component-diversity enforcement for multi-root queries belongs in
+        # BasilCorePipeline._diverse_top_k_by_component, which has access to
+        # the true required root count. Gating on this `k` would wrongly
+        # apply diversity logic to single-root-cause tasks too.
         tuples = list(getattr(result, "tuples", []) or [])
         if not tuples:
             tuples = self._tuples_from_hypotheses(result)
@@ -1980,15 +2153,29 @@ class IndexedEvidenceAgentRunner:
             "llm_uncertain_gap_threshold": float(getattr(args, "evidence_score_gap_threshold", 0.15) or 0.15),
             "llm_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
             "llm_time_confidence_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),
+            "force_llm_verify": bool(getattr(args, "llm_verify_all_candidates", False)),
+            "agent_loop_verify": bool(getattr(args, "agent_loop_verify", False)),
+            "agent_loop_max_turns": int(getattr(args, "agent_loop_max_turns", 5) or 5),
+            "tool_agent_verify": bool(getattr(args, "tool_agent_verify", False)),
+            "tool_agent_max_turns": int(getattr(args, "tool_agent_max_turns", 6) or 6),
+            "candidate_pool_preview_n": int(getattr(args, "candidate_pool_preview_n", 8) or 8),
             "llm_verify_top_k": (
-                max(8, int(_required_root_count(result, instruction)) * 4)
-                if root_count > 1
-                else max(3, int(_required_root_count(result, instruction)) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3))
+                len(tuple_candidates)
+                if bool(getattr(args, "llm_verify_all_candidates", False))
+                else (
+                    max(8, int(_required_root_count(result, instruction)) * 4)
+                    if root_count > 1
+                    else max(3, int(_required_root_count(result, instruction)) * 3, int(getattr(args, "basil_candidate_reason_top_r", 3) or 3))
+                )
             ),
             "llm_max_prompt_candidates": (
-                min(8, max(len(reasons), int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)))
-                if bool(need_reason) and not bool(need_comp)
-                else min(8, max(5, int(_required_root_count(result, instruction)) * 4))
+                max(1, len(tuple_candidates))
+                if bool(getattr(args, "llm_verify_all_candidates", False))
+                else (
+                    min(8, max(len(reasons), int(getattr(args, "basil_candidate_reason_top_r", 3) or 3)))
+                    if bool(need_reason) and not bool(need_comp)
+                    else min(8, max(5, int(_required_root_count(result, instruction)) * 4))
+                )
             ),
             "evidence_score_gap_threshold": float(getattr(args, "evidence_score_gap_threshold", 0.15) or 0.15),
             "evidence_top1_score_floor": float(getattr(args, "evidence_top1_score_floor", 0.30) or 0.30),

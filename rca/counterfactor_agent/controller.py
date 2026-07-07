@@ -216,7 +216,7 @@ class CounterfactualController:
                         return True, "llm_reason_field_evidence_gain"
                     return False, "reason_field_gain_not_supported_by_metrics"
                 if field == "datetime":
-                    if gain >= 0.30 or (score_drop <= max_drop and conf >= min_conf):
+                    if gain >= 0.30:
                         return True, "llm_time_field_evidence_gain"
                     return False, "time_field_gain_too_weak"
             if aggressive_intervention:
@@ -236,10 +236,23 @@ class CounterfactualController:
                     return bool(challenger_sufficient and challenger_strength >= 2), "reason_conflict_evidence"
                 return False, "no_reason_field_conflict"
             if field == "datetime":
+                # NOTE: this used to also allow a datetime swap purely on
+                # "score_drop <= max_drop and conf >= min_conf" -- i.e. a
+                # confident, low-score-drop challenger could move the
+                # occurrence time even when the LLM's own rationale for
+                # falsifying top1 was about COMPONENT-level evidence
+                # (local metrics / topology), not anything about *when*
+                # the incident happened. Observed in practice (Market/
+                # cloudbed-1 row 15, task_1 time-only): a component-level
+                # rationale ("stronger local owned metrics and topology
+                # connectivity to symptoms") was used to justify swapping
+                # a correct deterministic datetime for a wrong one, with
+                # no time-specific evidence at all. Datetime adoption now
+                # requires an actual time-dimension conflict signal
+                # (matches the tightened `gain >= 0.30` explicit-adopt
+                # branch above), not a generic confidence/score proxy.
                 if {"time_cluster", "metric_vs_trace", "trace_vs_metric"} & conflict_dims:
                     return bool(challenger_sufficient and challenger_strength >= 2), "time_conflict_evidence"
-                if score_drop <= max_drop and conf >= min_conf:
-                    return True, "high_confidence_low_score_drop_time_change"
                 return False, "no_time_field_conflict"
             return False, "unknown_field"
 
@@ -506,15 +519,55 @@ class CounterfactualController:
 
         if required_k > 1:
             picked: List[CandidateHypothesis] = []
-            used: set[tuple[str, str]] = set()
-            for cand in candidates:
-                key = (str(getattr(cand, "component", "") or ""), str(getattr(cand, "reason", "") or ""))
-                if key in used:
-                    continue
-                used.add(key)
-                picked.append(cand)
-                if len(picked) >= required_k:
-                    break
+            if need_comp:
+                # Prefer a distinct component per slot first (mirrors
+                # BasilCorePipeline._diverse_top_k_by_component in
+                # rca/core/basil_pipeline.py). This controller path builds
+                # its own JSON output directly instead of going through that
+                # pipeline, so it needs its own copy of the same diversity
+                # rule -- without it, dedup-by-(component, reason) lets the
+                # same component fill every slot as long as the reason
+                # string differs (e.g. "node-1"+"disk read" and
+                # "node-1"+"disk write" counted as distinct), which is
+                # exactly the multi-root bug fixed elsewhere this session.
+                # Only falls back to (component, reason) dedup when there
+                # aren't enough distinct components to fill all
+                # `required_k` slots, so it never shrinks the prediction.
+                used_components: set[str] = set()
+                deferred: List[CandidateHypothesis] = []
+                for cand in candidates:
+                    comp = str(getattr(cand, "component", "") or "").strip()
+                    if comp and comp in used_components:
+                        deferred.append(cand)
+                        continue
+                    picked.append(cand)
+                    if comp:
+                        used_components.add(comp)
+                    if len(picked) >= required_k:
+                        break
+                if len(picked) < required_k:
+                    used_pairs: set[tuple[str, str]] = {
+                        (str(getattr(c, "component", "") or ""), str(getattr(c, "reason", "") or ""))
+                        for c in picked
+                    }
+                    for cand in deferred:
+                        key = (str(getattr(cand, "component", "") or ""), str(getattr(cand, "reason", "") or ""))
+                        if key in used_pairs:
+                            continue
+                        used_pairs.add(key)
+                        picked.append(cand)
+                        if len(picked) >= required_k:
+                            break
+            else:
+                used: set[tuple[str, str]] = set()
+                for cand in candidates:
+                    key = (str(getattr(cand, "component", "") or ""), str(getattr(cand, "reason", "") or ""))
+                    if key in used:
+                        continue
+                    used.add(key)
+                    picked.append(cand)
+                    if len(picked) >= required_k:
+                        break
             if len(picked) < required_k:
                 picked.extend([c for c in candidates if c not in picked][: required_k - len(picked)])
             out: Dict[str, Any] = {}
@@ -529,22 +582,45 @@ class CounterfactualController:
 
         top = candidates[0]
         gate = {}
+        force_llm_verify = bool(context.get("force_llm_verify", False))
         if (not deterministic_only) and enable_uncertainty_llm:
             gate = self._uncertainty_gate(candidates=candidates, context=context)
+            if force_llm_verify:
+                gate["need_llm"] = True
+                gate["reasons"] = list(dict.fromkeys(list(gate.get("reasons") or []) + ["force_llm_verify_all_candidates"]))
             context["uncertainty_gate"] = dict(gate)
             trajectory.append({"step": 1, "action": "uncertainty_gate", "elapsed_seconds": 0.0, "output": dict(gate)})
 
             if bool(gate.get("need_llm")):
                 step_t0 = time.perf_counter()
                 try:
-                    selected = self.executor.select_best_candidate_with_llm(
-                        instruction=str(instruction),
-                        candidates=list(candidates),
-                        dataset_name=str(dataset_name or ""),
-                        task_focus=str(task_focus or ""),
-                        context=dict(context or {}),
-                        top_k=int(context.get("llm_verify_top_k", 3) or 3),
-                    )
+                    if bool(context.get("tool_agent_verify", False)):
+                        selected = self.executor.verify_with_tool_agent(
+                            instruction=str(instruction),
+                            candidates=list(candidates),
+                            dataset_name=str(dataset_name or ""),
+                            task_focus=str(task_focus or ""),
+                            context=dict(context or {}),
+                            max_turns=int(context.get("tool_agent_max_turns", 6) or 6),
+                        )
+                    elif bool(context.get("agent_loop_verify", False)):
+                        selected = self.executor.select_best_candidate_with_agent_loop(
+                            instruction=str(instruction),
+                            candidates=list(candidates),
+                            dataset_name=str(dataset_name or ""),
+                            task_focus=str(task_focus or ""),
+                            context=dict(context or {}),
+                            max_turns=int(context.get("agent_loop_max_turns", 5) or 5),
+                        )
+                    else:
+                        selected = self.executor.select_best_candidate_with_llm(
+                            instruction=str(instruction),
+                            candidates=list(candidates),
+                            dataset_name=str(dataset_name or ""),
+                            task_focus=str(task_focus or ""),
+                            context=dict(context or {}),
+                            top_k=int(context.get("llm_verify_top_k", 3) or 3),
+                        )
                     elapsed = float(time.perf_counter() - step_t0)
                     llm_details = dict(selected.get("details") or {})
                     trajectory.append(
@@ -596,7 +672,7 @@ class CounterfactualController:
                                 prop_score=float(prop_score),
                                 need_comp=bool(need_comp),
                                 need_reason=bool(need_reason),
-                                need_time=bool(need_time),
+                                need_time=bool(context.get("need_time", False)),
                             )
                             trajectory.append(
                                 {
